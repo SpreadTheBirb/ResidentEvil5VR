@@ -1,0 +1,11 @@
+# Normalize line endings in history; check out native on Windows.
+* text=auto
+
+# Binaries and prebuilt libs - never touch these.
+*.dll binary
+*.lib binary
+*.pdb binary
+*.exe binary
+*.png binary
+*.jpg binary
+*.zip binary

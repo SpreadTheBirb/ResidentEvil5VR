@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{6C2C8D3E-4B7A-4E1B-9A2F-1A8E7B5C9D01}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>RE5VR</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>MultiByte</CharacterSet>
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup>
+    <TargetName>d3d9</TargetName>
+    <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;RE5VR_EXPORTS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)thirdparty\minhook\include;$(ProjectDir)thirdparty\openxr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ModuleDefinitionFile>$(ProjectDir)RE5VR.def</ModuleDefinitionFile>
+      <AdditionalLibraryDirectories>$(ProjectDir)thirdparty\openxr\lib\win32;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;_WINDOWS;_USRDLL;RE5VR_EXPORTS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)thirdparty\minhook\include;$(ProjectDir)thirdparty\openxr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <SDLCheck>true</SDLCheck>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ModuleDefinitionFile>$(ProjectDir)RE5VR.def</ModuleDefinitionFile>
+      <AdditionalLibraryDirectories>$(ProjectDir)thirdparty\openxr\lib\win32;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\util\log.cpp" />
+    <ClCompile Include="src\proxy\real_d3d9.cpp" />
+    <ClCompile Include="src\proxy\blind_forwards.cpp" />
+    <ClCompile Include="src\hooks\d3d9_hooks.cpp" />
+    <ClCompile Include="src\hooks\getprocaddress_hook.cpp" />
+    <ClCompile Include="src\hooks\constant_probe.cpp" />
+    <ClCompile Include="src\hooks\pixel_constant_probe.cpp" />
+    <ClCompile Include="src\hooks\head_hide_probe.cpp" />
+    <ClCompile Include="src\hooks\camera_rig_hook.cpp" />
+    <ClCompile Include="src\render\stereo_test.cpp" />
+    <ClCompile Include="src\vr\openxr_bridge.cpp" />
+    <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
+    <ClCompile Include="thirdparty\minhook\src\buffer.c" />
+    <ClCompile Include="thirdparty\minhook\src\hook.c" />
+    <ClCompile Include="thirdparty\minhook\src\trampoline.c" />
+    <ClCompile Include="thirdparty\minhook\src\hde\hde32.c" />
+    <ClCompile Include="thirdparty\minhook\src\hde\hde64.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\util\log.h" />
+    <ClInclude Include="src\proxy\real_d3d9.h" />
+    <ClInclude Include="src\proxy\blind_forwards.h" />
+    <ClInclude Include="src\hooks\d3d9_hooks.h" />
+    <ClInclude Include="src\hooks\getprocaddress_hook.h" />
+    <ClInclude Include="src\hooks\constant_probe.h" />
+    <ClInclude Include="src\hooks\pixel_constant_probe.h" />
+    <ClInclude Include="src\hooks\head_hide_probe.h" />
+    <ClInclude Include="src\hooks\camera_rig_hook.h" />
+    <ClInclude Include="src\render\stereo_test.h" />
+    <ClInclude Include="src\vr\openxr_bridge.h" />
+    <ClInclude Include="src\vr\d3d12_addon_bridge.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="RE5VR.def" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

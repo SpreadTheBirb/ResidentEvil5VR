@@ -1,0 +1,34 @@
+# ---- Build output -------------------------------------------------------
+# MSBuild writes the DLL + PDB here; addon/build holds SampleAddon.dll.
+# These are rebuilt from source every time, so they don't belong in history.
+RE5VR/build/
+RE5VR/addon/build/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.tlog
+*.log
+
+# ---- Visual Studio local state ------------------------------------------
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# ---- OpenVR SDK ---------------------------------------------------------
+# 495 MB of SDK + Unity/Qt/OpenCV sample binaries, and NOT part of the
+# build - RE5VR.vcxproj links only minhook and OpenXR. src/vr/openvr_bridge.*
+# is kept on disk for reference but is not compiled. Re-clone from
+# github.com/ValveSoftware/openvr if the OpenVR path is ever revived.
+RE5VR/thirdparty/openvr/
+
+# ---- Machine-local Claude Code state ------------------------------------
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# ---- Packaging / scratch ------------------------------------------------
+*.zip
+*.7z

@@ -1,0 +1,26 @@
+LIBRARY d3d9
+
+EXPORTS
+    ; Intercepted ourselves (see src/proxy/real_d3d9.cpp)
+    Direct3DCreate9
+    Direct3DCreate9Ex
+
+    ; Naked jmp-trampolines to the real d3d9.dll (see
+    ; src/proxy/blind_forwards.cpp). RE5 is not expected to call any of
+    ; these, but they keep the proxy transparent to any tool/loader that
+    ; probes the full export table.
+    D3DPERF_BeginEvent
+    D3DPERF_EndEvent
+    D3DPERF_GetStatus
+    D3DPERF_QueryRepeatFrame
+    D3DPERF_SetMarker
+    D3DPERF_SetOptions
+    D3DPERF_SetRegion
+    DebugSetLevel
+    DebugSetMute
+    Direct3D9EnableMaximizedWindowedModeShim
+    Direct3DCreate9On12
+    Direct3DCreate9On12Ex
+    Direct3DShaderValidatorCreate9
+    PSGPError
+    PSGPSampleTexture
