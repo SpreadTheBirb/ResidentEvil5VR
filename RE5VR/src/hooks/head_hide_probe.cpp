@@ -112,6 +112,10 @@ constexpr StableHeadPartMatch kHeadParts[] = {
     { 128, 64,  static_cast<D3DFORMAT>(827611204), 985312 }, // candidate 100
 };
 
+// Retired 2026-09-11 in favour of collapsing the head joint - see
+// HeadHideHook_ShouldSkip. Kept switchable for comparison.
+constexpr bool kUsePermanentHeadParts = false;
+
 bool MatchesKnownHeadPart(UINT texW, UINT texH, D3DFORMAT fmt, UINT vbSize)
 {
     for (const auto& part : kHeadParts) {
@@ -332,7 +336,15 @@ bool HeadHideHook_ShouldSkip(IDirect3DDevice9* pDevice)
     // Permanent: the 4 confirmed head-mesh sub-draws, matched by stable
     // descriptor and cached by pointer for this session - always hidden
     // in first-person regardless of the diagnostic probe's state below.
-    if (IsPermanentHeadPart(tex, vb))
+    //
+    // RETIRED 2026-09-11. Every part of Chris shares one vertex buffer, so
+    // descriptor matching is guesswork: once the near-camera fade was fixed
+    // it was plain that this hid his head, hair AND hands, and left a black
+    // inner mesh behind. The user only ever wanted the head gone (the hands
+    // are needed for arm IK later). The head is now collapsed through the
+    // skeleton instead - see "Eye on the head" in camera_rig_hook.cpp. The
+    // F11/F1/F2 browsing probe below is untouched.
+    if (kUsePermanentHeadParts && IsPermanentHeadPart(tex, vb))
         return true;
 
     if (!g_skipEnabled)

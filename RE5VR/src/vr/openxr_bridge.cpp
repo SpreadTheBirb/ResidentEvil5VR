@@ -86,6 +86,9 @@ std::vector<XrSwapchainImageD3D11KHR> g_xrSwapchainImages[2];
 // OpenVR bridge's separate head-delta/FOV-scale/toe-in getters.
 bool g_haveEyeViews = false;
 XRBridgeEyeView g_eyeViews[2] = {};
+// Written by the XR submit thread, read by the render thread: a pose must
+// be copied in or out whole, never half of one frame and half of the next.
+SRWLOCK g_eyeViewsLock = SRWLOCK_INIT;
 
 // Per-eye orientation reference, captured once per eye the first time a
 // valid view is located after XR mode is (re-)enabled - same recenter-on-
@@ -1241,10 +1244,16 @@ void XrSubmitOneFrame()
                 (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
 
             if (haveViews) {
+                // Built locally and published in one go under the lock: the
+                // render thread reads these on its own schedule and must
+                // never see half of one pose and half of the next. (This
+                // thread is the only writer, so reading them here is safe.)
+                XRBridgeEyeView next[2];
+                std::memcpy(next, g_eyeViews, sizeof(next));
                 for (int eye = 0; eye < static_cast<int>(viewCount); ++eye) {
-                    g_eyeViews[eye].positionMeters[0] = views[eye].pose.position.x;
-                    g_eyeViews[eye].positionMeters[1] = views[eye].pose.position.y;
-                    g_eyeViews[eye].positionMeters[2] = views[eye].pose.position.z;
+                    next[eye].positionMeters[0] = views[eye].pose.position.x;
+                    next[eye].positionMeters[1] = views[eye].pose.position.y;
+                    next[eye].positionMeters[2] = views[eye].pose.position.z;
 
                     const XrQuaternionf& q = views[eye].pose.orientation;
                     // Belt-and-suspenders on top of orientationValid: this
@@ -1293,7 +1302,7 @@ void XrSubmitOneFrame()
                                 eye, static_cast<unsigned long long>(viewState.viewStateFlags), q.x, q.y, q.z, q.w);
                         }
                         const Mat3 delta = Mat3Multiply(nowMat, Mat3Transpose(g_eyeReference[eye]));
-                        std::memcpy(g_eyeViews[eye].rotationDelta, delta.m, sizeof(delta.m));
+                        std::memcpy(next[eye].rotationDelta, delta.m, sizeof(delta.m));
 
                         // DIAGNOSTIC (2026-07-28): the 90-frame settle delay
                         // (see g_framesSincePoseLock) eliminated the huge
@@ -1329,15 +1338,18 @@ void XrSubmitOneFrame()
                         // leave rotationDelta as whatever it was last frame
                         // instead of overwriting with an untrustworthy one.
                         const Mat3 identity = Mat3Identity();
-                        std::memcpy(g_eyeViews[eye].rotationDelta, identity.m, sizeof(identity.m));
+                        std::memcpy(next[eye].rotationDelta, identity.m, sizeof(identity.m));
                     }
 
-                    g_eyeViews[eye].angleLeft = views[eye].fov.angleLeft;
-                    g_eyeViews[eye].angleRight = views[eye].fov.angleRight;
-                    g_eyeViews[eye].angleUp = views[eye].fov.angleUp;
-                    g_eyeViews[eye].angleDown = views[eye].fov.angleDown;
+                    next[eye].angleLeft = views[eye].fov.angleLeft;
+                    next[eye].angleRight = views[eye].fov.angleRight;
+                    next[eye].angleUp = views[eye].fov.angleUp;
+                    next[eye].angleDown = views[eye].fov.angleDown;
                 }
+                AcquireSRWLockExclusive(&g_eyeViewsLock);
+                std::memcpy(g_eyeViews, next, sizeof(g_eyeViews));
                 g_haveEyeViews = true;
+                ReleaseSRWLockExclusive(&g_eyeViewsLock);
             }
 
             // Read whichever slot the producer most recently published as
@@ -1655,9 +1667,12 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
 
 bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
 {
-    if (!g_haveEyeViews)
-        return false;
-    outLeft = g_eyeViews[kEyeLeft];
-    outRight = g_eyeViews[kEyeRight];
-    return true;
+    AcquireSRWLockShared(&g_eyeViewsLock);
+    const bool have = g_haveEyeViews;
+    if (have) {
+        outLeft = g_eyeViews[kEyeLeft];
+        outRight = g_eyeViews[kEyeRight];
+    }
+    ReleaseSRWLockShared(&g_eyeViewsLock);
+    return have;
 }

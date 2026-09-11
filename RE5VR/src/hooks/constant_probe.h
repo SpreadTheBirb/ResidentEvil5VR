@@ -40,6 +40,11 @@ void ConstantProbe_OnEndScene();
 // state. Returns false if none has been observed yet.
 bool ConstantProbe_GetCachedCameraMatrix(float out[16]);
 
+// The addresses the game uploads its camera matrix (c0-c3) from, most-used
+// first, with upload counts since startup. Returns how many were written.
+// Render thread only.
+int ConstantProbe_GetCameraMatrixSources(const void** outPtrs, unsigned* outCounts, int maxCount);
+
 // Calls the REAL (un-hooked) SetVertexShaderConstantF directly, bypassing
 // this file's own capture/offset-test logic. Used by stereo_test.cpp to
 // push per-eye camera overrides without corrupting the cached true camera

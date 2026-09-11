@@ -1,6 +1,7 @@
 #include "stereo_test.h"
 #include "../hooks/camera_rig_hook.h"
 #include "../hooks/constant_probe.h"
+#include "../hooks/fade_probe.h"
 #include "../hooks/head_hide_probe.h"
 #include "../hooks/pixel_constant_probe.h"
 #include "../vr/openxr_bridge.h"
@@ -10,6 +11,7 @@
 #include <MinHook.h>
 #include <windows.h>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -92,6 +94,48 @@ constexpr float kFovWidenStep = 0.1f;
 
 bool g_enabled = false;
 bool g_suppressed = false;
+
+// See "2026-09-11 VR hole fixes" above BeginStereoDraw. '`' toggles them.
+bool g_frameFixes = true;
+// Pixel-space HUD draws are pulled in to this fraction of each eye's view -
+// laid out to the screen corners, they would otherwise sit at the lens edge.
+constexpr float kScreenSpaceScale = 0.8f;
+// If Present stops arriving (the game presenting some other way), fall back
+// to reading the pose live rather than freezing it.
+constexpr unsigned long long kPresentStaleMs = 250;
+XRBridgeEyeView g_frameViews[2] = {};
+bool g_haveFrameViews = false;
+unsigned long long g_lastPresentMs = 0;
+unsigned g_presentCount = 0;
+UINT g_backBufferWidth = 0;
+UINT g_backBufferHeight = 0;
+
+// What the draw hooks did with each draw, logged every 5 s while in VR.
+struct DrawCensus {
+    unsigned split3d, screenSpace, nudged, offscreen;
+    struct Target {
+        UINT w, h;
+        unsigned n;
+    } targets[6];
+};
+DrawCensus g_census = {};
+
+void CountOffscreenTarget(UINT w, UINT h)
+{
+    ++g_census.offscreen;
+    for (auto& t : g_census.targets) {
+        if (t.n && t.w == w && t.h == h) {
+            ++t.n;
+            return;
+        }
+        if (!t.n) {
+            t.w = w;
+            t.h = h;
+            t.n = 1;
+            return;
+        }
+    }
+}
 
 void* VTableEntry(void* pInterface, size_t index)
 {
@@ -313,9 +357,81 @@ void ApplyFrustumAsymmetry(float m[16], const XRBridgeEyeView& view)
     }
 }
 
+// ---- 2026-09-11 VR hole fixes (A/B with '`') ---------------------------
+// Headset screenshots showed dithered black patches on Sheva, foliage,
+// rooftop fences and the gun - not missing objects. Three causes in this
+// file's own logic, fixed below and toggled together so the difference can
+// be judged in the headset:
+//
+//  1. The eye poses were read fresh on EVERY draw, while the XR submit
+//     thread updates them on its own schedule. RE5 draws an object in
+//     several passes that must agree on depth, so a pose that moved
+//     between two passes of one frame made them disagree by a hair -
+//     z-fighting holes. Now latched once per frame, at Present.
+//  2. Every draw was split per eye, including draws into the shadow map -
+//     rendering it from each eye's head-rotated view into two half-maps,
+//     so shadow lookups on the real scene came back as garbage. Now only
+//     screen-shaped render targets are split; shadow maps and other
+//     off-screen targets draw once, untouched.
+//  3. Screen-space (HUD) draws failed IsPlausibleCameraMatrix and fell back
+//     to the old flat nudge, c0.w -/+ 2.75 - which for a pixel-space ortho
+//     matrix (w = 1) is a 2.75 NDC shift, entirely off the screen: the HUD
+//     was never visible in VR. Now squeezed into each eye's half instead.
+
+bool IsScreenSpaceMatrix(const float m[16])
+{
+    // Affine (c3 = 0,0,0,1: no perspective divide) and pixel-scaled
+    // (|c0| ~ 2/width). Identity stays on the camera path, as before.
+    const bool affine = std::fabs(m[12]) < 1e-4f && std::fabs(m[13]) < 1e-4f && std::fabs(m[14]) < 1e-4f &&
+        std::fabs(m[15] - 1.0f) < 1e-4f;
+    return affine && Length3(&m[0]) < 0.05f;
+}
+
+void BuildScreenSpaceEyes(const float base[16], StereoDrawContext& ctx)
+{
+    for (int eye = 0; eye < 2; ++eye) {
+        float* m = eye == 0 ? ctx.leftMatrix : ctx.rightMatrix;
+        std::memcpy(m, base, sizeof(ctx.leftMatrix));
+        for (int i = 0; i < 8; ++i) // c0 (x) and c1 (y): shrink toward the centre
+            m[i] *= kScreenSpaceScale;
+        FitEyeFovToViewportHalf(m, eye == 0);
+    }
+}
+
+// Same aspect as the backbuffer (within 2%): full- and reduced-size scene
+// buffers pass, square shadow maps don't.
+bool RenderTargetIsScreenShaped(IDirect3DDevice9* pDevice)
+{
+    if (!g_backBufferWidth || !g_backBufferHeight)
+        return true;
+    IDirect3DSurface9* rt = nullptr;
+    if (FAILED(pDevice->GetRenderTarget(0, &rt)) || !rt)
+        return true;
+    D3DSURFACE_DESC d = {};
+    const bool haveDesc = SUCCEEDED(rt->GetDesc(&d));
+    rt->Release();
+    if (!haveDesc || !d.Width || !d.Height)
+        return true;
+    const float rtAspect = static_cast<float>(d.Width) / static_cast<float>(d.Height);
+    const float bbAspect = static_cast<float>(g_backBufferWidth) / static_cast<float>(g_backBufferHeight);
+    if (std::fabs(rtAspect - bbAspect) <= 0.02f * bbAspect)
+        return true;
+    CountOffscreenTarget(d.Width, d.Height);
+    return false;
+}
+
+bool GetEyeViewsForDraw(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
+{
+    if (g_frameFixes && g_haveFrameViews && GetTickCount64() - g_lastPresentMs < kPresentStaleMs) {
+        outLeft = g_frameViews[0];
+        outRight = g_frameViews[1];
+        return true;
+    }
+    return VRBridge_GetEyeViews(outLeft, outRight);
+}
+
 bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
 {
-    (void)pDevice;
     if (!g_enabled || g_suppressed)
         return false;
 
@@ -324,8 +440,19 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         return false;
 
     XRBridgeEyeView leftView, rightView;
-    const bool haveEyeViews = VRBridge_GetEyeViews(leftView, rightView);
+    const bool haveEyeViews = GetEyeViewsForDraw(leftView, rightView);
+    if (g_frameFixes && haveEyeViews) {
+        if (!RenderTargetIsScreenShaped(pDevice))
+            return false; // shadow map etc: one untouched draw
+        if (IsScreenSpaceMatrix(baseMatrix)) {
+            BuildScreenSpaceEyes(baseMatrix, ctx);
+            ++g_census.screenSpace;
+            return true;
+        }
+    }
     if (!haveEyeViews || !IsPlausibleCameraMatrix(baseMatrix)) {
+        if (haveEyeViews)
+            ++g_census.nudged;
         // No HMD pose yet (VR mode off, or headset not ready), or this
         // particular draw call's matrix doesn't look like a real 3D
         // camera (likely a UI/HUD element reusing the same register for a
@@ -403,6 +530,7 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         Log_Printf("StereoTest: frustum centres L=%.2f deg R=%.2f deg -> eye-to-eye convergence error was %.2f deg (now corrected)",
             leftCentre, rightCentre, rightCentre - leftCentre);
     }
+    ++g_census.split3d;
     return true;
 }
 
@@ -443,6 +571,7 @@ HRESULT WINAPI hkDrawPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE Primitiv
 {
     HeadHideProbe_OnDrawCall(This, "DrawPrimitive", PrimitiveCount);
     PixelConstantProbe_OnDrawCall(This);
+    FadeProbe_OnDraw(This, 0, PrimitiveType, static_cast<INT>(StartVertex), 0, 0, 0, PrimitiveCount);
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
@@ -467,6 +596,7 @@ HRESULT WINAPI hkDrawIndexedPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE T
 {
     HeadHideProbe_OnDrawCall(This, "DrawIndexedPrimitive", primCount);
     PixelConstantProbe_OnDrawCall(This);
+    FadeProbe_OnDraw(This, 1, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
@@ -576,7 +706,49 @@ void StereoTest_Install(IDirect3DDevice9* pDevice)
 
 void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
 {
-    (void)pDevice;
+    const unsigned long long nowMs = GetTickCount64();
+
+    // Backbuffer size, for RenderTargetIsScreenShaped. Refreshed once a
+    // second - it only changes on a resolution switch.
+    static unsigned long long s_lastBackBufferMs = 0;
+    if (nowMs - s_lastBackBufferMs >= 1000) {
+        s_lastBackBufferMs = nowMs;
+        IDirect3DSurface9* bb = nullptr;
+        if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+            D3DSURFACE_DESC d = {};
+            if (SUCCEEDED(bb->GetDesc(&d))) {
+                g_backBufferWidth = d.Width;
+                g_backBufferHeight = d.Height;
+            }
+            bb->Release();
+        }
+    }
+
+    static unsigned long long s_lastCensusMs = 0;
+    if (nowMs - s_lastCensusMs >= 5000) {
+        s_lastCensusMs = nowMs;
+        XRBridgeEyeView l, r;
+        if (g_enabled && VRBridge_GetEyeViews(l, r)) {
+            char targets[256] = {};
+            size_t len = 0;
+            for (const auto& t : g_census.targets) {
+                if (!t.n)
+                    break;
+                const int n = _snprintf_s(targets + len, sizeof(targets) - len, _TRUNCATE, " %ux%u x%u", t.w, t.h, t.n);
+                if (n < 0)
+                    break;
+                len += static_cast<size_t>(n);
+            }
+            const bool latched = g_frameFixes && g_haveFrameViews && nowMs - g_lastPresentMs < kPresentStaleMs;
+            Log_Printf("StereoTest: last 5 s [fixes %s] - %u 3D draws split per eye, %u HUD draws squeezed, %u old-nudge draws, "
+                       "%u single draws into off-screen targets:%s | %u Present(s), pose %s",
+                g_frameFixes ? "ON" : "OFF", g_census.split3d, g_census.screenSpace, g_census.nudged, g_census.offscreen,
+                targets[0] ? targets : " none", g_presentCount, latched ? "latched per frame" : "read live per draw");
+        }
+        g_census = {};
+        g_presentCount = 0;
+    }
+
     static bool prevF8Down = false;
     bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
     if (f8Down && !prevF8Down) {
@@ -738,4 +910,11 @@ void StereoTest_SetSuppressed(bool suppressed)
 void StereoTest_SetEnabled(bool enabled)
 {
     g_enabled = enabled;
+}
+
+void StereoTest_OnPresent()
+{
+    g_haveFrameViews = VRBridge_GetEyeViews(g_frameViews[0], g_frameViews[1]);
+    g_lastPresentMs = GetTickCount64();
+    ++g_presentCount;
 }

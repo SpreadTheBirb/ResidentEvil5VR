@@ -3,6 +3,12 @@
 #include "pixel_constant_probe.h"
 #include "head_hide_probe.h"
 #include "camera_rig_hook.h"
+#include "boom_finder.h"
+#include "fade_probe.h"
+#include "fade_patch.h"
+#include "culling_patch.h"
+#include "query_probe.h"
+#include "skeleton_probe.h"
 #include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
@@ -131,6 +137,24 @@ void DrawDebugQuad(IDirect3DDevice9* pDevice)
     StereoTest_SetSuppressed(false);
 }
 
+// ---- IDirect3DDevice9::Present: the one true frame boundary ------------
+// EndScene fires several times per rendered frame here (once per pass), so
+// it can't mark "a new frame starts now". Present can: stereo_test latches
+// the head pose there so every pass of the next frame uses the same one.
+constexpr size_t kIDirect3DDevice9_Present = 17;
+
+typedef HRESULT(WINAPI* Present_t)(IDirect3DDevice9* This, const RECT* pSourceRect, const RECT* pDestRect,
+    HWND hDestWindowOverride, const RGNDATA* pDirtyRegion);
+Present_t oPresent = nullptr;
+
+HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const RECT* pDestRect,
+    HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
+{
+    const HRESULT hr = oPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    StereoTest_OnPresent();
+    return hr;
+}
+
 HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
 {
     ++g_frameCounter;
@@ -138,6 +162,12 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     // Poll the F8 stereo-test toggle first.
     StereoTest_OnEndScene(This);
     CameraRigHook_OnEndScene();
+    BoomFinder_OnEndScene();
+    FadeProbe_OnEndScene();
+    FadePatch_OnEndScene();
+    CullingPatch_OnEndScene();
+    QueryProbe_OnEndScene();
+    SkeletonProbe_OnEndScene();
 
     // At this point the game's own rendering for this frame is completely
     // finished (backbuffer holds the final, fully composited/tonemapped
@@ -199,9 +229,18 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     st = MH_EnableHook(pTarget);
     Log_Printf("Hooks_OnDeviceCreated: EndScene hook enabled -> %d", static_cast<int>(st));
 
+    void* pPresent = VTableEntry(pDevice, kIDirect3DDevice9_Present);
+    st = MH_CreateHook(pPresent, reinterpret_cast<void*>(&hkPresent), reinterpret_cast<void**>(&oPresent));
+    if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED)
+        st = MH_EnableHook(pPresent);
+    Log_Printf("Hooks_OnDeviceCreated: Present hook enabled -> %d", static_cast<int>(st));
+
     ConstantProbe_Install(pDevice);
     PixelConstantProbe_Install(pDevice);
+    QueryProbe_Install(pDevice);
     StereoTest_Install(pDevice);
     VRBridge_Install();
     CameraRigHook_Install();
+    FadePatch_Install();
+    CullingPatch_Install();
 }

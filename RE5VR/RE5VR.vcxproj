@@ -98,6 +98,12 @@
     <ClCompile Include="src\hooks\pixel_constant_probe.cpp" />
     <ClCompile Include="src\hooks\head_hide_probe.cpp" />
     <ClCompile Include="src\hooks\camera_rig_hook.cpp" />
+    <ClCompile Include="src\hooks\boom_finder.cpp" />
+    <ClCompile Include="src\hooks\fade_probe.cpp" />
+    <ClCompile Include="src\hooks\fade_patch.cpp" />
+    <ClCompile Include="src\hooks\skeleton_probe.cpp" />
+    <ClCompile Include="src\hooks\culling_patch.cpp" />
+    <ClCompile Include="src\hooks\query_probe.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
     <ClCompile Include="src\vr\openxr_bridge.cpp" />
     <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
@@ -118,6 +124,12 @@
     <ClInclude Include="src\hooks\pixel_constant_probe.h" />
     <ClInclude Include="src\hooks\head_hide_probe.h" />
     <ClInclude Include="src\hooks\camera_rig_hook.h" />
+    <ClInclude Include="src\hooks\boom_finder.h" />
+    <ClInclude Include="src\hooks\fade_probe.h" />
+    <ClInclude Include="src\hooks\fade_patch.h" />
+    <ClInclude Include="src\hooks\skeleton_probe.h" />
+    <ClInclude Include="src\hooks\culling_patch.h" />
+    <ClInclude Include="src\hooks\query_probe.h" />
     <ClInclude Include="src\render\stereo_test.h" />
     <ClInclude Include="src\vr\openxr_bridge.h" />
     <ClInclude Include="src\vr\d3d12_addon_bridge.h" />

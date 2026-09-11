@@ -1,4 +1,5 @@
 #include "constant_probe.h"
+#include "fade_probe.h"
 #include "../util/log.h"
 
 #include <MinHook.h>
@@ -50,6 +51,38 @@ constexpr float kOffsetTestAmount = 800.0f;
 float g_cachedCameraMatrix[16] = {};
 bool g_haveCachedCameraMatrix = false;
 
+// Where the camera matrix (c0-c3) is uploaded FROM (2026-09-11, culling
+// hunt). Forcing the model sphere test and every occlusion query visible
+// still left VR holes in level geometry, and nothing but the sphere test
+// reads the main camera's frustum planes - so whatever culls the level must
+// work from the renderer's own view-projection. Its address is the source
+// pointer of these uploads; the F5 watch then finds its readers. Render
+// thread only (all D3D9 calls), so no locking.
+struct MatrixSource {
+    const void* ptr;
+    unsigned count;
+};
+constexpr int kMaxMatrixSources = 16;
+MatrixSource g_matrixSources[kMaxMatrixSources];
+
+void RecordCameraMatrixSource(const void* p)
+{
+    int freeSlot = -1, minSlot = 0;
+    for (int i = 0; i < kMaxMatrixSources; ++i) {
+        if (g_matrixSources[i].ptr == p) {
+            ++g_matrixSources[i].count;
+            return;
+        }
+        if (!g_matrixSources[i].ptr && freeSlot < 0)
+            freeSlot = i;
+        if (g_matrixSources[i].count < g_matrixSources[minSlot].count)
+            minSlot = i;
+    }
+    const int slot = freeSlot >= 0 ? freeSlot : minSlot;
+    g_matrixSources[slot].ptr = p;
+    g_matrixSources[slot].count = 1;
+}
+
 typedef HRESULT(WINAPI* SetTransform_t)(IDirect3DDevice9* This, D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix);
 SetTransform_t oSetTransform = nullptr;
 
@@ -69,9 +102,12 @@ SetVertexShaderConstantF_t oSetVertexShaderConstantF = nullptr;
 
 HRESULT WINAPI hkSetVertexShaderConstantF(IDirect3DDevice9* This, UINT StartRegister, const float* pConstantData, UINT Vector4fCount)
 {
+    FadeProbe_OnSetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+
     if (StartRegister == 0 && Vector4fCount == 4 && pConstantData) {
         std::memcpy(g_cachedCameraMatrix, pConstantData, sizeof(g_cachedCameraMatrix));
         g_haveCachedCameraMatrix = true;
+        RecordCameraMatrixSource(pConstantData);
     }
 
     if (g_framesRemainingInCapture > 0 && Vector4fCount == 4 && StartRegister < g_tallyF.size() && pConstantData) {
@@ -210,4 +246,24 @@ HRESULT ConstantProbe_CallRealSetVertexShaderConstantF(IDirect3DDevice9* pDevice
     if (!oSetVertexShaderConstantF)
         return E_FAIL;
     return oSetVertexShaderConstantF(pDevice, StartRegister, pConstantData, Vector4fCount);
+}
+
+int ConstantProbe_GetCameraMatrixSources(const void** outPtrs, unsigned* outCounts, int maxCount)
+{
+    bool taken[kMaxMatrixSources] = {};
+    int n = 0;
+    while (n < maxCount) {
+        int best = -1;
+        for (int i = 0; i < kMaxMatrixSources; ++i) {
+            if (!taken[i] && g_matrixSources[i].ptr && (best < 0 || g_matrixSources[i].count > g_matrixSources[best].count))
+                best = i;
+        }
+        if (best < 0)
+            break;
+        taken[best] = true;
+        outPtrs[n] = g_matrixSources[best].ptr;
+        outCounts[n] = g_matrixSources[best].count;
+        ++n;
+    }
+    return n;
 }

@@ -32,6 +32,10 @@ void StereoTest_Install(IDirect3DDevice9* pDevice);
 // toggle hotkey.
 void StereoTest_OnEndScene(IDirect3DDevice9* pDevice);
 
+// Call right after every IDirect3DDevice9::Present: latches the head pose
+// that every draw of the next frame will use.
+void StereoTest_OnPresent();
+
 // Call around any draw call that must never be duplicated/clipped (e.g.
 // the Phase 0 debug quad) - while suppressed, stereo_test's Draw* hooks
 // pass straight through to a single normal draw.

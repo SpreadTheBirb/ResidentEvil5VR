@@ -1,4 +1,5 @@
 #include "pixel_constant_probe.h"
+#include "fade_probe.h"
 #include "head_hide_probe.h"
 #include "../util/log.h"
 
@@ -67,6 +68,8 @@ SetPixelShaderConstantF_t oSetPixelShaderConstantF = nullptr;
 
 HRESULT WINAPI hkSetPixelShaderConstantF(IDirect3DDevice9* This, UINT StartRegister, const float* pConstantData, UINT Vector4fCount)
 {
+    FadeProbe_OnSetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+
     if (Vector4fCount >= 1 && StartRegister < g_live.size() && pConstantData) {
         LiveRegister& live = g_live[StartRegister];
         live.everSet = true;
