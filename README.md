@@ -16,6 +16,8 @@ per-eye camera and scissor rectangle.
 
 Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steering Claude on my end. This was one of my favorite games to play growing up and I want to experience it in VR. I've tried to make sure that all of the first person features translate to flat screen as well, so it's totally playable in first person, with no weird camera pop out as others have done in the past. My plan is to get 6dof working, or at a minimum 3dof. This hasn't been tested online. For everyone to also be aware out the gate, my solution of using dgVoodoo2 to convert RE5 from d3d9 to d3d12 has some potential risks. I discovered that it existed through the recent DLSS5 modders, and it can flag as potential malware/trojan through your antivirus. Per the author, and various other users as I've read around, this is a false positive..but I'm throwing this out there so that it's clear from the gate. 
 
+I recommend playing this with a controller at the moment, since that auto-enables your laser and makes aiming much easier. There is no hud at the moment...so it's a little tricky, but I hope to have that corrected soon. Right now my focus is pure function and playing through the first area once my pistol is equipped. 
+
 ## Features
 
 - **Native stereoscopic VR through OpenXR** — each eye rendered with its own
