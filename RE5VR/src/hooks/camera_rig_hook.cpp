@@ -6,6 +6,7 @@
 
 #include <MinHook.h>
 #include <windows.h>
+#include <Xinput.h>
 
 #include <atomic>
 #include <cmath>
@@ -916,13 +917,82 @@ bool IsPlayerController(const unsigned char* controller)
 // to go through the collision routine instead).
 //
 // Directions come from the rendered camera's own basis (screen-right and
-// forward, flattened), so A/D can't come out mirrored. Keyboard only for
-// now; first person (F4) only, player character only, aim flag at
-// controller+0x1B1 (the camera function's aim-group switch).
+// forward, flattened), so A/D can't come out mirrored. Keyboard (WASD) or a
+// gamepad's left stick - analog, so half a push walks at half speed (added
+// 2026-09-11 after v0.3.0 shipped keyboard-only). First person (F4) only,
+// player character only, aim flag at controller+0x1B1 (the camera
+// function's aim-group switch).
 constexpr bool kMoveWhileAiming = true;
 constexpr DWORD kOffControllerAimFlag = 0x1B1;
 constexpr DWORD kOffCharacterPos = 0x30;
 constexpr float kAimWalkSpeed = 100.0f; // render units per second - first guess, tune by feel
+
+// XInput is loaded at runtime rather than linked, so a missing DLL only
+// means no gamepad walking. 1_4 ships with Windows 8+, 1_3 with the DirectX
+// runtime RE5 installs, 9_1_0 with Vista/7.
+typedef DWORD(WINAPI* XInputGetState_t)(DWORD userIndex, XINPUT_STATE* state);
+XInputGetState_t g_xinputGetState = nullptr;
+
+void LoadXInput()
+{
+    static const char* const kDlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+    for (const char* name : kDlls) {
+        HMODULE m = LoadLibraryA(name);
+        if (!m)
+            continue;
+        g_xinputGetState = reinterpret_cast<XInputGetState_t>(GetProcAddress(m, "XInputGetState"));
+        if (g_xinputGetState) {
+            Log_Printf("CameraRigHook: gamepad walk-while-aiming via %s", name);
+            return;
+        }
+    }
+    Log_Printf("CameraRigHook: no XInput DLL found - walk-while-aiming is keyboard only");
+}
+
+// Left stick of the first connected pad, deadzone removed, as forward/strafe
+// with length 0..1. Polling an empty XInput slot is slow, so while no pad is
+// connected the slots are only rescanned every 2 s.
+bool ReadLeftStick(float* forward, float* strafe)
+{
+    static bool s_loaded = false;
+    if (!s_loaded) {
+        s_loaded = true;
+        LoadXInput();
+    }
+    if (!g_xinputGetState)
+        return false;
+
+    static int s_pad = -1;
+    static ULONGLONG s_lastScanMs = 0;
+    XINPUT_STATE st = {};
+    if (s_pad >= 0 && g_xinputGetState(static_cast<DWORD>(s_pad), &st) != ERROR_SUCCESS)
+        s_pad = -1;
+    if (s_pad < 0) {
+        const ULONGLONG nowMs = GetTickCount64();
+        if (nowMs - s_lastScanMs < 2000)
+            return false;
+        s_lastScanMs = nowMs;
+        for (DWORD i = 0; i < XUSER_MAX_COUNT && s_pad < 0; ++i) {
+            if (g_xinputGetState(i, &st) == ERROR_SUCCESS)
+                s_pad = static_cast<int>(i);
+        }
+        if (s_pad < 0)
+            return false;
+        Log_Printf("CameraRigHook: gamepad found in XInput slot %d", s_pad);
+    }
+
+    const float x = st.Gamepad.sThumbLX, y = st.Gamepad.sThumbLY;
+    const float len = std::sqrt(x * x + y * y);
+    const float dead = static_cast<float>(XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+    if (len <= dead)
+        return false;
+    float mag = (len - dead) / (32767.0f - dead);
+    if (mag > 1.0f)
+        mag = 1.0f;
+    *strafe = x / len * mag;
+    *forward = y / len * mag;
+    return true;
+}
 
 void AimWalk(unsigned char* controller)
 {
@@ -944,10 +1014,14 @@ void AimWalk(unsigned char* controller)
         return;
 
     const auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) ? 1.0f : 0.0f; };
-    const float forward = held('W') - held('S');
-    const float strafe = held('D') - held('A');
-    if (forward == 0.0f && strafe == 0.0f)
-        return;
+    float forward = held('W') - held('S');
+    float strafe = held('D') - held('A');
+    float speedScale = 1.0f; // keys are full speed; the stick is analog
+    if (forward == 0.0f && strafe == 0.0f) {
+        if (!ReadLeftStick(&forward, &strafe))
+            return;
+        speedScale = std::sqrt(forward * forward + strafe * strafe);
+    }
 
     float fx = g_camForward[0], fz = g_camForward[2];
     float rx = g_camRight[0], rz = g_camRight[2];
@@ -967,8 +1041,8 @@ void AimWalk(unsigned char* controller)
     if (!TryRead(&character, controller + kOffControllerCharacter, sizeof(character)) || !character)
         return;
     float* pos = reinterpret_cast<float*>(character + kOffCharacterPos);
-    pos[0] += dx * kAimWalkSpeed * dt;
-    pos[2] += dz * kAimWalkSpeed * dt;
+    pos[0] += dx * kAimWalkSpeed * speedScale * dt;
+    pos[2] += dz * kAimWalkSpeed * speedScale * dt;
 }
 
 extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
