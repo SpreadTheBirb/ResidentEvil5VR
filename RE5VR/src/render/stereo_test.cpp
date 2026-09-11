@@ -35,11 +35,38 @@ constexpr size_t kIDirect3DDevice9_DrawIndexedPrimitiveUP = 84;
 // evidence: user reported a real, measured, quantified depth error at
 // separation=20 (a deer corpse read as ~4ft away when it should be ~10ft,
 // a ~2.5x compression - exactly the "toy town" symptom of an oversized
-// virtual IPD relative to true scene scale). Live-tunable via '['/']' as
-// always - if 3.18 doesn't land the deer at the correct ~10ft, dial from
-// here and report back the value that does, same as every other tunable
-// in this project.
-constexpr float kDefaultHalfSeparation = 3.18f;
+// virtual IPD relative to true scene scale).
+//
+// MEASURED AND REPLACED (2026-09-10): 2.75, roughly 13% tighter than the
+// derived 3.18. This is the first time the value has actually been
+// measured rather than predicted, and it only became possible once the
+// F4 first-person camera worked - scale cannot be judged honestly from a
+// floating third-person vantage point, which is why it stayed open for so
+// long. The user's verdict at 2.75: "the gun, sheva, and buildings more
+// or less feel like the right size... a good balance of nothing too big,
+// nothing too small."
+//
+// The sweep behind it (179 presses, read off the log rather than assumed):
+// down to the 0.00 floor, up past 7.75, then a narrowing oscillation
+// inside 2.50-3.25 before settling. That final oscillation is what makes
+// this a real convergence - an earlier session the same day ended at the
+// 0.00 floor and was briefly, wrongly, reported as confirming 3.18.
+//
+// Still one session in one scene, so treat it as the best available
+// measurement rather than a settled constant. Implied render-units-per-
+// meter = 2.75 / 0.0318 ~= 86.5, not the assumed 100.
+// Camera-trajectory tracking after an F4 toggle (see the tracking block in
+// StereoTest_OnEndScene).
+//
+// MUST be wall-clock, not a frame count. The first attempt used 4000
+// EndScene calls expecting ~20s, and got 0.4s: EndScene runs several times
+// per rendered frame here, around 10,000 calls/sec, so the whole window
+// elapsed during the transition into first person and never saw the
+// look-down it was built to capture.
+constexpr unsigned long long kRigTrackDurationMs = 20000;
+constexpr unsigned long long kRigTrackSampleEveryMs = 100;
+
+constexpr float kDefaultHalfSeparation = 2.75f;
 float g_halfSeparation = kDefaultHalfSeparation;
 // 0.25 rather than 0.5: with the projection/scissor bug fixed (see
 // FitEyeFovToViewportHalf) the remaining stereo complaint is doubling on
@@ -567,26 +594,55 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
     // does not move at all, the override isn't reaching the camera the
     // game is actually rendering from.
     static bool prevRigEnabled = false;
-    static int rigLogFramesLeft = 0;
+    static unsigned long long rigTrackUntilMs = 0;
+    static unsigned long long rigLastSampleMs = 0;
     const bool rigEnabled = CameraRigHook_IsEnabled();
     if (rigEnabled != prevRigEnabled) {
-        rigLogFramesLeft = 6;
-        Log_Printf("StereoTest: camera rig override toggled %s - logging decoded camera position for %d frames",
-            rigEnabled ? "ON" : "OFF", rigLogFramesLeft);
+        // 2026-09-10 20:31: the camera still pops out to third person when
+        // pitching down, even though the log proves ALL SIX rig structs
+        // held our override the entire time (Dist=0, VDist=173, FOV=42) -
+        // including at the moment the pop was on screen. So the pop is not
+        // these fields being overwritten, and it is not a race we are
+        // losing: we win it, and the camera moves anyway. Something else
+        // positions the camera on pitch.
+        //
+        // Six frames at the moment of the toggle was enough to prove the
+        // override reaches the camera, but it all lands before the player
+        // has looked anywhere. Track the camera for ~20s instead, sampled
+        // rather than per-frame, so a slow deliberate look-down produces a
+        // readable trajectory: if camPos slides backwards along -forward
+        // it is a boom arm extending, if it arcs it is a pivot, and either
+        // way the magnitude says how far whatever-this-is thinks the
+        // camera should sit.
+        rigTrackUntilMs = GetTickCount64() + kRigTrackDurationMs;
+        rigLastSampleMs = 0;
+        Log_Printf("StereoTest: camera rig override toggled %s - tracking decoded camera position for %llu ms",
+            rigEnabled ? "ON" : "OFF", kRigTrackDurationMs);
     }
     prevRigEnabled = rigEnabled;
 
-    if (rigLogFramesLeft > 0) {
-        --rigLogFramesLeft;
+    const unsigned long long rigNowMs = GetTickCount64();
+    if (rigNowMs < rigTrackUntilMs && rigNowMs - rigLastSampleMs >= kRigTrackSampleEveryMs) {
+        rigLastSampleMs = rigNowMs;
         float rigMatrix[16];
         if (ConstantProbe_GetCachedCameraMatrix(rigMatrix) && IsPlausibleCameraMatrix(rigMatrix)) {
             CameraBasis rigBasis;
             DecomposeCameraMatrix(rigMatrix, rigBasis);
-            Log_Printf("StereoTest: rig=%s camPos=(%.1f, %.1f, %.1f) forward=(%.3f, %.3f, %.3f) Sx=%.3f Sy=%.3f",
-                rigEnabled ? "ON" : "OFF",
-                rigBasis.camPos[0], rigBasis.camPos[1], rigBasis.camPos[2],
-                rigBasis.forward[0], rigBasis.forward[1], rigBasis.forward[2],
-                rigBasis.scaleX, rigBasis.scaleY);
+            // Drop the identity-ish matrices that IsPlausibleCameraMatrix
+            // still lets through - a real camera here has Sx ~1.36-1.46,
+            // while UI/shadow passes decode as exactly Sx=Sy=1.000 with
+            // forward=(0,0,+-1). They polluted the 20:52 trace and, more
+            // importantly, the same cached matrix feeds head tracking, so
+            // this is a real bug in its own right (see project memory).
+            const bool identityish =
+                std::fabs(rigBasis.scaleX - 1.0f) < 0.01f && std::fabs(rigBasis.scaleY - 1.0f) < 0.01f;
+            if (!identityish) {
+                Log_Printf("StereoTest: rig=%s camPos=(%.1f, %.1f, %.1f) forward=(%.3f, %.3f, %.3f) Sx=%.3f Sy=%.3f",
+                    rigEnabled ? "ON" : "OFF",
+                    rigBasis.camPos[0], rigBasis.camPos[1], rigBasis.camPos[2],
+                    rigBasis.forward[0], rigBasis.forward[1], rigBasis.forward[2],
+                    rigBasis.scaleX, rigBasis.scaleY);
+            }
         } else {
             Log_Printf("StereoTest: rig=%s - no plausible camera matrix cached this frame",
                 rigEnabled ? "ON" : "OFF");
