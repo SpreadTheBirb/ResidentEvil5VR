@@ -10,9 +10,34 @@ handed to an OpenXR runtime as a pair of eye textures. The stereo image itself
 is produced by drawing the scene twice per frame into one backbuffer with a
 per-eye camera and scissor rectangle.
 
-> **Status:** working and playable, still under active development. See
-> `RE5VR/README.md` for the detailed build/install notes and the current set of
-> hotkeys.
+> **Status:** working and playable, still under active development. The
+> install steps and the full list of hotkeys are in the README inside each
+> release zip.
+
+## Features
+
+- **Native stereoscopic VR through OpenXR** — each eye rendered with its own
+  camera, real head tracking and the headset's actual per-eye lens FOV,
+  delivered at the headset's full refresh rate.
+- **True first person (F4)** — the camera sits in Chris's head, throughout
+  gameplay. It works in VR **and on a normal monitor**, so you can play RE5 in
+  first person without a headset.
+- **Walk while aiming** — something RE5 never allowed. Keep moving with your
+  weapon up, on WASD or a gamepad's left stick (analog).
+- **Full look range, no pop-out** — look straight up or down without the
+  camera snapping back to third person.
+- **No near-camera fade** — Chris and Sheva stay solid up close instead of
+  dissolving.
+- **Only the head is hidden** — Chris's body and hands stay visible, ready for
+  arm IK.
+- **Calibrated world scale** — measured from first person, adjustable live.
+- **VR culling fixes** — the game draws everything in front of you, including
+  the ground at your feet, not just what its own narrower camera would see.
+- **Drop-in install** — no game files are modified; delete the files to
+  uninstall.
+
+**Next up:** the game camera turning with your head (so nothing disappears
+over your shoulder), the HUD in VR, and motion controllers with arm IK.
 
 ---
 
