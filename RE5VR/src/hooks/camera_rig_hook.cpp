@@ -984,7 +984,13 @@ constexpr DWORD kOffCharacterPos = 0x30;
 constexpr float kAimWalkSpeed = 100.0f; // render units per second - first guess, tune by feel
 // After each step, do what the game's movement code does (see the end of
 // AimWalk): set the character's "moved" bit and run its step handler.
-constexpr bool kAimWalkCommitMove = true;
+// Multiplayer test switch (F6), default OFF. While on, each aim-walk step is
+// committed the way the game's own movement code does: the character's
+// "moved" flag plus its step handler. That may be what makes the move reach a
+// co-op partner - but the weapon path consumes the same flag, so the gun
+// fires several rounds per trigger pull while it is on (user, 2026-09-11).
+// For a co-op sync test only; leave it off to play.
+std::atomic<bool> g_aimWalkCommit{ false };
 constexpr DWORD kOffCharacterStepFlags = 0x2D7C;
 constexpr DWORD kStepMovedFlag = 0x10000000;
 constexpr DWORD kOffCharacterStepHandler = 0x2F30;
@@ -1114,7 +1120,7 @@ void AimWalk(unsigned char* controller)
     // position write never reached the co-op partner: they saw you frozen
     // while aiming, then a teleport when aiming ended (2026-09-11). Whether
     // these are what sends the move online is untested - needs a co-op session.
-    if (kAimWalkCommitMove) {
+    if (g_aimWalkCommit.load(std::memory_order_relaxed)) {
         *reinterpret_cast<DWORD*>(character + kOffCharacterStepFlags) |= kStepMovedFlag;
         void* handler = nullptr;
         if (TryRead(&handler, character + kOffCharacterStepHandler, sizeof(handler)) && handler) {
@@ -1260,6 +1266,17 @@ void CameraRigHook_OnEndScene()
         XRBridgeEyeView left, right;
         g_vrActive.store(VRBridge_GetEyeViews(left, right), std::memory_order_relaxed);
     }
+
+    // F6 = the co-op aim-walk sync test (see g_aimWalkCommit).
+    static bool prevF6Down = false;
+    const bool f6Down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (f6Down && !prevF6Down) {
+        const bool on = !g_aimWalkCommit.load(std::memory_order_relaxed);
+        g_aimWalkCommit.store(on, std::memory_order_relaxed);
+        Log_Printf("CameraRigHook: F6 pressed, aim-walk step commit now %s%s", on ? "ON" : "OFF",
+            on ? " - co-op sync test; the gun will fire several rounds per trigger pull" : "");
+    }
+    prevF6Down = f6Down;
 
     // '`' = wide culling FOV in VR on/off (g_vrWideFov).
     static bool prevGraveDown = false;
