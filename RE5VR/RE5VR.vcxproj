@@ -102,6 +102,8 @@
     <ClCompile Include="src\hooks\fade_probe.cpp" />
     <ClCompile Include="src\hooks\fade_patch.cpp" />
     <ClCompile Include="src\hooks\skeleton_probe.cpp" />
+    <ClCompile Include="src\hooks\state_probe.cpp" />
+    <ClCompile Include="src\hooks\laser_patch.cpp" />
     <ClCompile Include="src\hooks\culling_patch.cpp" />
     <ClCompile Include="src\hooks\query_probe.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
@@ -128,6 +130,8 @@
     <ClInclude Include="src\hooks\fade_probe.h" />
     <ClInclude Include="src\hooks\fade_patch.h" />
     <ClInclude Include="src\hooks\skeleton_probe.h" />
+    <ClInclude Include="src\hooks\state_probe.h" />
+    <ClInclude Include="src\hooks\laser_patch.h" />
     <ClInclude Include="src\hooks\culling_patch.h" />
     <ClInclude Include="src\hooks\query_probe.h" />
     <ClInclude Include="src\render\stereo_test.h" />

@@ -459,13 +459,13 @@ bool RigViewDirection(const unsigned char* rig, float* outDy, float* outDz)
 // In VR this does not change the headset image at all: stereo_test.cpp
 // builds each eye's projection from OpenXR's own FOV. There it only widens
 // the frustum the game culls with, which helps.
-constexpr float kFirstPersonHorizontalFovDeg = 90.0f;
+float g_flatFovDeg = 90.0f; // horizontal; Ctrl + ',' / '.' tune it live
 constexpr float kPi = 3.14159265358979f;
 float g_screenAspect = 16.0f / 9.0f;
 
 float FirstPersonVerticalFov()
 {
-    const float halfH = kFirstPersonHorizontalFovDeg * 0.5f * kPi / 180.0f;
+    const float halfH = g_flatFovDeg * 0.5f * kPi / 180.0f;
     return 2.0f * std::atan(std::tan(halfH) / g_screenAspect) * 180.0f / kPi;
 }
 
@@ -498,8 +498,29 @@ constexpr float kVrCullVerticalFovDeg = 150.0f;
 // forward" - and 0.0 puts the eye right above the neck pivot, inside the
 // collar/neck geometry that the head collapse leaves (it belongs to the
 // chest joint), a likely source of that session's black flicker.
-float g_vrEyeAheadScale = 0.2f;
-constexpr float kVrEyeAheadStep = 0.1f;
+// Two independent eye positions, as multipliers of the skeleton-derived
+// offsets: one for flat first person, one for VR - where head tracking moves
+// the view on top of the offset, so the eye wants to sit further back. ',' /
+// '.' move the active mode's eye back / forward; Shift with them moves it
+// down / up. VR forward starts at 0.2: the user settled at 0.0 on 2026-09-11
+// but said "probably a bit more forward", and 0.0 puts the eye right above
+// the neck pivot, inside the collar geometry the head collapse leaves.
+struct EyeOffsetScale {
+    float up;
+    float ahead;
+};
+// Flat default: where the user settled on 2026-09-11 (log: up 0.9, fwd -0.9) -
+// a little back and a hair down from the skeleton eye, which frames the gun
+// well. 1.0/1.0 is the anatomically right 6-foot view, two presses away.
+EyeOffsetScale g_flatEye = { 0.9f, -0.9f };
+EyeOffsetScale g_vrEye = { 1.0f, 0.2f };
+constexpr float kEyeScaleStep = 0.1f;
+constexpr float kEyeScaleMax = 2.0f;   // forward
+constexpr float kEyeUpMax = 3.0f;      // height: the user wants to reach Chris's full 6 feet
+constexpr float kFlatFovStep = 5.0f;
+constexpr float kFlatFovMin = 50.0f;
+constexpr float kFlatFovMax = 120.0f;
+constexpr float kEyeAheadMin = -1.0f; // forward may go behind the head pivot: the user hit the old 0.0 floor and wanted to pull back further
 
 void PlaceRigAtEye(unsigned char* rig, const float eye[3], float dy, float dz, float fovDeg)
 {
@@ -710,9 +731,16 @@ void RigToWorld(const unsigned char* controller, DWORD transformOff, const float
 }
 
 // Which camera controller is the player's - see "Which character is YOU" in
-// UpdateHead. Sticky: only changes when another controller clearly matches.
+// UpdateHead. Held once chosen: it only moves to another controller when the
+// current one expires, or its eye measures clearly away from the rendered
+// camera (kPlayerKeepDistance) for kPlayerSwitchDelayMs - what a real change
+// of character looks like, and what Sheva standing close never does.
 const unsigned char* g_playerController = nullptr;
 constexpr float kPlayerEyeMaxDistance = 25.0f;
+constexpr float kPlayerKeepDistance = 75.0f;
+constexpr unsigned long long kPlayerSwitchDelayMs = 1000;
+unsigned long long g_playerFarSinceMs = 0; // 0 = the player's eye is near the camera (or unmeasured)
+unsigned long long g_lastHoldLogMs = 0;
 
 // Last frame's rendered camera basis in world space (screen-right and
 // forward), refreshed by LastCameraPosition. Used by AimWalk so WASD moves
@@ -817,17 +845,21 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
     // Plausibility: a head pivot is roughly above the root, at head height.
     const bool plausible = pivotNormal[1] >= 80.0f && pivotNormal[1] <= 250.0f &&
         std::fabs(pivotNormal[0]) <= 100.0f && std::fabs(pivotNormal[2]) <= 100.0f;
-    const float ahead = track->eyeAhead * (vrActive ? g_vrEyeAheadScale : 1.0f);
-    const float eyeRigNormal[3] = { pivotNormal[0], pivotNormal[1] + track->eyeUp, pivotNormal[2] + ahead };
-    const float eyeRigAim[3] = { pivotAim[0], pivotAim[1] + track->eyeUp, pivotAim[2] + ahead };
+    const EyeOffsetScale& eyeScale = vrActive ? g_vrEye : g_flatEye;
+    const float ahead = track->eyeAhead * eyeScale.ahead;
+    const float up = track->eyeUp * eyeScale.up;
+    const float eyeRigNormal[3] = { pivotNormal[0], pivotNormal[1] + up, pivotNormal[2] + ahead };
+    const float eyeRigAim[3] = { pivotAim[0], pivotAim[1] + up, pivotAim[2] + ahead };
 
     // Which character is YOU: the one whose EYE is where last frame's camera
     // was. The first version compared head PIVOTS to the camera - but your
     // own pivot is ~19 units from your eye, so whenever Sheva's head came
     // within ~19 units of the camera she won and her head collapsed instead
     // (user, flat and VR). Your eye is essentially at the camera; hers
-    // practically never is. Sticky, so a frame of bad camera data (a stray
-    // pass slipping through the decode) can't flip it.
+    // practically never is. Held once chosen (see g_playerController): the
+    // old instant switch still let Sheva steal it whenever her eye came
+    // within 25 of the camera while yours measured further or not at all -
+    // online, "certain times when we got close" (user, 2026-09-11).
     track->distance = 1e9f;
     float cam[3];
     if (plausible && LastCameraPosition(cam)) {
@@ -856,11 +888,35 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
         if (!best || t.distance < best->distance)
             best = &t;
     }
-    if (best && best->distance < kPlayerEyeMaxDistance) {
-        if (g_playerController != best->controller)
+    // Hold the current player (see g_playerController). Its "far" clock only
+    // runs on a real measurement: an unmeasured frame (an odd pose failing
+    // the plausibility check) is no evidence either way.
+    if (controller == g_playerController && track->distance < 1e8f) {
+        if (track->distance <= kPlayerKeepDistance)
+            g_playerFarSinceMs = 0;
+        else if (!g_playerFarSinceMs)
+            g_playerFarSinceMs = now;
+    }
+    const HeadTrack* current = nullptr;
+    for (const HeadTrack& t : g_heads) {
+        if (t.controller && t.controller == g_playerController && t.head && now - t.ms <= kHeadTrackExpiryMs)
+            current = &t;
+    }
+    const bool currentHolds = current && !(g_playerFarSinceMs && now - g_playerFarSinceMs >= kPlayerSwitchDelayMs);
+    if (best && best->distance < kPlayerEyeMaxDistance && best->controller != g_playerController) {
+        if (currentHolds) {
+            if (now - g_lastHoldLogMs >= 5000) {
+                g_lastHoldLogMs = now;
+                Log_Printf("CameraRigHook: kept player controller %p - %p's eye came within %.1f of the camera "
+                           "(the player's: %.1f)",
+                    g_playerController, best->controller, best->distance, current->distance);
+            }
+        } else {
             Log_Printf("CameraRigHook: player controller now %p (%s, eye %.1f from the rendered camera)",
                 best->controller, best->direct ? "main-camera candidate" : "fallback", best->distance);
-        g_playerController = best->controller;
+            g_playerController = best->controller;
+            g_playerFarSinceMs = 0;
+        }
     }
     const bool nearest = controller == g_playerController;
 
@@ -926,6 +982,13 @@ constexpr bool kMoveWhileAiming = true;
 constexpr DWORD kOffControllerAimFlag = 0x1B1;
 constexpr DWORD kOffCharacterPos = 0x30;
 constexpr float kAimWalkSpeed = 100.0f; // render units per second - first guess, tune by feel
+// After each step, do what the game's movement code does (see the end of
+// AimWalk): set the character's "moved" bit and run its step handler.
+constexpr bool kAimWalkCommitMove = true;
+constexpr DWORD kOffCharacterStepFlags = 0x2D7C;
+constexpr DWORD kStepMovedFlag = 0x10000000;
+constexpr DWORD kOffCharacterStepHandler = 0x2F30;
+constexpr DWORD kRvaStepHandlerUpdate = 0x864B40;
 
 // XInput is loaded at runtime rather than linked, so a missing DLL only
 // means no gamepad walking. 1_4 ships with Windows 8+, 1_3 with the DirectX
@@ -1043,6 +1106,24 @@ void AimWalk(unsigned char* controller)
     float* pos = reinterpret_cast<float*>(character + kOffCharacterPos);
     pos[0] += dx * kAimWalkSpeed * speedScale * dt;
     pos[2] += dz * kAimWalkSpeed * speedScale * dt;
+
+    // Commit the step the way the game's own movement code does after a
+    // root-motion step (re5dx9.exe+87A69B / +87ACF8): mark the character as
+    // moved (character+0x2D7C |= 0x10000000 - all exe+75C350 does with that
+    // flag), then run the handler on character+0x2F30 (exe+864B40). The bare
+    // position write never reached the co-op partner: they saw you frozen
+    // while aiming, then a teleport when aiming ended (2026-09-11). Whether
+    // these are what sends the move online is untested - needs a co-op session.
+    if (kAimWalkCommitMove) {
+        *reinterpret_cast<DWORD*>(character + kOffCharacterStepFlags) |= kStepMovedFlag;
+        void* handler = nullptr;
+        if (TryRead(&handler, character + kOffCharacterStepHandler, sizeof(handler)) && handler) {
+            typedef void(__fastcall * StepHandler_t)(void* self, void* edxUnused);
+            const auto update = reinterpret_cast<StepHandler_t>(
+                reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)) + kRvaStepHandlerUpdate);
+            update(handler, nullptr);
+        }
+    }
 }
 
 extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
@@ -1190,19 +1271,44 @@ void CameraRigHook_OnEndScene()
     }
     prevGraveDown = graveDown;
 
-    // Live VR tuning: ',' / '.' = eye forward offset (g_vrEyeAheadScale).
+    // Live eye tuning: ',' / '.' = back / forward, Shift with them = down / up.
+    // Whichever mode is running gets tuned, so a VR session never disturbs the
+    // flat-screen position or the other way round.
     static bool prevCommaDown = false, prevPeriodDown = false;
     const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
     const bool periodDown = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
     const bool commaPressed = commaDown && !prevCommaDown;
     const bool periodPressed = periodDown && !prevPeriodDown;
     if (commaPressed || periodPressed) {
-        g_vrEyeAheadScale += (periodPressed ? 1.0f : -1.0f) * kVrEyeAheadStep;
-        if (g_vrEyeAheadScale < 0.0f)
-            g_vrEyeAheadScale = 0.0f;
-        if (g_vrEyeAheadScale > 1.5f)
-            g_vrEyeAheadScale = 1.5f;
-        Log_Printf("CameraRigHook: VR eye forward scale now %.1f (1.0 = the flat-screen position)", g_vrEyeAheadScale);
+        const float direction = periodPressed ? 1.0f : -1.0f;
+        const bool fov = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool height = !fov && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (fov) {
+            // 90 reads wide and makes Chris feel short of his 6 feet (user,
+            // 2026-09-11); 75-80 usually feels right. Flat first person only:
+            // VR renders with the headset's own FOV, and the FOV the game
+            // culls with in VR is separate again (kVrCullVerticalFovDeg).
+            g_flatFovDeg += direction * kFlatFovStep;
+            if (g_flatFovDeg < kFlatFovMin)
+                g_flatFovDeg = kFlatFovMin;
+            if (g_flatFovDeg > kFlatFovMax)
+                g_flatFovDeg = kFlatFovMax;
+            Log_Printf("CameraRigHook: flat first-person FOV now %.0f deg horizontal", g_flatFovDeg);
+        } else {
+            const bool vrActive = g_vrActive.load(std::memory_order_relaxed);
+            EyeOffsetScale& eye = vrActive ? g_vrEye : g_flatEye;
+            float& value = height ? eye.up : eye.ahead;
+            value += direction * kEyeScaleStep;
+            const float minValue = height ? 0.0f : kEyeAheadMin;
+            if (value < minValue)
+                value = minValue;
+            const float maxValue = height ? kEyeUpMax : kEyeScaleMax;
+            if (value > maxValue)
+                value = maxValue;
+            Log_Printf("CameraRigHook: %s eye %s now %.1f (1.0 = the skeleton eye, 0 = the head joint) - VR up %.1f fwd %.1f, flat up %.1f fwd %.1f",
+                vrActive ? "VR" : "flat", height ? "height" : "forward", value,
+                g_vrEye.up, g_vrEye.ahead, g_flatEye.up, g_flatEye.ahead);
+        }
     }
     prevCommaDown = commaDown;
     prevPeriodDown = periodDown;

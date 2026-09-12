@@ -9,12 +9,20 @@
 #include "culling_patch.h"
 #include "query_probe.h"
 #include "skeleton_probe.h"
+#include "state_probe.h"
+#include "laser_patch.h"
 #include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
 
 #include <MinHook.h>
 #include <windows.h>
+
+// Developer diagnostics: the probes and captures used to find things in the
+// game, plus the Phase 0 blinking quad. Off in released builds - players hit
+// F-keys by accident, and some of these visibly break the camera or write
+// large files into the game folder. Set to 1 for a debugging build.
+#define RE5VR_DIAGNOSTICS 0
 
 namespace {
 
@@ -103,6 +111,7 @@ typedef HRESULT(WINAPI* EndScene_t)(IDirect3DDevice9* This);
 EndScene_t oEndScene = nullptr;
 UINT64 g_frameCounter = 0;
 
+#if RE5VR_DIAGNOSTICS
 struct DebugVertex {
     float x, y, z, rhw;
     DWORD color;
@@ -136,6 +145,7 @@ void DrawDebugQuad(IDirect3DDevice9* pDevice)
     pDevice->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, verts, sizeof(DebugVertex));
     StereoTest_SetSuppressed(false);
 }
+#endif
 
 // ---- IDirect3DDevice9::Present: the one true frame boundary ------------
 // EndScene fires several times per rendered frame here (once per pass), so
@@ -162,12 +172,14 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     // Poll the F8 stereo-test toggle first.
     StereoTest_OnEndScene(This);
     CameraRigHook_OnEndScene();
-    BoomFinder_OnEndScene();
-    FadeProbe_OnEndScene();
+#if RE5VR_DIAGNOSTICS
+    BoomFinder_OnEndScene();   // F5: hardware-watchpoint finder
+    StateProbe_OnEndScene();   // "=": game-state capture
+    SkeletonProbe_OnEndScene();
+#endif
     FadePatch_OnEndScene();
     CullingPatch_OnEndScene();
     QueryProbe_OnEndScene();
-    SkeletonProbe_OnEndScene();
 
     // At this point the game's own rendering for this frame is completely
     // finished (backbuffer holds the final, fully composited/tonemapped
@@ -176,10 +188,12 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     // debug quad below) draws on top of it.
     VRBridge_OnEndScene(This);
 
+#if RE5VR_DIAGNOSTICS
     DrawDebugQuad(This);
-    ConstantProbe_OnEndScene();
-    PixelConstantProbe_OnEndScene();
-    HeadHideProbe_OnEndScene();
+    ConstantProbe_OnEndScene();      // F6/F9/F10 (F10 visibly shears the camera)
+    PixelConstantProbe_OnEndScene(); // Page Up/Down, Delete
+    HeadHideProbe_OnEndScene();      // F1-F3, F11, F12 (F12 is Steam's screenshot key)
+#endif
 
     if (g_frameCounter % 300 == 0)
         Log_Printf("hkEndScene: frame %llu", g_frameCounter);
@@ -243,4 +257,5 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     CameraRigHook_Install();
     FadePatch_Install();
     CullingPatch_Install();
+    LaserPatch_Install();
 }
