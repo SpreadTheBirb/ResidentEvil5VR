@@ -12,6 +12,11 @@ PFN_Direct3DCreate9Ex g_RealDirect3DCreate9Ex = nullptr;
 
 namespace {
 HMODULE g_hRealD3D9 = nullptr;
+
+// Did we chain to dgVoodoo2, or fall back to the system d3d9.dll? VR needs
+// dgVoodoo2's D3D12 frames, so this is also the answer to "can this install
+// do VR at all" - see RealD3D9_UsingDgVoodoo.
+bool g_usingDgVoodoo = false;
 // The CreateDevice-bootstrap probe (dgVoodoo2 route), kept for the whole run -
 // see RealD3D9_Init.
 IDirect3D9Ex* g_bootstrapProbe = nullptr;
@@ -100,6 +105,7 @@ bool RealD3D9_Init()
 
     g_hRealD3D9 = LoadLibraryA(realPath);
     const bool usingDgVoodoo = g_hRealD3D9 != nullptr;
+    g_usingDgVoodoo = usingDgVoodoo;
     if (!usingDgVoodoo) {
         // No dgVoodoo2 next to us: fall back to the system d3d9.dll - Windows'
         // own on Windows, DXVK under Proton. dgVoodoo2's author doesn't
@@ -206,4 +212,9 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
         Hooks_OnD3D9ExCreated(*ppD3D);
 
     return hr;
+}
+
+bool RealD3D9_UsingDgVoodoo()
+{
+    return g_usingDgVoodoo;
 }

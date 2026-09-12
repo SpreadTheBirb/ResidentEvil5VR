@@ -2025,6 +2025,20 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
 
     static bool prevF7Down = false;
     bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (f7Down && !prevF7Down && !RealD3D9_UsingDgVoodoo()) {
+        // Flat-screen install (or Linux/Proton): no dgVoodoo2, so there are no
+        // D3D12 frames to send a headset and VR cannot work. Refuse the key
+        // outright instead of starting stereo and stranding the player in a
+        // split-screen image they have to know about F8 to undo.
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log_Printf("XRBridge: F7 ignored - this is the flat-screen install (no dgVoodoo2 alongside us), so "
+                       "there is nothing to send to a headset. First person (F4) works exactly as normal.");
+        }
+        prevF7Down = f7Down;
+        return;
+    }
     if (f7Down && !prevF7Down) {
         g_xrModeEnabled = !g_xrModeEnabled;
         Log_Printf("XRBridge: F7 pressed, XR mode now %s", g_xrModeEnabled ? "ON" : "OFF");
