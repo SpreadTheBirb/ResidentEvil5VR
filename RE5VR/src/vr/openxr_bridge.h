@@ -85,3 +85,29 @@ struct XRBridgeEyeView {
 // turned on), in which case callers should fall back to their own
 // non-head-tracked behavior.
 bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight);
+
+// ---- Rendered-pose tracking (2026-09-12) -------------------------------
+// A tester reported VR being janky and twitchy while the desktop split view
+// was perfectly smooth. Cause: xrEndFrame was submitting the pose from the
+// submit thread's OWN latest xrLocateViews, but the pixels were rendered by
+// the game some frames earlier from an older pose. Claiming a newer pose
+// than the image was drawn with makes the compositor reproject the wrong
+// way, so every head movement lurches and settles - and it is invisible on
+// the desktop mirror, which does no reprojection at all.
+//
+// The fix is to submit the pose the image was ACTUALLY rendered with:
+//   * the render thread latches a pose id along with the eye views,
+//   * at Present it tags the frame the addon just published with that id,
+//   * the submit thread looks the id back up and submits that pose.
+//
+// Ids are opaque and monotonic; 0 means "none".
+using XRBridgePoseId = unsigned long long;
+
+// The id of the eye views most recently published by the submit thread.
+// Latch this in the same breath as VRBridge_GetEyeViews.
+XRBridgePoseId VRBridge_GetCurrentPoseId();
+
+// Call from the Present hook AFTER the game has finished the frame,
+// passing the pose id that frame was rendered with. Associates it with
+// whichever addon slot the producer just published.
+void VRBridge_NoteFramePresented(XRBridgePoseId poseId);

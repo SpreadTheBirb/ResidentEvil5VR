@@ -61,3 +61,9 @@ void* CameraRigHook_GetPlayerController();
 // True while the OpenXR session is delivering frames (polled from the
 // render thread every 100 ms). Safe to call from any thread.
 bool CameraRigHook_IsVrActive();
+
+// True while head tracking is actually steering the game's camera this frame
+// (VR on, F9 on, gun down). When it is, the game camera ALREADY contains your
+// head rotation, so stereo_test must not rotate the eye bases by the head
+// delta a second time - see the head-follow compensation there.
+bool CameraRigHook_HeadFollowDrivingCamera();

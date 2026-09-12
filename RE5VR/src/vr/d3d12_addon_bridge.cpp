@@ -148,8 +148,17 @@ bool D3D12AddonBridge_IsActive()
     return g_active;
 }
 
+int D3D12AddonBridge_GetFrontSlot()
+{
+    if (!g_active || !g_pGetFrontSlot)
+        return -1;
+    const int slot = g_pGetFrontSlot();
+    return (slot < 0 || slot > 1) ? -1 : slot;
+}
+
 bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
-    ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight)
+    ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight,
+    int* outSlot)
 {
     if (!g_active || !g_pGetFrontSlot)
         return false;
@@ -157,6 +166,8 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
     const int frontSlot = g_pGetFrontSlot();
     if (frontSlot < 0 || frontSlot > 1)
         return false; // addon hasn't published a frame yet
+    if (outSlot)
+        *outSlot = frontSlot;
 
     ID3D11Texture2D* src = g_fullFrameTex[frontSlot];
     if (!src)

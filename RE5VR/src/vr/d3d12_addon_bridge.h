@@ -44,8 +44,16 @@ bool D3D12AddonBridge_IsActive();
 // must match what TryInit reported (width/2, height). Returns false if
 // the addon hasn't published a frame yet (front slot still unset) -
 // treat that the same as "nothing new to copy this call", not an error.
+// outSlot, when given, receives the producer slot the pixels came from.
+// The submit path needs it to look up which head pose the game actually
+// rendered that image with - see VRBridge_NoteFramePresented.
 bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
-    ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight);
+    ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight,
+    int* outSlot = nullptr);
+
+// Which slot the producer most recently published, or -1 if none yet.
+// Called on the game thread at Present to tag the just-finished frame.
+int D3D12AddonBridge_GetFrontSlot();
 
 // Releases the opened D3D11 textures/module reference. Safe to call
 // even if TryInit was never called or failed.

@@ -2,6 +2,7 @@
 #include "util/log.h"
 #include "proxy/real_d3d9.h"
 #include "hooks/getprocaddress_hook.h"
+#include "util/crash_log.h"
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
@@ -10,6 +11,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         Log_Init();
         Log_Printf("RE5VR proxy DLL attached (module=%p)", hModule);
+        CrashLog_Install();
 
         // re5dx9.exe statically imports at least one d3d9.dll export
         // (D3DPERF_GetStatus) that the loader/game-startup code calls

@@ -11,6 +11,7 @@
 #include "skeleton_probe.h"
 #include "state_probe.h"
 #include "laser_patch.h"
+#include "filter_patch.h"
 #include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
@@ -180,6 +181,7 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     FadePatch_OnEndScene();
     CullingPatch_OnEndScene();
     QueryProbe_OnEndScene();
+    FilterPatch_OnEndScene(); // F10: RE5's colour filter
 
     // At this point the game's own rendering for this frame is completely
     // finished (backbuffer holds the final, fully composited/tonemapped
@@ -258,4 +260,5 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     FadePatch_Install();
     CullingPatch_Install();
     LaserPatch_Install();
+    FilterPatch_Install();
 }

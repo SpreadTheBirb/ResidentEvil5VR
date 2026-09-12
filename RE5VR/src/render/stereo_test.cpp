@@ -9,6 +9,8 @@
 #include "mat3.h"
 
 #include <MinHook.h>
+
+#include <atomic>
 #include <windows.h>
 #include <cmath>
 #include <cstdio>
@@ -89,6 +91,15 @@ constexpr float kHalfSeparationStep = 0.25f;
 // (higher value = bigger FOV, matching the increase-on-the-right
 // convention of '['/']'). Applied AFTER the real per-eye scale is chosen,
 // and has no effect on orientation.
+// Draw post-process buffers (anything meaningfully smaller than the
+// backbuffer) once instead of splitting them per eye - see
+// RenderTargetIsScreenShaped. '/' toggles.
+std::atomic<bool> g_monoSmallTargets{ true };
+
+// Don't rotate the eye bases by the head delta while F9 is already steering
+// the game camera with it - see buildEyeBasis. '\' toggles.
+std::atomic<bool> g_compensateHeadFollow{ false };
+
 float g_fovWidenMultiplier = 1.0f;
 constexpr float kFovWidenStep = 0.1f;
 
@@ -105,6 +116,9 @@ constexpr float kScreenSpaceScale = 0.8f;
 constexpr unsigned long long kPresentStaleMs = 250;
 XRBridgeEyeView g_frameViews[2] = {};
 bool g_haveFrameViews = false;
+// Which published pose g_frameViews came from, carried through to Present
+// so the submit path can tell the compositor the truth about this image.
+XRBridgePoseId g_frameViewsPoseId = 0;
 unsigned long long g_lastPresentMs = 0;
 unsigned g_presentCount = 0;
 UINT g_backBufferWidth = 0;
@@ -412,6 +426,25 @@ bool RenderTargetIsScreenShaped(IDirect3DDevice9* pDevice)
     rt->Release();
     if (!haveDesc || !d.Width || !d.Height)
         return true;
+    // Aspect alone is not enough (2026-09-12). The post-process chain -
+    // bright-pass, bloom, light shafts - renders into buffers that are a
+    // half or a quarter of the backbuffer but keep its ASPECT, so they
+    // sailed through this test and got scissor-split per eye like real
+    // scene geometry. A radial light-shaft blur reading from a source that
+    // has been shifted and clipped in half produces exactly the hard-edged
+    // bright wedges the user reported as "light leaks" - present with
+    // culling on or off, wide FOV or not, because it was never a culling
+    // problem. Anything meaningfully smaller than the backbuffer is now
+    // drawn ONCE, untouched, and composited mono. '/' toggles this back for
+    // comparison.
+    if (g_monoSmallTargets.load(std::memory_order_relaxed)) {
+        const bool fullSize = d.Width * 10 >= g_backBufferWidth * 9 && d.Height * 10 >= g_backBufferHeight * 9;
+        if (!fullSize) {
+            CountOffscreenTarget(d.Width, d.Height);
+            return false;
+        }
+    }
+
     const float rtAspect = static_cast<float>(d.Width) / static_cast<float>(d.Height);
     const float bbAspect = static_cast<float>(g_backBufferWidth) / static_cast<float>(g_backBufferHeight);
     if (std::fabs(rtAspect - bbAspect) <= 0.02f * bbAspect)
@@ -478,9 +511,21 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
     auto buildEyeBasis = [&](const XRBridgeEyeView& view, bool leftEye) {
         CameraBasis basis = baseBasis;
 
-        Mat3 delta{};
-        std::memcpy(delta.m, view.rotationDelta, sizeof(delta.m));
-        ApplyHeadRotation(basis, delta);
+        // Head-follow compensation (2026-09-12). When F9 is steering the
+        // game's camera, that camera ALREADY contains this rotation - the
+        // measurement showed it tracking the head 1:1 - so rotating the eye
+        // basis by it again turns the world roughly twice as far as the
+        // wearer turns. That is consistent with the user needing to "move
+        // slow to get it to feel smooth". While head-follow is driving, skip
+        // the delta and let the game camera carry the rotation on its own.
+        // '\' toggles this off to compare.
+        const bool headFollowDriving = g_compensateHeadFollow.load(std::memory_order_relaxed) &&
+            CameraRigHook_HeadFollowDrivingCamera();
+        if (!headFollowDriving) {
+            Mat3 delta{};
+            std::memcpy(delta.m, view.rotationDelta, sizeof(delta.m));
+            ApplyHeadRotation(basis, delta);
+        }
 
         const float offset = leftEye ? -g_halfSeparation : g_halfSeparation;
         for (int i = 0; i < 3; ++i)
@@ -755,6 +800,30 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
         g_enabled = !g_enabled;
         Log_Printf("StereoTest: F8 pressed, scissor-split stereo test now %s", g_enabled ? "ON" : "OFF");
     }
+
+    // '/' = draw post-process buffers mono instead of per eye.
+    static bool prevSlashDown = false;
+    const bool slashDown = (GetAsyncKeyState(VK_OEM_2) & 0x8000) != 0;
+    if (slashDown && !prevSlashDown) {
+        const bool on = !g_monoSmallTargets.load(std::memory_order_relaxed);
+        g_monoSmallTargets.store(on, std::memory_order_relaxed);
+        Log_Printf("StereoTest: '/' pressed, post-process buffers now drawn %s",
+            on ? "MONO (small render targets not split per eye)" : "per eye (old behaviour)");
+    }
+    prevSlashDown = slashDown;
+
+    // '\' = apply the head delta to the eyes even while head-follow is
+    // steering the camera (i.e. the old, double-rotating behaviour).
+    static bool prevBackslashDown = false;
+    const bool backslashDown = (GetAsyncKeyState(VK_OEM_5) & 0x8000) != 0;
+    if (backslashDown && !prevBackslashDown) {
+        const bool on = !g_compensateHeadFollow.load(std::memory_order_relaxed);
+        g_compensateHeadFollow.store(on, std::memory_order_relaxed);
+        Log_Printf("StereoTest: '\\' pressed, head-follow double-rotation compensation now %s",
+            on ? "ON (eyes not rotated again while F9 steers the camera)" : "OFF (old behaviour)");
+    }
+    prevBackslashDown = backslashDown;
+
     prevF8Down = f8Down;
 
     // Does F4 actually move the game's camera while VR is on? The user
@@ -912,9 +981,35 @@ void StereoTest_SetEnabled(bool enabled)
     g_enabled = enabled;
 }
 
+bool StereoTest_GetLatchedHeadForward(float out[3])
+{
+    if (!g_frameFixes || !g_haveFrameViews || GetTickCount64() - g_lastPresentMs >= kPresentStaleMs)
+        return false;
+    // Row 2 of the rotation delta is forward, same convention the bridge
+    // publishes and camera_rig_hook consumes.
+    out[0] = g_frameViews[0].rotationDelta[6];
+    out[1] = g_frameViews[0].rotationDelta[7];
+    out[2] = g_frameViews[0].rotationDelta[8];
+    return true;
+}
+
+float StereoTest_GetBackbufferAspect()
+{
+    if (!g_backBufferWidth || !g_backBufferHeight)
+        return 16.0f / 9.0f;
+    return static_cast<float>(g_backBufferWidth) / static_cast<float>(g_backBufferHeight);
+}
+
 void StereoTest_OnPresent()
 {
+    // The frame that was just presented is the one rendered with the pose
+    // latched at the PREVIOUS Present, so hand that id over before taking a
+    // new one - the bridge tags the outgoing image with it so the compositor
+    // is told the pose those pixels were really drawn from.
+    VRBridge_NoteFramePresented(g_frameViewsPoseId);
+
     g_haveFrameViews = VRBridge_GetEyeViews(g_frameViews[0], g_frameViews[1]);
+    g_frameViewsPoseId = g_haveFrameViews ? VRBridge_GetCurrentPoseId() : 0;
     g_lastPresentMs = GetTickCount64();
     ++g_presentCount;
 }

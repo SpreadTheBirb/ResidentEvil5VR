@@ -37,9 +37,35 @@
 // with 1.0. Every other caller passes through untouched. The per-caller
 // summary logged at EndScene shows which sites actually fire.
 
+// ---- The OTHER fade, found 2026-09-12 ----------------------------------
+// The tester reported NPCs and Sheva fading out when you walk right up to
+// them, which the above did nothing about - and the per-caller log showed no
+// fractional values while it happened. Reason: there are two setters.
+//
+//   SetVisibility  +7576C0  stores the raw value at model+view*4+1724h,
+//     then calls the mapper below with it.
+//   ApplyVisibility +755410  maps a value through a global response curve
+//     ([123457Ch]+3090h..309Ch) and stores the EFFECTIVE alpha the renderer
+//     reads, at model+view*4+1734h.
+//
+// +757710 is the per-model proximity fade: distance from the model's origin
+// (+0x30/34/38) to the camera, against a near/far pair of globals
+// ([113AF20h] and friends, with hysteresis at [113AF38h]), driving a
+// four-state machine (0 visible, 1 fading out, 2 hidden, 3 fading in) whose
+// state lives at [slot-10h]. It animates the alpha itself and writes it
+// STRAIGHT to +755410, never through SetVisibility - which is exactly why
+// the existing hook never saw it. Its one SetVisibility call (+757B90) is a
+// separate branch that sets the distance ratio instantly; it didn't fire in
+// the capture but it is the same feature, so it is blocked too.
+//
+// Not included: +757956, which copies a child's visibility onto its parent.
+// Same reasoning as +439E21/+439E6F below - with the real fades blocked it
+// copies 1.0 anyway, and forcing it would reveal scripted hides.
+
 namespace {
 
 constexpr uintptr_t kOffSetVisibility = 0x7576C0;
+constexpr uintptr_t kOffApplyVisibility = 0x755410;
 
 // Return addresses (module-relative) of the camera's own fade writes:
 //   +43D2C3  1 - ([cam+30DCh]/k) * (1 - x)      proximity fade, character
@@ -49,10 +75,21 @@ constexpr uintptr_t kOffSetVisibility = 0x7576C0;
 // CURRENT visibility onto its attachments. With the camera fades blocked they
 // copy 1.0 anyway - and if a script hides the character (0.0), the gun must
 // hide with it rather than float in mid-air.
-constexpr uintptr_t kCameraCallers[] = { 0x43D2C8, 0x43D4AC, 0x43D4F1 };
+//   +757B90  the proximity fade's instant branch: clamp((dist - near) /
+//            (far - near), 0, 1), applied to the model itself.
+constexpr uintptr_t kCameraCallers[] = { 0x43D2C8, 0x43D4AC, 0x43D4F1, 0x757B90 };
+
+// Return addresses of the proximity fade's animated writes, which go direct
+// to ApplyVisibility. +757A24 is deliberately absent: that is state 0 and it
+// always pushes exactly 1.0, so overriding it would only add log noise.
+//   +757A89  state 1, alpha -= dt * fadeOutRate
+//   +757AC4  state 2 -> 3 transition, pushes 0.0
+//   +757B1B  state 3, alpha += dt * fadeInRate
+constexpr uintptr_t kFadeStateCallers[] = { 0x757A89, 0x757AC4, 0x757B1B };
 
 typedef void(__fastcall* SetVisibility_t)(void* model, void* edxUnused, int view, float value);
 SetVisibility_t g_origSetVisibility = nullptr;
+SetVisibility_t g_origApplyVisibility = nullptr;
 
 uintptr_t g_moduleBase = 0;
 volatile bool g_enabled = false;
@@ -72,6 +109,19 @@ unsigned long long g_lastReportMs = 0;
 bool IsCameraCaller(uintptr_t ret)
 {
     for (uintptr_t c : kCameraCallers) {
+        if (ret == c)
+            return true;
+    }
+    for (uintptr_t c : kFadeStateCallers) {
+        if (ret == c)
+            return true;
+    }
+    return false;
+}
+
+bool IsFadeStateCaller(uintptr_t ret)
+{
+    for (uintptr_t c : kFadeStateCallers) {
         if (ret == c)
             return true;
     }
@@ -109,6 +159,20 @@ void __fastcall hkSetVisibility(void* model, void* edxUnused, int view, float va
     g_origSetVisibility(model, edxUnused, view, value);
 }
 
+// The proximity fade animates the alpha itself and writes it here, bypassing
+// SetVisibility entirely. Only its own sites are overridden - everything
+// else, including SetVisibility's own internal call at +7576EB (which has
+// already been corrected by the hook above), passes through.
+void __fastcall hkApplyVisibility(void* model, void* edxUnused, int view, float value)
+{
+    const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_moduleBase;
+    const bool overridden = g_enabled && IsFadeStateCaller(ret) && value != 1.0f;
+    RecordCaller(ret, value, overridden);
+    if (overridden)
+        value = 1.0f;
+    g_origApplyVisibility(model, edxUnused, view, value);
+}
+
 } // namespace
 
 void FadePatch_Install()
@@ -134,6 +198,27 @@ void FadePatch_Install()
     }
     st = MH_EnableHook(target);
     Log_Printf("FadePatch_Install: SetVisibility hook enabled -> %d (target=%p)", static_cast<int>(st), target);
+
+    // ApplyVisibility. Expected prologue: mov eax,ds:[0123457Ch] - an
+    // absolute address, so it pins the build as tightly as a byte pattern.
+    void* applyTarget = reinterpret_cast<void*>(g_moduleBase + kOffApplyVisibility);
+    static const unsigned char kApplyPrologue[] = { 0xA1, 0x7C, 0x45, 0x23, 0x01 };
+    if (std::memcmp(applyTarget, kApplyPrologue, sizeof(kApplyPrologue)) != 0) {
+        const unsigned char* p = static_cast<const unsigned char*>(applyTarget);
+        Log_Printf("FadePatch_Install: ApplyVisibility prologue is %02X %02X %02X %02X %02X, not the expected "
+                   "one - not hooking (proximity fade stays on)",
+            p[0], p[1], p[2], p[3], p[4]);
+        return;
+    }
+
+    st = MH_CreateHook(applyTarget, reinterpret_cast<void*>(&hkApplyVisibility),
+        reinterpret_cast<void**>(&g_origApplyVisibility));
+    if (st != MH_OK && st != MH_ERROR_ALREADY_CREATED) {
+        Log_Printf("FadePatch_Install: MH_CreateHook(ApplyVisibility) failed -> %d", static_cast<int>(st));
+        return;
+    }
+    st = MH_EnableHook(applyTarget);
+    Log_Printf("FadePatch_Install: ApplyVisibility hook enabled -> %d (target=%p)", static_cast<int>(st), applyTarget);
 }
 
 void FadePatch_SetEnabled(bool enabled)

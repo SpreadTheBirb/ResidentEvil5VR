@@ -46,3 +46,15 @@ void StereoTest_SetSuppressed(bool suppressed);
 // underlying stereo rendering, since there's nothing to submit to the
 // headset otherwise.
 void StereoTest_SetEnabled(bool enabled);
+
+// The real backbuffer aspect (width / height), or 16:9 before the first
+// frame has been seen. Authoritative, unlike inferring it from whatever
+// camera matrix a pass happened to leave cached - see FirstPersonVerticalFov.
+float StereoTest_GetBackbufferAspect();
+
+// The head's forward vector from the pose LATCHED for this frame - the same
+// snapshot the eye matrices use. False if no fresh latch exists. Head-follow
+// must use this rather than the live published pose: two different snapshots
+// of the same head, sampled moments apart, make a fast turn overshoot and
+// snap back as they reconverge.
+bool StereoTest_GetLatchedHeadForward(float out[3]);

@@ -90,6 +90,7 @@
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\util\log.cpp" />
+    <ClCompile Include="src\util\crash_log.cpp" />
     <ClCompile Include="src\proxy\real_d3d9.cpp" />
     <ClCompile Include="src\proxy\blind_forwards.cpp" />
     <ClCompile Include="src\hooks\d3d9_hooks.cpp" />
@@ -104,6 +105,7 @@
     <ClCompile Include="src\hooks\skeleton_probe.cpp" />
     <ClCompile Include="src\hooks\state_probe.cpp" />
     <ClCompile Include="src\hooks\laser_patch.cpp" />
+    <ClCompile Include="src\hooks\filter_patch.cpp" />
     <ClCompile Include="src\hooks\culling_patch.cpp" />
     <ClCompile Include="src\hooks\query_probe.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
@@ -118,6 +120,7 @@
 
   <ItemGroup>
     <ClInclude Include="src\util\log.h" />
+    <ClInclude Include="src\util\crash_log.h" />
     <ClInclude Include="src\proxy\real_d3d9.h" />
     <ClInclude Include="src\proxy\blind_forwards.h" />
     <ClInclude Include="src\hooks\d3d9_hooks.h" />
@@ -132,6 +135,7 @@
     <ClInclude Include="src\hooks\skeleton_probe.h" />
     <ClInclude Include="src\hooks\state_probe.h" />
     <ClInclude Include="src\hooks\laser_patch.h" />
+    <ClInclude Include="src\hooks\filter_patch.h" />
     <ClInclude Include="src\hooks\culling_patch.h" />
     <ClInclude Include="src\hooks\query_probe.h" />
     <ClInclude Include="src\render\stereo_test.h" />

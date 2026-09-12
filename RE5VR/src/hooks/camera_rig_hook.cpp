@@ -1,6 +1,7 @@
 #include "camera_rig_hook.h"
 #include "constant_probe.h"
 #include "fade_patch.h"
+#include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
 
@@ -461,12 +462,21 @@ bool RigViewDirection(const unsigned char* rig, float* outDy, float* outDz)
 // the frustum the game culls with, which helps.
 float g_flatFovDeg = 90.0f; // horizontal; Ctrl + ',' / '.' tune it live
 constexpr float kPi = 3.14159265358979f;
-float g_screenAspect = 16.0f / 9.0f;
 
 float FirstPersonVerticalFov()
 {
+    // Aspect comes from the BACKBUFFER, not from whatever camera matrix a
+    // pass happened to leave cached (2026-09-12). The old way read sy/sx off
+    // the cached matrix, and the game runs plenty of passes whose projection
+    // isn't the screen's shape - catch a squarish one at the wrong moment and
+    // the aspect lands near 1.0, which turns a 90 deg horizontal FOV into a
+    // 90 deg VERTICAL one and fisheyes the view. That is the "FOV bug" the
+    // tester reported as FOV fighting, reproduced by the user on 2026-09-12
+    // by pressing F4 in flat mode; entering VR hid it because VR uses the
+    // fixed cull FOV constant instead of this function.
+    const float aspect = StereoTest_GetBackbufferAspect();
     const float halfH = g_flatFovDeg * 0.5f * kPi / 180.0f;
-    return 2.0f * std::atan(std::tan(halfH) / g_screenAspect) * 180.0f / kPi;
+    return 2.0f * std::atan(std::tan(halfH) / aspect) * 180.0f / kPi;
 }
 
 // ---- VR-only tuning (2026-09-11) ----------------------------------------
@@ -488,8 +498,84 @@ std::atomic<bool> g_vrActive{false};
 // whatever culls them is something else working from the game camera.
 // 150 deg vertical also covers looking down with the head, which the game
 // camera doesn't follow. '`' toggles it for A/B in the headset.
+// ---- VR camera stabilisation (F11, default ON, 2026-09-12) -------------
+// The rig sits on the character's head JOINT, which breathes, sways and
+// settles under idle animation. On a monitor that reads as life; in a
+// headset it is the view shaking by itself, and it also breaks reprojection,
+// because none of that motion is in the pose we hand OpenXR - the compositor
+// is told the head didn't move while the image says otherwise. The user
+// confirmed it 2026-09-12: standing still, no stick, no mouse, head-only -
+// still jittery, and only F9 (which overrides where the camera points) made
+// it better.
+//
+// So in VR the eye position is low-passed: slow motion (walking, crouching,
+// genuinely leaning) passes through, animation shake does not. A time
+// constant rather than a hard freeze, so the camera still follows the
+// character instead of detaching from him.
+std::atomic<bool> g_vrStabiliseEye{true};
+constexpr float kEyeSmoothTimeConstantSec = 0.12f;
+
 std::atomic<bool> g_vrWideFov{true};
-constexpr float kVrCullVerticalFovDeg = 150.0f;
+// 150 is a ceiling, not a preference. 179 was tried on 2026-09-12 to get
+// "cull nothing" and the headset image went visibly FISHEYE - so the claim
+// this comment used to make, that the game's FOV never reaches the VR image
+// because stereo_test builds each eye from OpenXR's own FOV, is WRONG. The
+// game's projection still feeds the matrices we transform. Widening the cull
+// frustum therefore costs image distortion, and 150 is about where that
+// stops being noticeable. Fixing culling properly means decoupling the two,
+// not turning this number up.
+constexpr float kVrCullVerticalFovDeg = 150.0f; // fallback only, see VrCullVerticalFov
+
+// Derive the culling FOV from the headset's REAL frustum instead of a magic
+// number (2026-09-12). 90 was too narrow - the Quest 3 shows ~100-110 deg per
+// eye, so a partner's legs sat outside the game's cone unless you looked
+// straight at them, with F9 on or off. 150 covered everything but cost LOD on
+// most of the scene, because LOD is picked from projected screen size. The
+// headset already tells us its exact per-eye angles every frame; the right
+// answer is "everything the wearer can physically see, plus a margin", which
+// is far narrower than 150 and never too narrow.
+constexpr float kVrCullFovMargin = 1.15f;
+constexpr float kVrCullFovMinDeg = 90.0f;
+constexpr float kVrCullFovMaxDeg = 170.0f;
+
+float VrCullVerticalFov()
+{
+    XRBridgeEyeView l, r;
+    if (!VRBridge_GetEyeViews(l, r))
+        return kVrCullVerticalFovDeg;
+
+    // OpenXR angles are signed from the view axis: left/down negative, so the
+    // union across both eyes is the widest excursion on each side.
+    const float up = std::fmax(l.angleUp, r.angleUp);
+    const float down = std::fmax(-l.angleDown, -r.angleDown);
+    const float left = std::fmax(-l.angleLeft, -r.angleLeft);
+    const float right = std::fmax(l.angleRight, r.angleRight);
+    if (up + down <= 0.0f || left + right <= 0.0f)
+        return kVrCullVerticalFovDeg;
+
+    // The rig's FOV field is VERTICAL, and the game widens it horizontally by
+    // the screen aspect - so covering the headset's horizontal reach needs a
+    // vertical value big enough that aspect stretches it far enough.
+    const float aspect = StereoTest_GetBackbufferAspect();
+    const float vertical = up + down;
+    const float horizontal = left + right;
+    const float verticalForHorizontal = 2.0f * std::atan(std::tan(horizontal * 0.5f) / aspect);
+
+    float deg = std::fmax(vertical, verticalForHorizontal) * 180.0f / kPi * kVrCullFovMargin;
+    if (deg < kVrCullFovMinDeg)
+        deg = kVrCullFovMinDeg;
+    if (deg > kVrCullFovMaxDeg)
+        deg = kVrCullFovMaxDeg;
+
+    static float s_lastLogged = 0.0f;
+    if (std::fabs(deg - s_lastLogged) > 1.0f) {
+        s_lastLogged = deg;
+        Log_Printf("CameraRigHook: VR culling FOV from the headset - %.0f deg vertical (headset %.0f v / %.0f h, "
+                   "+%.0f%% margin)",
+            deg, vertical * 180.0f / kPi, horizontal * 180.0f / kPi, (kVrCullFovMargin - 1.0f) * 100.0f);
+    }
+    return deg;
+}
 
 // Eye placement. The flat-screen eye (15 ahead of the head pivot for Chris)
 // felt too far forward in VR, where head tracking moves the view on top of
@@ -509,10 +595,13 @@ struct EyeOffsetScale {
     float up;
     float ahead;
 };
-// Flat default: where the user settled on 2026-09-11 (log: up 0.9, fwd -0.9) -
-// a little back and a hair down from the skeleton eye, which frames the gun
-// well. 1.0/1.0 is the anatomically right 6-foot view, two presses away.
-EyeOffsetScale g_flatEye = { 0.9f, -0.9f };
+// Flat default: up 0.9, fwd -0.4. The height is where the user settled on
+// 2026-09-11; the forward offset was retuned on 2026-09-12 flat-screen -
+// they ran it to the -1.0 clamp, then stepped it forward six times and
+// stopped, calling that the default flat view. A little back and a hair down
+// from the skeleton eye, which frames the gun well. 1.0/1.0 is the
+// anatomically right 6-foot view, a few presses away.
+EyeOffsetScale g_flatEye = { 0.9f, -0.4f };
 EyeOffsetScale g_vrEye = { 1.0f, 0.2f };
 constexpr float kEyeScaleStep = 0.1f;
 constexpr float kEyeScaleMax = 2.0f;   // forward
@@ -522,13 +611,81 @@ constexpr float kFlatFovMin = 50.0f;
 constexpr float kFlatFovMax = 120.0f;
 constexpr float kEyeAheadMin = -1.0f; // forward may go behind the head pivot: the user hit the old 0.0 floor and wanted to pull back further
 
-void PlaceRigAtEye(unsigned char* rig, const float eye[3], float dy, float dz, float fovDeg)
+// ---- Head tracking drives the game camera (F9, default ON) -------------
+// In VR the game culls to where ITS camera points, so anything over your
+// shoulder never draws. Turning the game camera with your head fixes that.
+// It started as an experiment because RE5 also AIMS where the camera points,
+// which the forced laser makes very visible - but that objection is gone:
+// head-follow now applies only while the gun is down (see the aim gate in
+// OnRigsReady), so aiming is untouched. Tested 2026-09-12, the user asked for
+// it on by default: "felt a lot better, especially with F9 on". F9 still
+// toggles it. Known rough edge: the camera does not track 1:1 with a fast
+// head turn - something downstream eases toward the direction we write, and
+// finding it is the next job.
+std::atomic<bool> g_headFollow{ true };
+
+// Mirrors the gated head-follow decision for stereo_test - see
+// CameraRigHook_HeadFollowDrivingCamera.
+std::atomic<bool> g_headFollowDriving{ false };
+
+// The head's forward direction in the game camera's own frame (right, up,
+// forward), published by the render thread. Double-buffered: a torn read
+// here would be a jump in the camera - the same bug that punched holes in
+// the VR image before the pose was published whole.
+float g_headForward[2][3] = { { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f } };
+std::atomic<int> g_headForwardFront{ 0 };
+
+void PublishHeadForward(const float rotationDelta[9])
+{
+    const int back = 1 - g_headForwardFront.load(std::memory_order_relaxed);
+    g_headForward[back][0] = rotationDelta[6];
+    g_headForward[back][1] = rotationDelta[7];
+    g_headForward[back][2] = rotationDelta[8];
+    g_headForwardFront.store(back, std::memory_order_release);
+}
+
+// Turns a rig direction (pitch only, in rig space) by the head rotation.
+// The rig's own basis is forward = (0, dy, dz), up = (0, dz, -dy) and
+// right = (1, 0, 0); the head's forward arrives in exactly those terms.
+void ApplyHeadFollow(float* dx, float* dy, float* dz)
+{
+    // Take the head direction from the pose LATCHED for this frame - the very
+    // same one the eye matrices use. Reading the live published pose here
+    // instead (which is what this did until 2026-09-12) meant the camera was
+    // steered by a fresher snapshot than the image was rendered with: at
+    // moderate speed the view dragged behind, and on a fast turn it overshot
+    // and snapped back as the two reconverged. One pose per frame, everywhere;
+    // the remaining age is what the compositor's reprojection is for, and it
+    // is told exactly which pose the frame used.
+    float latched[3];
+    const bool haveLatched = StereoTest_GetLatchedHeadForward(latched);
+    const int front = g_headForwardFront.load(std::memory_order_acquire);
+    const float fx = haveLatched ? latched[0] : g_headForward[front][0];
+    const float fy = haveLatched ? latched[1] : g_headForward[front][1];
+    const float fz = haveLatched ? latched[2] : g_headForward[front][2];
+    const float rigDy = *dy, rigDz = *dz;
+    // Negated 2026-09-12: tested in the headset, looking left swung the game
+    // camera right and vice versa. The rig's sideways axis runs opposite to
+    // OpenXR's +X, which no amount of staring at the basis was going to
+    // settle - the headset did.
+    const float nx = -fx;
+    const float ny = fy * rigDz + fz * rigDy;
+    const float nz = -fy * rigDy + fz * rigDz;
+    const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (len < 1e-3f)
+        return;
+    *dx = nx / len;
+    *dy = ny / len;
+    *dz = nz / len;
+}
+
+void PlaceRigAtEye(unsigned char* rig, const float eye[3], float dx, float dy, float dz, float fovDeg)
 {
     float* f = reinterpret_cast<float*>(rig); // f[0..2] eye, f[4..6] target, f[9] FOV (+0x24)
     f[0] = eye[0];
     f[1] = eye[1];
     f[2] = eye[2];
-    f[4] = eye[0];
+    f[4] = eye[0] + dx * kFirstPersonTargetDistance;
     f[5] = eye[1] + dy * kFirstPersonTargetDistance;
     f[6] = eye[2] + dz * kFirstPersonTargetDistance;
     f[9] = fovDeg;
@@ -767,10 +924,11 @@ bool LastCameraPosition(float out[3])
                 g_camForward[i] = m[8 + i];
             }
             s_have = true;
-            // Sx = Sy / aspect whatever the FOV, so this is the screen's shape.
-            const float aspect = sy / sx;
-            if (aspect > 1.0f && aspect < 3.0f)
-                g_screenAspect = aspect;
+            // Deliberately NOT deriving the screen aspect here any more. It
+            // looked sound - Sx = Sy / aspect whatever the FOV - but "the
+            // matrix cached this instant" is not always the main scene's, and
+            // one squarish pass was enough to fisheye first person. The
+            // backbuffer knows its own shape; see FirstPersonVerticalFov.
         }
     }
     if (s_have)
@@ -1132,6 +1290,157 @@ void AimWalk(unsigned char* controller)
     }
 }
 
+// Low-pass the rig-space eye position - see g_vrStabiliseEye. Kept per
+// controller so a partner's rig can't drag the player's filter around, and
+// reset when a controller has been away long enough that continuing to
+// smooth from its old value would slide the camera across the level.
+void StabiliseEye(const unsigned char* controller, float* eyeNormal, float* eyeAim)
+{
+    struct Smoothed {
+        const unsigned char* owner;
+        unsigned long long lastMs;
+        float normal[3];
+        float aim[3];
+    };
+    static Smoothed s_state[4] = {};
+
+    const unsigned long long now = GetTickCount64();
+    Smoothed* slot = nullptr;
+    for (Smoothed& s : s_state) {
+        if (s.owner == controller) {
+            slot = &s;
+            break;
+        }
+    }
+    if (!slot) {
+        for (Smoothed& s : s_state) {
+            if (!s.owner || now - s.lastMs > 2000) {
+                slot = &s;
+                slot->owner = nullptr; // force the re-seed below
+                break;
+            }
+        }
+    }
+    if (!slot)
+        return; // all four busy - leave the position untouched rather than guess
+
+    const unsigned long long sinceMs = now - slot->lastMs;
+    const bool reseed = slot->owner != controller || sinceMs > 250;
+    slot->owner = controller;
+    slot->lastMs = now;
+    if (reseed) {
+        std::memcpy(slot->normal, eyeNormal, sizeof(slot->normal));
+        std::memcpy(slot->aim, eyeAim, sizeof(slot->aim));
+        return;
+    }
+
+    const float dt = static_cast<float>(sinceMs) * 0.001f;
+    // Frame-rate independent exponential smoothing: at dt >> tau this
+    // approaches 1 and the filter simply follows, which is what we want after
+    // a hitch.
+    float alpha = 1.0f - std::exp(-dt / kEyeSmoothTimeConstantSec);
+    if (alpha < 0.0f)
+        alpha = 0.0f;
+    if (alpha > 1.0f)
+        alpha = 1.0f;
+
+    for (int i = 0; i < 3; ++i) {
+        slot->normal[i] += (eyeNormal[i] - slot->normal[i]) * alpha;
+        slot->aim[i] += (eyeAim[i] - slot->aim[i]) * alpha;
+        eyeNormal[i] = slot->normal[i];
+        eyeAim[i] = slot->aim[i];
+    }
+}
+
+// Is head-follow actually 1:1? The user reports having to turn slowly for it
+// to feel right, which means something downstream is easing toward the
+// direction we write - we set it instantly. This measures two candidates at
+// once, without guessing:
+//
+//   * how often the camera code runs. If OnRigsReady fires at 30 Hz while the
+//     head moves at 90, tracking is steppy no matter how correct the value.
+//   * how far the rendered camera's yaw trails the head's yaw. Both are in
+//     different frames, so the OFFSET is meaningless - the swing in that
+//     offset while turning is the lag. Standing still it should barely move;
+//     if it opens up during a fast turn and closes again afterwards, the
+//     camera is being smoothed and we go find the smoothing.
+void MeasureHeadFollowLag()
+{
+    // Compare how FAST each one turns, not how far apart they point. The two
+    // yaws live in different frames, so their difference carries a constant
+    // offset and wraps at +-180 - the first version of this measured that
+    // wrap and reported ~358 deg every window, standing still included. Turn
+    // rates need no shared frame: if the camera's peak rate is well under the
+    // head's, something is rate-limiting or smoothing it, and the ratio says
+    // how much. A single writer isn't guaranteed here (the camera code runs
+    // ~180x/sec and evidently re-enters), so the window is guarded.
+    static volatile LONG s_busy = 0;
+    static unsigned long long s_windowStartMs = 0;
+    static unsigned long long s_lastSampleMs = 0;
+    static unsigned int s_calls = 0;
+    static float s_prevHeadYaw = 0.0f;
+    static float s_prevCamYaw = 0.0f;
+    static bool s_havePrev = false;
+    static float s_peakHeadRate = 0.0f;
+    static float s_peakCamRate = 0.0f;
+
+    if (InterlockedCompareExchange(&s_busy, 1, 0) != 0)
+        return;
+
+    ++s_calls;
+
+    const int front = g_headForwardFront.load(std::memory_order_acquire);
+    const float headYaw = std::atan2(g_headForward[front][0], g_headForward[front][2]);
+    const float camYaw = std::atan2(g_camForward[0], g_camForward[2]);
+    const unsigned long long now = GetTickCount64();
+
+    if (s_havePrev && now > s_lastSampleMs) {
+        const float dt = static_cast<float>(now - s_lastSampleMs) * 0.001f;
+        auto wrapped = [](float a) {
+            while (a > kPi)
+                a -= 2.0f * kPi;
+            while (a < -kPi)
+                a += 2.0f * kPi;
+            return a;
+        };
+        // Accumulated rotation, not peak rate. Peaks were useless: the camera
+        // yaw is decoded from the cached shader constant matrix, which
+        // belongs to whichever pass ran last, so sampling it at ~165 Hz
+        // manufactures spikes and the camera "turned" up to 4x faster than
+        // the head. Summing absolute change over three seconds lets those
+        // cancel while real turning adds up, so the ratio means something.
+        const float headStep = std::fabs(wrapped(headYaw - s_prevHeadYaw)) * 180.0f / kPi;
+        const float camStep = std::fabs(wrapped(camYaw - s_prevCamYaw)) * 180.0f / kPi;
+        (void)dt;
+        if (headStep < 45.0f && camStep < 45.0f) { // skip cuts and teleports
+            s_peakHeadRate += headStep;
+            s_peakCamRate += camStep;
+        }
+    }
+    if (!s_havePrev || now > s_lastSampleMs) {
+        s_prevHeadYaw = headYaw;
+        s_prevCamYaw = camYaw;
+        s_lastSampleMs = now;
+        s_havePrev = true;
+    }
+
+    if (s_windowStartMs == 0)
+        s_windowStartMs = now;
+    const unsigned long long elapsed = now - s_windowStartMs;
+    if (elapsed >= 3000) {
+        const float ratio = s_peakHeadRate > 1.0f ? s_peakCamRate / s_peakHeadRate : 1.0f;
+        Log_Printf("CameraRigHook: head-follow - camera updated %.0f times/sec | rotation this window: head %.0f deg, "
+                   "camera %.0f deg (camera is %.0f%% of head)",
+            s_calls * 1000.0 / static_cast<double>(elapsed), s_peakHeadRate, s_peakCamRate, ratio * 100.0f);
+        s_windowStartMs = now;
+        s_calls = 0;
+        s_peakHeadRate = 0.0f;
+        s_peakCamRate = 0.0f;
+    }
+
+    InterlockedExchange(&s_busy, 0);
+}
+
 extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
 {
     // Keeps the live list, the F4 before-write samples and the F5 boom
@@ -1143,10 +1452,12 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
     float eyeAim[3] = { g_targetHorizontalDistance, g_targetVerticalDistance, g_targetDistance };
     const bool vrActive = g_vrActive.load(std::memory_order_relaxed);
     UpdateHead(controller, vrActive, eyeNormal, eyeAim);
+    if (vrActive && g_vrStabiliseEye.load(std::memory_order_relaxed))
+        StabiliseEye(controller, eyeNormal, eyeAim);
     if (!g_enabled)
         return;
     AimWalk(controller);
-    const float fov = vrActive && g_vrWideFov.load(std::memory_order_relaxed) ? kVrCullVerticalFovDeg
+    const float fov = vrActive && g_vrWideFov.load(std::memory_order_relaxed) ? VrCullVerticalFov()
                                                                               : FirstPersonVerticalFov();
 
     // Every direction is read from the game's untouched rigs before any of
@@ -1156,19 +1467,42 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
     for (int i = 0; i < 3; ++i)
         aimOk[i] = RigViewDirection(controller + kOffAimRigs + i * kRigStride, &aimDy[i], &aimDz[i]);
 
+    // Head-follow, but only while the gun is down. Pointing the game's camera
+    // where you are looking is what fills the culled-away world back in - it
+    // also makes you aim with your head, which the user tested and disliked
+    // ("a shame"). Aiming is exactly when you don't need it: the gun is up,
+    // you are looking down the laser, and the camera already points where the
+    // shot goes. So follow the head while free-looking, and hand aim straight
+    // back the moment the aim flag comes on - the same instant the game
+    // switches rig sets anyway, so the change rides an existing transition.
+    unsigned char aimFlag = 0;
+    const bool aiming = TryRead(&aimFlag, controller + kOffControllerAimFlag, sizeof(aimFlag)) && aimFlag == 1;
+    if (vrActive && g_headFollow.load(std::memory_order_relaxed))
+        MeasureHeadFollowLag();
+    const bool headFollow = vrActive && !aiming && g_headFollow.load(std::memory_order_relaxed);
+    g_headFollowDriving.store(headFollow, std::memory_order_release);
     for (int i = 0; i < 3; ++i) {
         unsigned char* normalRig = controller + kOffNormalRigs + i * kRigStride;
-        float dy = 0.0f, dz = 1.0f;
+        float baseDy = 0.0f, baseDz = 1.0f;
         if (kNormalUsesAimPitchRange && aimOk[i]) {
-            dy = aimDy[i];
-            dz = aimDz[i];
-        } else if (!RigViewDirection(normalRig, &dy, &dz)) {
-            dy = 0.0f;
-            dz = 1.0f;
+            baseDy = aimDy[i];
+            baseDz = aimDz[i];
+        } else if (!RigViewDirection(normalRig, &baseDy, &baseDz)) {
+            baseDy = 0.0f;
+            baseDz = 1.0f;
         }
-        PlaceRigAtEye(normalRig, eyeNormal, dy, dz, fov);
-        PlaceRigAtEye(controller + kOffAimRigs + i * kRigStride, eyeAim,
-            aimOk[i] ? aimDy[i] : dy, aimOk[i] ? aimDz[i] : dz, fov);
+
+        float nx = 0.0f, ny = baseDy, nz = baseDz;
+        if (headFollow)
+            ApplyHeadFollow(&nx, &ny, &nz);
+        PlaceRigAtEye(normalRig, eyeNormal, nx, ny, nz, fov);
+
+        float ax = 0.0f;
+        float ay = aimOk[i] ? aimDy[i] : baseDy;
+        float az = aimOk[i] ? aimDz[i] : baseDz;
+        if (headFollow)
+            ApplyHeadFollow(&ax, &ay, &az);
+        PlaceRigAtEye(controller + kOffAimRigs + i * kRigStride, eyeAim, ax, ay, az, fov);
     }
 }
 
@@ -1261,11 +1595,38 @@ void CameraRigHook_OnEndScene()
     // calls into the VR bridge itself.
     static unsigned long long s_lastVrCheckMs = 0;
     const unsigned long long nowMs = GetTickCount64();
-    if (nowMs - s_lastVrCheckMs >= 100) {
+    // Every frame while head-follow is on: the game thread needs a fresh head
+    // direction, not one up to 100 ms old.
+    if (g_headFollow.load(std::memory_order_relaxed) || nowMs - s_lastVrCheckMs >= 100) {
         s_lastVrCheckMs = nowMs;
         XRBridgeEyeView left, right;
-        g_vrActive.store(VRBridge_GetEyeViews(left, right), std::memory_order_relaxed);
+        const bool haveViews = VRBridge_GetEyeViews(left, right);
+        g_vrActive.store(haveViews, std::memory_order_relaxed);
+        if (haveViews)
+            PublishHeadForward(left.rotationDelta);
     }
+
+    // F11 = VR camera stabilisation on/off (see g_vrStabiliseEye), so the
+    // idle-animation shake can be compared directly.
+    static bool prevF11Down = false;
+    const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11Down && !prevF11Down) {
+        const bool on = !g_vrStabiliseEye.load(std::memory_order_relaxed);
+        g_vrStabiliseEye.store(on, std::memory_order_relaxed);
+        Log_Printf("CameraRigHook: F11 pressed, VR camera stabilisation now %s", on ? "ON" : "OFF");
+    }
+    prevF11Down = f11Down;
+
+    // F9 = the head-follow experiment (see g_headFollow). VR only.
+    static bool prevF9Down = false;
+    const bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9Down && !prevF9Down) {
+        const bool on = !g_headFollow.load(std::memory_order_relaxed);
+        g_headFollow.store(on, std::memory_order_relaxed);
+        Log_Printf("CameraRigHook: F9 pressed, game camera follows the head now %s%s", on ? "ON" : "OFF",
+            on ? " - VR only; the game aims where its camera points, so you will aim with your head" : "");
+    }
+    prevF9Down = f9Down;
 
     // F6 = the co-op aim-walk sync test (see g_aimWalkCommit).
     static bool prevF6Down = false;
@@ -1284,7 +1645,8 @@ void CameraRigHook_OnEndScene()
     if (graveDown && !prevGraveDown) {
         const bool wide = !g_vrWideFov.load(std::memory_order_relaxed);
         g_vrWideFov.store(wide, std::memory_order_relaxed);
-        Log_Printf("CameraRigHook: '`' pressed, VR culling FOV now %s", wide ? "WIDE (150 deg vertical)" : "normal (90 deg horizontal)");
+        Log_Printf("CameraRigHook: '`' pressed, VR culling FOV now %s",
+            wide ? "WIDE (derived from the headset frustum)" : "normal (90 deg horizontal)");
     }
     prevGraveDown = graveDown;
 
@@ -1363,6 +1725,11 @@ void* CameraRigHook_GetPlayerController()
 bool CameraRigHook_IsVrActive()
 {
     return g_vrActive.load(std::memory_order_relaxed);
+}
+
+bool CameraRigHook_HeadFollowDrivingCamera()
+{
+    return g_headFollowDriving.load(std::memory_order_acquire);
 }
 
 int CameraRigHook_GetLiveBases(void** outBases, bool* outAim, int maxCount)

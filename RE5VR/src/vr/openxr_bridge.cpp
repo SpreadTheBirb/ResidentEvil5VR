@@ -85,6 +85,158 @@ std::vector<XrSwapchainImageD3D11KHR> g_xrSwapchainImages[2];
 // VRBridge_GetEyeViews - see openxr_bridge.h for why this replaces the old
 // OpenVR bridge's separate head-delta/FOV-scale/toe-in getters.
 bool g_haveEyeViews = false;
+// ---- Rendered-pose ring (2026-09-12) -----------------------------------
+// See openxr_bridge.h. Each xrLocateViews publish stamps an id and keeps the
+// raw XrPosef/XrFovf pair; the render thread carries that id through to
+// Present, where it lands on an addon slot; the submit thread reads it back
+// so the pose it hands xrEndFrame is the one the pixels were drawn with.
+// A ring rather than a single slot because the game can be several frames
+// ahead of, or behind, the submit thread.
+struct RenderedPose {
+    XrPosef pose[2];
+    XrFovf fov[2];
+    double publishedMs; // when this pose was located - see the age measurement
+    std::atomic<XRBridgePoseId> id{ 0 }; // written last: id != 0 means the entry is complete
+};
+constexpr size_t kPoseRingSize = 16;
+RenderedPose g_poseRing[kPoseRingSize];
+std::atomic<XRBridgePoseId> g_nextPoseId{ 1 };
+std::atomic<XRBridgePoseId> g_currentPoseId{ 0 };
+// Pose id the game rendered the image now sitting in each addon slot with.
+std::atomic<XRBridgePoseId> g_slotPoseId[2] = {};
+// Pose the frame the game just finished was rendered with, set at Present.
+std::atomic<XRBridgePoseId> g_poseOfPresentedFrame{ 0 };
+// Diagnostics for the submit thread's pose lookup.
+std::atomic<unsigned long long> g_poseHits{ 0 };
+std::atomic<unsigned long long> g_poseMisses{ 0 };
+// How stale the image is by the time it reaches the compositor, measured from
+// when its pose was located. The user can see this directly: mouse look is 1:1
+// on the desktop mirror and visibly late in the headset.
+// Plain, not atomic: only the submit thread accumulates these and only the
+// submit thread reports them.
+double g_frameAgeSumMs = 0.0;
+unsigned long long g_frameAgeCount = 0;
+double g_frameAgeWorstMs = 0.0;
+
+// Multiplies the head's rotation before it reaches anything: 1.0 is honest
+// 1:1, higher means a smaller neck turn covers more world. Page Up / Page
+// Down tune it live.
+std::atomic<float> g_headRotationGain{ 1.0f };
+constexpr float kHeadGainStep = 0.1f;
+constexpr float kHeadGainMin = 0.5f;
+constexpr float kHeadGainMax = 3.0f;
+
+// Milliseconds of head-rotation prediction. Unlike gain, this scales
+// VELOCITY, not displacement: it pushes the view ahead only while you are
+// actually turning and contributes exactly nothing once you stop, which is
+// why it can cancel drag without the overshoot-at-the-end that gain causes.
+// Home / End tune it; 0 is off.
+std::atomic<float> g_headPredictMs{ 0.0f };
+constexpr float kHeadPredictStep = 5.0f;
+constexpr float kHeadPredictMax = 60.0f;
+
+struct HeadPredictState {
+    Mat3 last;
+    double lastMs;
+    float omega[3]; // smoothed angular velocity, radians per millisecond
+    bool valid;
+};
+HeadPredictState g_headPredict[2] = {};
+// How hard to smooth the velocity estimate. A single-step difference is far
+// too noisy to extrapolate 25+ ms from - that noise WAS the jitter that
+// capped how much prediction was usable.
+constexpr float kHeadOmegaSmoothing = 0.25f;
+
+// High-resolution milliseconds. GetTickCount64 ticks every ~15.6 ms while
+// poses arrive every ~11, so it quantised the step to 0 / 15.6 / 31.2 and made
+// the extrapolation factor swing between half and double every publish.
+double NowMillis()
+{
+    static LARGE_INTEGER freq = {};
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+}
+
+void Mat3ToAxisAngle(const Mat3& m, float axis[3], float* angle)
+{
+    float c = (m.m[0] + m.m[4] + m.m[8] - 1.0f) * 0.5f;
+    if (c > 1.0f)
+        c = 1.0f;
+    if (c < -1.0f)
+        c = -1.0f;
+    *angle = std::acos(c);
+    const float s = std::sin(*angle);
+    if (*angle < 1e-5f || std::fabs(s) < 1e-6f) {
+        axis[0] = axis[1] = 0.0f;
+        axis[2] = 1.0f;
+        *angle = 0.0f;
+        return;
+    }
+    axis[0] = (m.m[7] - m.m[5]) / (2.0f * s);
+    axis[1] = (m.m[2] - m.m[6]) / (2.0f * s);
+    axis[2] = (m.m[3] - m.m[1]) / (2.0f * s);
+}
+
+Mat3 AxisAngleToMat3(const float axis[3], float angle)
+{
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    const float t = 1.0f - c;
+    const float x = axis[0], y = axis[1], z = axis[2];
+    Mat3 r{};
+    r.m[0] = c + x * x * t;
+    r.m[1] = x * y * t - z * s;
+    r.m[2] = x * z * t + y * s;
+    r.m[3] = y * x * t + z * s;
+    r.m[4] = c + y * y * t;
+    r.m[5] = y * z * t - x * s;
+    r.m[6] = z * x * t - y * s;
+    r.m[7] = z * y * t + x * s;
+    r.m[8] = c + z * z * t;
+    return r;
+}
+
+// Scale a rotation by converting to axis-angle, multiplying the angle, and
+// rebuilding it (Rodrigues). Scaling the matrix entries directly would not
+// produce a rotation at all. Row-major, rows = right/up/forward, matching
+// XRBridgeEyeView::rotationDelta.
+Mat3 ScaleRotation(const Mat3& m, float gain)
+{
+    float c = (m.m[0] + m.m[4] + m.m[8] - 1.0f) * 0.5f;
+    if (c > 1.0f)
+        c = 1.0f;
+    if (c < -1.0f)
+        c = -1.0f;
+    const float angle = std::acos(c);
+    const float s = std::sin(angle);
+    if (angle < 1e-4f || std::fabs(s) < 1e-6f)
+        return m; // no meaningful rotation to scale, and the axis is unstable
+
+    const float ax = (m.m[7] - m.m[5]) / (2.0f * s);
+    const float ay = (m.m[2] - m.m[6]) / (2.0f * s);
+    const float az = (m.m[3] - m.m[1]) / (2.0f * s);
+
+    const float na = angle * gain;
+    const float nc = std::cos(na);
+    const float ns = std::sin(na);
+    const float t = 1.0f - nc;
+
+    Mat3 r{};
+    r.m[0] = nc + ax * ax * t;
+    r.m[1] = ax * ay * t - az * ns;
+    r.m[2] = ax * az * t + ay * ns;
+    r.m[3] = ay * ax * t + az * ns;
+    r.m[4] = nc + ay * ay * t;
+    r.m[5] = ay * az * t - ax * ns;
+    r.m[6] = az * ax * t - ay * ns;
+    r.m[7] = az * ay * t + ax * ns;
+    r.m[8] = nc + az * az * t;
+    return r;
+}
+
 XRBridgeEyeView g_eyeViews[2] = {};
 // Written by the XR submit thread, read by the render thread: a pose must
 // be copied in or out whole, never half of one frame and half of the next.
@@ -224,6 +376,14 @@ IDirect3DSurface9* g_bridgeRightSysMem = nullptr;
 // rather than genuinely new content.
 std::atomic<int> g_eyeFrontIndex[2] = { 0, 0 };
 std::atomic<UINT64> g_eyeGeneration[2] = { 0, 0 };
+// The generation the submit thread has actually consumed. Producing faster
+// than this is pure waste - see ShouldCopyThisCall.
+std::atomic<UINT64> g_eyeConsumedGeneration[2] = { 0, 0 };
+// Whether the producer waits for the submit thread to take the previous frame
+// before making another. On: fewer wasted copies and no context thrash. Off:
+// always keep the freshest possible image, at the cost of contention. Insert
+// toggles it, because it is a prime suspect in the measured 64 ms image age.
+std::atomic<bool> g_waitForConsumer{ false };
 
 IDirect3DSurface9* g_gameLeftCrop = nullptr;
 IDirect3DSurface9* g_gameRightCrop = nullptr;
@@ -405,6 +565,21 @@ bool CreateSharedEyeTexture(IDirect3DTexture9** outTex, IDirect3DSurface9** outS
 // OpenSharedResource calls now happen earlier, in
 // CreateXrSessionAndSwapchains, since OpenXR needs that same device to
 // exist BEFORE xrCreateSession (it's passed in the graphics binding).
+// xrCreateSession behind a structured-exception guard. Deliberately tiny and
+// free of anything needing unwinding, which is what lets __try live in a C++
+// translation unit compiled without /EHa. Catching an access violation and
+// carrying on is normally a bad idea - the faulting component's state is
+// unknowable afterwards - but the alternative here is the process dying
+// outright, and we never touch that session again on this path.
+XrResult CreateSessionGuarded(XrInstance instance, const XrSessionCreateInfo* info, XrSession* out, DWORD* outSehCode)
+{
+    __try {
+        return xrCreateSession(instance, info, out);
+    } __except (*outSehCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+}
+
 bool EnsureBridgeReady(IDirect3DDevice9* pGameDevice)
 {
     if (g_bridgeReady)
@@ -663,6 +838,34 @@ bool CopyHalfToEye(IDirect3DDevice9* pGameDevice, IDirect3DSurface9* gameBackbuf
 
 // ---- OpenXR-specific: instance/system/session/swapchains ----------------
 
+// Which runtime are we about to talk to? Normally you'd ask the instance
+// after creating it, but the extension list has to be decided BEFORE that,
+// and on Meta's runtime the extensions we ask for are the suspect - see
+// InitOpenXRInstanceAndSystem. The active runtime is a manifest path in the
+// registry; this process is 32-bit, so HKLM\SOFTWARE is redirected to
+// WOW6432Node for us and we get the 32-bit runtime's manifest, which is the
+// one that will actually be loaded.
+bool ActiveRuntimeLooksLikeOculus()
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Khronos\\OpenXR\\1", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+
+    char path[MAX_PATH * 2] = {};
+    DWORD size = sizeof(path) - 1;
+    DWORD type = 0;
+    const LSTATUS st = RegQueryValueExA(key, "ActiveRuntime", nullptr, &type, reinterpret_cast<BYTE*>(path), &size);
+    RegCloseKey(key);
+    if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
+        return false;
+
+    for (char* p = path; *p; ++p)
+        *p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+    const bool oculus = std::strstr(path, "oculus") != nullptr || std::strstr(path, "meta horizon") != nullptr;
+    Log_Printf("XRBridge: active OpenXR runtime manifest is \"%s\"%s", path, oculus ? " (Meta)" : "");
+    return oculus;
+}
+
 bool InitOpenXRInstanceAndSystem()
 {
     // Check whether this runtime supports XR_FB_display_refresh_rate before
@@ -687,6 +890,17 @@ bool InitOpenXRInstanceAndSystem()
     Log_Printf("XRBridge: %s supported by runtime",
         havePerfSettingsExt ? XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME
                              : (XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME " NOT"));
+
+    // Logged because knowing which runtime is loaded explains most VR
+    // reports at a glance. It used to gate an experiment: on Meta's runtime,
+    // xrCreateSession dies with a null write inside their service IPC client
+    // (RuntimeIPCServiceClient_32.dll+0x28561), and since
+    // XR_FB_display_refresh_rate is a Meta extension carried over that same
+    // IPC, requesting nothing optional seemed worth a try. Tested
+    // 2026-09-12: identical crash, same address, same stack. The fault is in
+    // their baseline session path, so the extensions are back on - there is
+    // nothing to gain by shipping Meta users a degraded instance.
+    ActiveRuntimeLooksLikeOculus();
 
     std::vector<const char*> extensions = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
     if (haveDisplayRefreshRateExt)
@@ -730,6 +944,19 @@ bool InitOpenXRInstanceAndSystem()
     if (XR_SUCCEEDED(xrGetInstanceProperties(g_xrInstance, &instanceProps))) {
         Log_Printf("XRBridge: xrCreateInstance OK - runtime \"%s\" version 0x%llX",
             instanceProps.runtimeName, static_cast<unsigned long long>(instanceProps.runtimeVersion));
+
+        // 2026-09-12: a tester on Meta Link (Quest 3, "Oculus" runtime) lost
+        // the whole process inside xrCreateSession - no exception for the
+        // crash reporter to catch, so the runtime killed it outright. The
+        // same machine, same build, works when SteamVR is made the active
+        // OpenXR runtime. Everything up to here succeeds, so the log looks
+        // healthy right until the game vanishes; say so plainly instead.
+        if (std::strstr(instanceProps.runtimeName, "Oculus") != nullptr) {
+            Log_Printf("XRBridge: WARNING - this is Meta's own OpenXR runtime. It has been seen to kill this "
+                       "(32-bit) game during xrCreateSession. If the game disappears now, set SteamVR as the "
+                       "active OpenXR runtime and try again - same headset, same Link connection, it just "
+                       "routes through a runtime that works.");
+        }
     }
 
     XrSystemGetInfo systemInfo{ XR_TYPE_SYSTEM_GET_INFO };
@@ -898,22 +1125,42 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
         Log_Printf("XRBridge: WARNING - QueryInterface(ID3D11Multithread) failed; the submit thread and the game's main thread will share an unprotected D3D11 context");
     }
 
-    // 2026-09-10: check for the dgVoodoo2 D3D12 addon bridge now, on this
-    // same device, BEFORE picking a swapchain format below - if it's
-    // active, the swapchain format needs to match the addon's real
-    // source format family, not the D3D9 backbuffer's.
-    D3D12AddonBridgeInfo addonInfo;
-    g_usingD3D12AddonPath = D3D12AddonBridge_TryInit(g_d3d11Device, &addonInfo);
-    if (g_usingD3D12AddonPath)
-        g_addonFrameFormat = addonInfo.format;
-
+    // 2026-09-12: the addon bridge init USED to run here, before
+    // xrCreateSession, because the swapchain format below needs to match
+    // the addon's real source format. It only has to happen before that
+    // choice, though - not before the session - and doing it first meant we
+    // handed the runtime a D3D11 device that already had two foreign D3D12
+    // shared textures opened on it, which no ordinary OpenXR app does. A
+    // tester's process was killed outright inside xrCreateSession on Meta's
+    // runtime, so it now runs AFTER the session exists, leaving the device
+    // in the state a runtime expects at binding time. Nothing else about it
+    // changes; see the format-selection block below, which is still the
+    // first thing that reads g_usingD3D12AddonPath.
     XrGraphicsBindingD3D11KHR binding{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
     binding.device = g_d3d11Device;
 
     XrSessionCreateInfo sessionInfo{ XR_TYPE_SESSION_CREATE_INFO };
     sessionInfo.next = &binding;
     sessionInfo.systemId = g_xrSystemId;
-    r = xrCreateSession(g_xrInstance, &sessionInfo, &g_xrSession);
+    // Guarded because Meta's own runtime faults in here. Confirmed
+    // 2026-09-12 from Windows Error Reporting on two machines: an access
+    // violation at RuntimeIPCServiceClient_32.dll+0x28561 (Meta Horizon
+    // 208.0.47.535), inside their 32-bit runtime's service IPC client, which
+    // took the whole game down with it. Nothing on our side can prevent
+    // their bug - but losing the player's session to it is avoidable, so
+    // catch it, leave XR off, and let them keep playing flat.
+    Log_Printf("XRBridge: calling xrCreateSession (D3D11 device=%p)", g_d3d11Device);
+    DWORD sehCode = 0;
+    r = CreateSessionGuarded(g_xrInstance, &sessionInfo, &g_xrSession, &sehCode);
+    if (sehCode != 0) {
+        Log_Printf("XRBridge: xrCreateSession CRASHED inside the runtime (SEH code 0x%08lX) - VR not started, "
+                   "the game keeps running. This is a bug in the OpenXR runtime itself; on Meta's runtime the "
+                   "known fault is RuntimeIPCServiceClient_32.dll. Switching the active OpenXR runtime to "
+                   "SteamVR avoids it.",
+            sehCode);
+        return false;
+    }
+    Log_Printf("XRBridge: xrCreateSession returned %s", XrResultName(r));
     if (XR_FAILED(r)) {
         Log_Printf("XRBridge: xrCreateSession failed -> %s", XrResultName(r));
         return false;
@@ -927,6 +1174,16 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
         Log_Printf("XRBridge: xrCreateReferenceSpace failed -> %s", XrResultName(r));
         return false;
     }
+
+    // Now that the runtime has the device, open the dgVoodoo2 addon's shared
+    // D3D12 frame on it - see the note above xrCreateSession. Must still
+    // happen before the swapchain format is chosen, since that format has to
+    // match the addon's real source format family rather than the D3D9
+    // backbuffer's.
+    D3D12AddonBridgeInfo addonInfo;
+    g_usingD3D12AddonPath = D3D12AddonBridge_TryInit(g_d3d11Device, &addonInfo);
+    if (g_usingD3D12AddonPath)
+        g_addonFrameFormat = addonInfo.format;
 
     // Pick a swapchain format matching our D3D9 backbuffer's byte layout
     // (D3DFMT_A8R8G8B8 is BGRA) AND its gamma encoding. Prefer the sRGB
@@ -1058,6 +1315,15 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
 // ShouldCopyThisCall's comment. Oversampling the copy relative to the
 // independent ~90Hz submit thread avoids the two free-running clocks
 // beating against each other and reusing stale eye textures.
+// Back to 400 Hz, and this time it is measured rather than assumed
+// (2026-09-12). Three configurations, from the "image age at submit" line:
+//   waiting for the consumer, 400 Hz cap : 59 ms avg, 118 worst
+//   no wait, 400 Hz cap                  : 36 ms avg,  57 worst
+//   no wait, 120 Hz cap                  : 44-47 ms avg, and MICROSTUTTER
+// The 120 Hz cap looked principled - why produce faster than the headset
+// consumes - but it recreated exactly what the original oversampling existed
+// to avoid: two free-running clocks beating against each other. Oversampling
+// costs some redundant copies and buys steady, fresh frames. Keep it.
 double g_targetFrameIntervalMs = 1000.0 / 400.0;
 bool g_xrThreadStarted = false;
 HANDLE g_xrThread = nullptr; // 2026-07-29: dedicated submit thread, see EnsureXrThreadStarted
@@ -1301,7 +1567,63 @@ void XrSubmitOneFrame()
                             Log_Printf("XRBridge: eye %d reference orientation captured (flags=0x%016llX, quat=%.4f,%.4f,%.4f,%.4f)",
                                 eye, static_cast<unsigned long long>(viewState.viewStateFlags), q.x, q.y, q.z, q.w);
                         }
-                        const Mat3 delta = Mat3Multiply(nowMat, Mat3Transpose(g_eyeReference[eye]));
+                        Mat3 delta = Mat3Multiply(nowMat, Mat3Transpose(g_eyeReference[eye]));
+                        // Head-rotation gain (2026-09-12). The user wants a
+                        // smaller neck turn to cover more world - "what if we
+                        // add more to it". Applied HERE, at the one place the
+                        // delta is published, so the eye matrices and F9's
+                        // head-follow scale together and can never disagree.
+                        const float gain = g_headRotationGain.load(std::memory_order_relaxed);
+                        if (std::fabs(gain - 1.0f) > 1e-3f)
+                            delta = ScaleRotation(delta, gain);
+
+                        // Latency prediction (2026-09-12). Unifying the pose
+                        // snapshots killed the overshoot-and-snap, but the
+                        // view still drags at normal turning speed: the frame
+                        // you see was rendered from where your head WAS, and
+                        // this pipeline is deep - game, dgVoodoo, D3D12 addon,
+                        // shared texture, submit thread, compositor. So take
+                        // the rotation since the last publish as the current
+                        // angular velocity and extrapolate it forward by
+                        // g_headPredictMs. Home / End tune it live; 0 is off.
+                        const float predictMs = g_headPredictMs.load(std::memory_order_relaxed);
+                        if (predictMs > 0.1f) {
+                            const double nowMs = NowMillis();
+                            HeadPredictState& hp = g_headPredict[eye];
+                            const double stepMs = nowMs - hp.lastMs;
+                            if (hp.valid && stepMs > 0.2 && stepMs < 100.0) {
+                                // Angular velocity of the head, as an
+                                // axis-angle vector in radians per ms, then
+                                // smoothed - one raw step is far too noisy to
+                                // extrapolate tens of milliseconds from.
+                                const Mat3 increment = Mat3Multiply(delta, Mat3Transpose(hp.last));
+                                float axis[3];
+                                float angle = 0.0f;
+                                Mat3ToAxisAngle(increment, axis, &angle);
+                                const float rate = angle / static_cast<float>(stepMs);
+                                for (int i = 0; i < 3; ++i) {
+                                    const float sample = axis[i] * rate;
+                                    hp.omega[i] += (sample - hp.omega[i]) * kHeadOmegaSmoothing;
+                                }
+
+                                const float speed = std::sqrt(hp.omega[0] * hp.omega[0] +
+                                    hp.omega[1] * hp.omega[1] + hp.omega[2] * hp.omega[2]);
+                                if (speed > 1e-6f) {
+                                    const float dir[3] = { hp.omega[0] / speed, hp.omega[1] / speed, hp.omega[2] / speed };
+                                    const Mat3 ahead = AxisAngleToMat3(dir, speed * predictMs);
+                                    hp.last = delta;
+                                    hp.lastMs = nowMs;
+                                    delta = Mat3Multiply(ahead, delta);
+                                } else {
+                                    hp.last = delta;
+                                    hp.lastMs = nowMs;
+                                }
+                            } else {
+                                hp.last = delta;
+                                hp.lastMs = nowMs;
+                                hp.valid = true;
+                            }
+                        }
                         std::memcpy(next[eye].rotationDelta, delta.m, sizeof(delta.m));
 
                         // DIAGNOSTIC (2026-07-28): the 90-frame settle delay
@@ -1346,10 +1668,24 @@ void XrSubmitOneFrame()
                     next[eye].angleUp = views[eye].fov.angleUp;
                     next[eye].angleDown = views[eye].fov.angleDown;
                 }
+                // Stamp this locate's raw poses into the ring before
+                // publishing the derived views, so the id the render thread
+                // is about to read always resolves to a complete entry.
+                const XRBridgePoseId poseId = g_nextPoseId.fetch_add(1, std::memory_order_relaxed);
+                RenderedPose& entry = g_poseRing[poseId % kPoseRingSize];
+                entry.id.store(0, std::memory_order_relaxed); // mark incomplete while writing
+                for (int eye = 0; eye < 2; ++eye) {
+                    entry.pose[eye] = views[eye].pose;
+                    entry.fov[eye] = views[eye].fov;
+                }
+                entry.publishedMs = NowMillis();
+                entry.id.store(poseId, std::memory_order_release);
+
                 AcquireSRWLockExclusive(&g_eyeViewsLock);
                 std::memcpy(g_eyeViews, next, sizeof(g_eyeViews));
                 g_haveEyeViews = true;
                 ReleaseSRWLockExclusive(&g_eyeViewsLock);
+                g_currentPoseId.store(poseId, std::memory_order_release);
             }
 
             // Read whichever slot the producer most recently published as
@@ -1363,6 +1699,43 @@ void XrSubmitOneFrame()
             const int leftFrontSlot = g_eyeFrontIndex[kEyeLeft].load(std::memory_order_acquire);
             const int rightFrontSlot = g_eyeFrontIndex[kEyeRight].load(std::memory_order_acquire);
             ID3D11Texture2D* srcTex[2] = { g_d3d11LeftTex[leftFrontSlot], g_d3d11RightTex[rightFrontSlot] };
+
+            // Which pose were these pixels actually drawn with? Submitting
+            // the freshly-located pose instead is what made the image lurch
+            // on every head movement (see openxr_bridge.h). Fall back to the
+            // fresh pose only when the tag is missing or has already been
+            // overwritten in the ring - i.e. the game is more than
+            // kPoseRingSize frames behind, at which point nothing is going
+            // to look good anyway.
+            XrPosef submitPose[2] = { views[0].pose, views[1].pose };
+            XrFovf submitFov[2] = { views[0].fov, views[1].fov };
+            const XRBridgePoseId taggedId = g_slotPoseId[leftFrontSlot].load(std::memory_order_acquire);
+            if (taggedId != 0) {
+                const RenderedPose& entry = g_poseRing[taggedId % kPoseRingSize];
+                if (entry.id.load(std::memory_order_acquire) == taggedId) {
+                    for (int eye = 0; eye < 2; ++eye) {
+                        submitPose[eye] = entry.pose[eye];
+                        submitFov[eye] = entry.fov[eye];
+                    }
+                    // End-to-end age: how long ago the pose this image was
+                    // rendered with was located. That is the delay the user
+                    // sees as the headset trailing the desktop mirror, and it
+                    // is the number to beat if we start removing pipeline
+                    // hops (addon slot -> eye texture -> swapchain).
+                    const double ageMs = NowMillis() - entry.publishedMs;
+                    if (ageMs >= 0.0 && ageMs < 1000.0) {
+                        g_frameAgeSumMs += ageMs;
+                        ++g_frameAgeCount;
+                        if (ageMs > g_frameAgeWorstMs)
+                            g_frameAgeWorstMs = ageMs;
+                    }
+                    g_poseHits.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_poseMisses.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                g_poseMisses.fetch_add(1, std::memory_order_relaxed);
+            }
             const UINT64 curGeneration[2] = { g_eyeGeneration[kEyeLeft].load(std::memory_order_acquire), g_eyeGeneration[kEyeRight].load(std::memory_order_acquire) };
             static UINT64 s_lastSubmittedGeneration[2] = { 0, 0 };
             static UINT64 s_reusedFrameCount[2] = { 0, 0 };
@@ -1373,6 +1746,10 @@ void XrSubmitOneFrame()
                 if (curGeneration[eye] != 0 && curGeneration[eye] == s_lastSubmittedGeneration[eye])
                     ++s_reusedFrameCount[eye];
                 s_lastSubmittedGeneration[eye] = curGeneration[eye];
+                // Tell the producer this frame has been taken - see
+                // ShouldCopyThisCall. Until it changes, the game thread has
+                // no reason to touch the shared D3D11 context again.
+                g_eyeConsumedGeneration[eye].store(curGeneration[eye], std::memory_order_release);
                 if (logThisIteration) {
                     Log_Printf("XRBridge: eye %d reused=%llu/%llu submitted frames", eye,
                         s_reusedFrameCount[eye], s_submittedFrameCount[eye]);
@@ -1436,8 +1813,8 @@ void XrSubmitOneFrame()
                 }
 
                 projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                projViews[eye].pose = views[eye].pose;
-                projViews[eye].fov = views[eye].fov;
+                projViews[eye].pose = submitPose[eye];
+                projViews[eye].fov = submitFov[eye];
                 projViews[eye].subImage.swapchain = g_xrSwapchain[eye];
                 projViews[eye].subImage.imageRect.offset = { 0, 0 };
                 projViews[eye].subImage.imageRect.extent = { static_cast<int32_t>(g_eyeWidth), static_cast<int32_t>(g_eyeHeight) };
@@ -1461,6 +1838,21 @@ void XrSubmitOneFrame()
         }
         static UINT64 g_frameCount = 0;
         ++g_frameCount;
+        if (g_frameCount % 600 == 0) {
+            // Should be almost all hits. A high miss count means the tag
+            // isn't reaching the submit thread and we are back to submitting
+            // a pose the image was never rendered with.
+            const unsigned long long ageCount = g_frameAgeCount;
+            const double ageSum = g_frameAgeSumMs;
+            const double ageWorst = g_frameAgeWorstMs;
+            g_frameAgeCount = 0;
+            g_frameAgeSumMs = 0.0;
+            g_frameAgeWorstMs = 0.0;
+            Log_Printf("XRBridge: submitted pose came from the rendered frame %llu time(s), fell back %llu time(s) "
+                       "| image age at submit: avg %.1f ms, worst %.1f ms",
+                g_poseHits.load(std::memory_order_relaxed), g_poseMisses.load(std::memory_order_relaxed),
+                ageCount ? ageSum / static_cast<double>(ageCount) : 0.0, ageWorst);
+        }
         if (XR_FAILED(r)) {
             Log_Printf("XRBridge: xrEndFrame failed (count=%llu) -> %s", g_frameCount, XrResultName(r));
         } else {
@@ -1542,6 +1934,31 @@ bool ShouldCopyThisCall()
     const double elapsedMs = static_cast<double>(now.QuadPart - last.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
     if (elapsedMs < g_targetFrameIntervalMs)
         return false;
+
+    // 2026-09-12: the rate gate above is no longer the real limiter. It was
+    // set to 400 Hz deliberately, to oversample against a free-running
+    // submit thread so the two clocks couldn't beat and leave stale eye
+    // textures - but the game thread and the submit thread share ONE
+    // ID3D11DeviceContext, which is serialized between them. At 100+ fps the
+    // game was taking that lock hundreds of times a second for frames the
+    // headset would never display, starving the thread that actually feeds
+    // the compositor. That is why calling up the SteamVR overlay made VR
+    // smoother: it throttled the game and handed the context back.
+    //
+    // Now the producer waits until the submit thread has consumed what it
+    // last published. Copies land at the headset's real rate, whatever that
+    // is, with no magic number - and frames are no longer stale, because
+    // each one carries the pose it was rendered with (see the pose ring).
+    // The deadline is a safety valve: if VR stalls or the submit thread is
+    // gone, keep refreshing rather than freezing the last image forever.
+    constexpr double kUnconsumedDeadlineMs = 100.0;
+    if (g_waitForConsumer.load(std::memory_order_relaxed)) {
+        const bool consumed = g_eyeConsumedGeneration[kEyeLeft].load(std::memory_order_acquire) >=
+            g_eyeGeneration[kEyeLeft].load(std::memory_order_acquire);
+        if (!consumed && elapsedMs < kUnconsumedDeadlineMs)
+            return false;
+    }
+
     last = now;
     return true;
 }
@@ -1555,6 +1972,57 @@ void VRBridge_Install()
 
 void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
 {
+    // Page Up / Page Down: head-rotation gain (see g_headRotationGain).
+    {
+        static bool prevUp = false, prevDown = false;
+        const bool up = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+        const bool down = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+        if ((up && !prevUp) || (down && !prevDown)) {
+            float g = g_headRotationGain.load(std::memory_order_relaxed) + (up && !prevUp ? kHeadGainStep : -kHeadGainStep);
+            if (g < kHeadGainMin)
+                g = kHeadGainMin;
+            if (g > kHeadGainMax)
+                g = kHeadGainMax;
+            g_headRotationGain.store(g, std::memory_order_relaxed);
+            Log_Printf("XRBridge: head rotation gain now %.1fx (1.0 = 1:1 with your neck)", g);
+        }
+        prevUp = up;
+        prevDown = down;
+    }
+
+    // Home / End: head-rotation prediction in ms (see g_headPredictMs).
+    {
+        static bool prevHome = false, prevEnd = false;
+        const bool home = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+        const bool end = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+        if ((home && !prevHome) || (end && !prevEnd)) {
+            float ms = g_headPredictMs.load(std::memory_order_relaxed) +
+                (home && !prevHome ? kHeadPredictStep : -kHeadPredictStep);
+            if (ms < 0.0f)
+                ms = 0.0f;
+            if (ms > kHeadPredictMax)
+                ms = kHeadPredictMax;
+            g_headPredictMs.store(ms, std::memory_order_relaxed);
+            Log_Printf("XRBridge: head rotation prediction now %.0f ms (0 = off; only acts while you are turning)", ms);
+        }
+        prevHome = home;
+        prevEnd = end;
+    }
+
+    // Insert: producer waits for the consumer, or always keeps the newest
+    // frame (see g_waitForConsumer). Watch the "image age at submit" line.
+    {
+        static bool prevInsert = false;
+        const bool insert = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+        if (insert && !prevInsert) {
+            const bool on = !g_waitForConsumer.load(std::memory_order_relaxed);
+            g_waitForConsumer.store(on, std::memory_order_relaxed);
+            Log_Printf("XRBridge: Insert pressed, producer %s",
+                on ? "WAITS for the submit thread (fewer copies)" : "always refreshes (freshest image)");
+        }
+        prevInsert = insert;
+    }
+
     static bool prevF7Down = false;
     bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     if (f7Down && !prevF7Down) {
@@ -1562,7 +2030,6 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         Log_Printf("XRBridge: F7 pressed, XR mode now %s", g_xrModeEnabled ? "ON" : "OFF");
 
         if (g_xrModeEnabled) {
-            StereoTest_SetEnabled(true);
             g_haveEyeViews = false;
             g_haveEyeReference[0] = false;
             g_haveEyeReference[1] = false;
@@ -1577,9 +2044,18 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
                 g_xrInitialized = InitOpenXRInstanceAndSystem();
             }
             if (!g_xrInitialized) {
-                Log_Printf("XRBridge: OpenXR instance/system init failed, turning XR mode back off");
+                Log_Printf("XRBridge: OpenXR instance/system init failed (no headset or no OpenXR "
+                           "runtime?), turning XR mode back off");
                 g_xrModeEnabled = false;
+            } else {
+                // Only split the screen once we know there is somewhere to
+                // send the two halves. Turning it on before this point left
+                // anyone without a headset staring at a side-by-side image
+                // with no obvious way back - F7 again wouldn't undo it.
+                StereoTest_SetEnabled(true);
             }
+        } else {
+            StereoTest_SetEnabled(false);
         }
     }
     prevF7Down = f7Down;
@@ -1600,6 +2076,7 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         if (!CreateXrSessionAndSwapchains(w / 2, h, D3DFMT_A8R8G8B8)) {
             Log_Printf("XRBridge: session/swapchain setup failed, turning XR mode back off");
             g_xrModeEnabled = false;
+            StereoTest_SetEnabled(false); // don't strand them in split-screen
             return;
         }
         g_xrSessionReady = true;
@@ -1643,6 +2120,12 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
     }
 
     if (okLeft) {
+        // Tag the slot with the pose the game actually rendered these
+        // pixels with, before publishing it - the submit thread reads the
+        // tag only after seeing the new front index, so it can never pick
+        // up a slot whose pose hasn't been written yet.
+        g_slotPoseId[leftBackSlot].store(g_poseOfPresentedFrame.load(std::memory_order_acquire),
+            std::memory_order_release);
         g_eyeFrontIndex[kEyeLeft].store(leftBackSlot, std::memory_order_release);
         g_eyeGeneration[kEyeLeft].fetch_add(1, std::memory_order_release);
     }
@@ -1663,6 +2146,16 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
     } else if (g_copyCount % 300 == 0) {
         Log_Printf("XRBridge: copy heartbeat count=%llu", g_copyCount);
     }
+}
+
+XRBridgePoseId VRBridge_GetCurrentPoseId()
+{
+    return g_currentPoseId.load(std::memory_order_acquire);
+}
+
+void VRBridge_NoteFramePresented(XRBridgePoseId poseId)
+{
+    g_poseOfPresentedFrame.store(poseId, std::memory_order_release);
 }
 
 bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
