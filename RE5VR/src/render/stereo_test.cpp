@@ -94,9 +94,12 @@ constexpr float kHalfSeparationStep = 0.25f;
 // and has no effect on orientation.
 // Draw post-process buffers (anything meaningfully smaller than the
 // backbuffer) once instead of splitting them per eye - see
-// RenderTargetIsScreenShaped. This is the light-leak fix, confirmed by the
-// user on 2026-09-12, so it is ON by default; '/' turns it back off to get
-// the old (leaking) per-eye behaviour for comparison.
+// RenderTargetIsScreenShaped. This is the light-leak fix and has been ON by
+// default since it landed (dc2d257, shipped in v0.3.4-alpha); '/' turns it off
+// to get the old, leaking per-eye behaviour back for comparison. DO NOT
+// commit it flipped: on 2026-09-12 it was set to false in a working tree
+// during an experiment and left there, the leaks came back in the dev and
+// tester builds, and hours went into hunting a bug that was this line.
 std::atomic<bool> g_monoSmallTargets{ true };
 
 // Don't rotate the eye bases by the head delta while F9 is already steering
@@ -438,11 +441,10 @@ bool RenderTargetIsScreenShaped(IDirect3DDevice9* pDevice)
     // bright wedges the user reported as "light leaks" - present with
     // culling on or off, wide FOV or not, because it was never a culling
     // problem. Anything meaningfully smaller than the backbuffer is now
-    // drawn ONCE, untouched, and composited mono - and with that on the
-    // leaks are gone (user-confirmed 2026-09-12). An earlier run of this
-    // same toggle read as a miss; that was before the post-process revert,
-    // so trust this result over that one. '/' puts the per-eye splitting
-    // back for comparison.
+    // drawn ONCE, untouched, and composited mono - user-confirmed to remove
+    // the leaks, twice: when it first landed, and again on 2026-09-12 after
+    // the flag had been left off in a working tree. '/' puts the per-eye
+    // splitting back for comparison.
     if (g_monoSmallTargets.load(std::memory_order_relaxed)) {
         const bool fullSize = d.Width * 10 >= g_backBufferWidth * 9 && d.Height * 10 >= g_backBufferHeight * 9;
         if (!fullSize) {
