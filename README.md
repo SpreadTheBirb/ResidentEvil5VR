@@ -45,7 +45,7 @@ over your shoulder), the HUD in VR, and motion controllers with arm IK.
 
 ---
 
-## Getting the mod (most people want this)
+## Getting the mod 
 
 Grab the newest **[Release](../../releases)** — it contains the built DLLs and
 everything needed to run, so there is nothing to compile. Follow the install
