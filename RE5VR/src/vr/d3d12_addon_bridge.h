@@ -47,9 +47,22 @@ bool D3D12AddonBridge_IsActive();
 // outSlot, when given, receives the producer slot the pixels came from.
 // The submit path needs it to look up which head pose the game actually
 // rendered that image with - see VRBridge_NoteFramePresented.
+// maxWaitMs: how long the two "not ready yet" checks may spin before giving
+// up and reusing the previous frame. 0 keeps the original behaviour - poll
+// once, never block - which is right for the game thread, where a skip costs
+// only until the next call a few milliseconds later. The submit thread is the
+// opposite: a skip there costs a whole displayed frame, so a fraction of a
+// millisecond of waiting is far cheaper. Always bounded; an unbounded wait
+// here is the freeze this design was built to avoid.
+// outCopied, when given, says whether pixels were actually written this call.
+// The return value cannot carry that: it means "the frame you have is still
+// usable", which is what the staged caller needs (its eye textures keep their
+// previous contents) and returning false there silently killed its pose
+// tagging. The direct caller needs the stricter fact, because it must not
+// present a swapchain image nothing was written into.
 bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
     ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight,
-    int* outSlot = nullptr);
+    int* outSlot = nullptr, double maxWaitMs = 0.0, bool* outCopied = nullptr);
 
 // Which slot the producer most recently published, or -1 if none yet.
 // Called on the game thread at Present to tag the just-finished frame.

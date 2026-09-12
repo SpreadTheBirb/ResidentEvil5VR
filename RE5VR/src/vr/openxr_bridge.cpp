@@ -2,6 +2,7 @@
 #include "../render/stereo_test.h"
 #include "../render/mat3.h"
 #include "../proxy/real_d3d9.h"
+#include "../util/build_config.h"
 #include "../util/log.h"
 #include "d3d12_addon_bridge.h"
 
@@ -104,6 +105,60 @@ std::atomic<XRBridgePoseId> g_nextPoseId{ 1 };
 std::atomic<XRBridgePoseId> g_currentPoseId{ 0 };
 // Pose id the game rendered the image now sitting in each addon slot with.
 std::atomic<XRBridgePoseId> g_slotPoseId[2] = {};
+
+// ---- Direct submit (2026-09-12) ----------------------------------------
+// Measured image age at submit was ~36 ms, and the biggest remaining cause is
+// stage count. The game thread used to copy the addon's shared frame into a
+// pair of eye textures, which the submit thread then copied into the OpenXR
+// swapchain images: two GPU copies and an extra double-buffer between render
+// and display. The addon bridge already takes two destination textures, so
+// the submit thread can point it straight at the swapchain images and the
+// eye textures disappear entirely.
+//
+// It also takes the game thread off the shared ID3D11DeviceContext, which is
+// the contention that the copy-rate tuning was fighting all along.
+//
+// First attempt (2026-09-12) was WORSE than the staged path: 47/41 ms against
+// 43/37/36, with the pose tag missing ~50% of frames and visible stutter
+// while turning. Cause: the addon's read is non-blocking by design - if its
+// fence says the previous read is unfinished it skips and tries again. On the
+// game thread at 400 Hz a skip cost 2.5 ms; on the submit thread it costs a
+// whole displayed frame, so the previous image is shown twice.
+//
+// Second attempt added a BOUNDED wait instead of skipping: still 45-48 ms
+// against the staged path's 35-38, and it still hitched, though only while
+// turning - a stale swapchain image looks identical when you are still.
+//
+// Third attempt fell back to the addon's other slot when the newest was not
+// ready, so an untouched swapchain image would never be presented. That made
+// it far worse: the camera stuck and the recentred forward direction ended up
+// 180 degrees behind the user.
+//
+// FOURTH attempt, and the one that stands: DEFAULT ON. Every measurement
+// above was taken at 40 fps on a laptop that turned out to be the bottleneck
+// (Quadro M2200, rendering stereo and running NVENC at once). Once the frame
+// rate was stable at 72, the user compared the two directly and found direct
+// submit clearly smoother - same code, opposite verdict, because the whole
+// difference is whether the addon has published before the submit thread
+// needs it. On a GPU that keeps up it has, and the shorter path wins.
+// Two things make this attempt different from the first three: the wait
+// below is bounded rather than a skip, and a failed copy now submits the pose
+// the acquired image actually holds (g_imagePoseId) instead of a fresh one.
+// The third attempt's stuck camera is BELIEVED fixed by that second change,
+// but it was never reproduced deliberately, so it is not proven. If it comes
+// back, this is the first suspect.
+std::atomic<bool> g_directAddonSubmit{ true };
+// How long the submit thread may wait for the addon's GPU work rather than
+// skip a frame. Bounded on purpose - see the header note on maxWaitMs.
+constexpr double kDirectSubmitWaitMs = 3.0;
+// Pose tagged per ADDON slot (the direct path's equivalent of g_slotPoseId).
+std::atomic<XRBridgePoseId> g_addonSlotPoseId[2] = {};
+// Which pose each SWAPCHAIN image currently holds. Runtimes hand out images
+// in rotation, so when a copy fails the image we acquired already contains a
+// frame from a few displays ago - this is how we tell the compositor which
+// one, instead of claiming it is current and making it lurch.
+constexpr size_t kMaxSwapchainImages = 8;
+XRBridgePoseId g_imagePoseId[2][kMaxSwapchainImages] = {};
 // Pose the frame the game just finished was rendered with, set at Present.
 std::atomic<XRBridgePoseId> g_poseOfPresentedFrame{ 0 };
 // Diagnostics for the submit thread's pose lookup.
@@ -1273,8 +1328,23 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
     // CopySubresourceRegion below, and the composition layer's imageRect
     // stays exactly that size) - this tests swapchain size in isolation
     // without changing render resolution/cost at all.
-    const UINT swapchainW = (std::max)(eyeWidth, g_recommendedEyeWidth);
-    const UINT swapchainH = (std::max)(eyeHeight, g_recommendedEyeHeight);
+    //
+    // 2026-09-12: that experiment is being REVERSED, because it now looks
+    // like the cause of a cap rather than a cure for one. Measured in VR on
+    // Virtual Desktop: 40 fps against a 90 Hz headset, VD reporting 100 ms
+    // end-to-end, with xrEndFrame alone taking 13-14 ms while every copy took
+    // 0.01 ms and acquire/wait took 0.00. Nothing on our side is slow - the
+    // compositor is. And no wonder: the runtime recommends 2496x2688, so each
+    // eye's images were 6.7 MP of which our 960x1080 content filled about 8%,
+    // and a wireless streamer had to encode all of it every frame. Sizing the
+    // swapchain to the content we actually render leaves the visible result
+    // identical (the compositor was upscaling that same sub-rectangle either
+    // way) while cutting what it has to move by more than 10x.
+    //
+    // Flip this to true to restore the oversized behaviour for comparison.
+    constexpr bool kOversizeSwapchainToRecommended = false;
+    const UINT swapchainW = kOversizeSwapchainToRecommended ? (std::max)(eyeWidth, g_recommendedEyeWidth) : eyeWidth;
+    const UINT swapchainH = kOversizeSwapchainToRecommended ? (std::max)(eyeHeight, g_recommendedEyeHeight) : eyeHeight;
     for (int eye = 0; eye < 2; ++eye) {
         XrSwapchainCreateInfo scInfo{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
         scInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -1709,7 +1779,14 @@ void XrSubmitOneFrame()
             // to look good anyway.
             XrPosef submitPose[2] = { views[0].pose, views[1].pose };
             XrFovf submitFov[2] = { views[0].fov, views[1].fov };
-            const XRBridgePoseId taggedId = g_slotPoseId[leftFrontSlot].load(std::memory_order_acquire);
+            // Skipped entirely in direct-submit mode: nothing tags the eye
+            // slots there, so this lookup would miss on every single frame and
+            // did - it was counting one phantom "fallback" per real hit and
+            // made the tagging look 50% broken when it was fine.
+            const bool stagedTagging = !g_directAddonSubmit.load(std::memory_order_relaxed);
+            const XRBridgePoseId taggedId =
+                stagedTagging ? g_slotPoseId[leftFrontSlot].load(std::memory_order_acquire) : 0;
+            if (stagedTagging) {
             if (taggedId != 0) {
                 const RenderedPose& entry = g_poseRing[taggedId % kPoseRingSize];
                 if (entry.id.load(std::memory_order_acquire) == taggedId) {
@@ -1736,12 +1813,114 @@ void XrSubmitOneFrame()
             } else {
                 g_poseMisses.fetch_add(1, std::memory_order_relaxed);
             }
+            } // stagedTagging
             const UINT64 curGeneration[2] = { g_eyeGeneration[kEyeLeft].load(std::memory_order_acquire), g_eyeGeneration[kEyeRight].load(std::memory_order_acquire) };
             static UINT64 s_lastSubmittedGeneration[2] = { 0, 0 };
             static UINT64 s_reusedFrameCount[2] = { 0, 0 };
             static UINT64 s_submittedFrameCount[2] = { 0, 0 };
             const char* eyeNames[2] = { "left", "right" };
-            for (int eye = 0; eye < static_cast<int>(viewCount) && haveViews && srcTex[eye]; ++eye) {
+
+            // ---- Direct submit: addon frame straight into the swapchain ----
+            // Both images have to be held at once, because the addon crops
+            // the left and right halves of one source in a single locked
+            // read, so this cannot use the per-eye loop below.
+            const bool directSubmit = g_usingD3D12AddonPath && haveViews &&
+                g_directAddonSubmit.load(std::memory_order_relaxed);
+            if (directSubmit) {
+                uint32_t imageIndex[2] = { 0, 0 };
+                bool acquired[2] = { false, false };
+                const int eyes = static_cast<int>(viewCount) < 2 ? static_cast<int>(viewCount) : 2;
+
+                for (int eye = 0; eye < eyes; ++eye) {
+                    XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+                    if (XR_FAILED(xrAcquireSwapchainImage(g_xrSwapchain[eye], &acquireInfo, &imageIndex[eye])))
+                        continue;
+                    XrSwapchainImageWaitInfo waitImgInfo{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                    waitImgInfo.timeout = XR_INFINITE_DURATION;
+                    acquired[eye] = XR_SUCCEEDED(xrWaitSwapchainImage(g_xrSwapchain[eye], &waitImgInfo));
+                }
+
+                if (acquired[0] && acquired[1]) {
+                    int addonSlot = -1;
+                    bool copied = false;
+                    ScopedTimer t("DirectSubmitCopy", logThisIteration);
+                    // A bounded wait, not a skip: on this thread a skip costs
+                    // a whole displayed frame (that is what made the first
+                    // direct-submit attempt slower than the staged path), so
+                    // spending up to 3 ms waiting for the GPU is the cheaper
+                    // trade by a wide margin.
+                    if (D3D12AddonBridge_CopyToEyeSlots(g_d3d11Context,
+                            g_xrSwapchainImages[kEyeLeft][imageIndex[kEyeLeft]].texture,
+                            g_xrSwapchainImages[kEyeRight][imageIndex[kEyeRight]].texture,
+                            g_eyeWidth, g_eyeHeight, &addonSlot, kDirectSubmitWaitMs, &copied)
+                        && addonSlot >= 0 && copied) {
+                        // Pose the game rendered THIS addon frame with.
+                        const XRBridgePoseId tagged =
+                            g_addonSlotPoseId[addonSlot].load(std::memory_order_acquire);
+                        if (tagged != 0) {
+                            const RenderedPose& entry = g_poseRing[tagged % kPoseRingSize];
+                            if (entry.id.load(std::memory_order_acquire) == tagged) {
+                                for (int eye = 0; eye < 2; ++eye) {
+                                    submitPose[eye] = entry.pose[eye];
+                                    submitFov[eye] = entry.fov[eye];
+                                }
+                                const double ageMs = NowMillis() - entry.publishedMs;
+                                if (ageMs >= 0.0 && ageMs < 1000.0) {
+                                    g_frameAgeSumMs += ageMs;
+                                    ++g_frameAgeCount;
+                                    if (ageMs > g_frameAgeWorstMs)
+                                        g_frameAgeWorstMs = ageMs;
+                                }
+                                ++g_poseHits;
+                                // Remember what this swapchain image now
+                                // holds, so a later frame that fails to copy
+                                // can still describe it honestly.
+                                for (int eye = 0; eye < 2; ++eye)
+                                    g_imagePoseId[eye][imageIndex[eye] % kMaxSwapchainImages] = tagged;
+                            } else {
+                                ++g_poseMisses;
+                            }
+                        } else {
+                            ++g_poseMisses;
+                        }
+                    } else {
+                        // Nothing was written into the images we acquired, so
+                        // they still hold whatever frame was last put there -
+                        // and swapchain images cycle, so that is not the most
+                        // recent one. Submitting a fresh pose for old pixels
+                        // is what made this path hitch while turning. Use the
+                        // pose those pixels really were rendered with, and the
+                        // compositor reprojects them correctly instead.
+                        for (int eye = 0; eye < 2; ++eye) {
+                            const XRBridgePoseId held = g_imagePoseId[eye][imageIndex[eye] % kMaxSwapchainImages];
+                            if (held == 0)
+                                continue;
+                            const RenderedPose& e = g_poseRing[held % kPoseRingSize];
+                            if (e.id.load(std::memory_order_acquire) == held) {
+                                submitPose[eye] = e.pose[eye];
+                                submitFov[eye] = e.fov[eye];
+                            }
+                        }
+                        ++g_poseMisses;
+                    }
+                }
+
+                for (int eye = 0; eye < eyes; ++eye) {
+                    if (!acquired[eye])
+                        continue;
+                    XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                    xrReleaseSwapchainImage(g_xrSwapchain[eye], &releaseInfo);
+                    projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                    projViews[eye].pose = submitPose[eye];
+                    projViews[eye].fov = submitFov[eye];
+                    projViews[eye].subImage.swapchain = g_xrSwapchain[eye];
+                    projViews[eye].subImage.imageRect.offset = { 0, 0 };
+                    projViews[eye].subImage.imageRect.extent = { static_cast<int32_t>(g_eyeWidth),
+                        static_cast<int32_t>(g_eyeHeight) };
+                }
+            }
+
+            for (int eye = 0; !directSubmit && eye < static_cast<int>(viewCount) && haveViews && srcTex[eye]; ++eye) {
                 ++s_submittedFrameCount[eye];
                 if (curGeneration[eye] != 0 && curGeneration[eye] == s_lastSubmittedGeneration[eye])
                     ++s_reusedFrameCount[eye];
@@ -2009,6 +2188,7 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         prevEnd = end;
     }
 
+#if RE5VR_DIAGNOSTICS
     // Insert: producer waits for the consumer, or always keeps the newest
     // frame (see g_waitForConsumer). Watch the "image age at submit" line.
     {
@@ -2022,6 +2202,22 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         }
         prevInsert = insert;
     }
+
+    // Delete: direct submit on/off (see g_directAddonSubmit). Watch the
+    // "image age at submit" line either side of it.
+    {
+        static bool prevDel = false;
+        const bool del = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+        if (del && !prevDel) {
+            const bool on = !g_directAddonSubmit.load(std::memory_order_relaxed);
+            g_directAddonSubmit.store(on, std::memory_order_relaxed);
+            Log_Printf("XRBridge: Delete pressed, direct submit %s",
+                on ? "ON (addon frame copied straight into the swapchain)"
+                   : "OFF (staged through the eye textures, the old path)");
+        }
+        prevDel = del;
+    }
+#endif // RE5VR_DIAGNOSTICS
 
     static bool prevF7Down = false;
     bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
@@ -2113,7 +2309,12 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
     bool okLeft = false;
     bool okRight = false;
 
-    if (g_usingD3D12AddonPath) {
+    if (g_usingD3D12AddonPath && g_directAddonSubmit.load(std::memory_order_relaxed)) {
+        // Direct submit: the submit thread reads the addon's frame itself, so
+        // there is nothing for the game thread to stage and no reason for it
+        // to touch the shared D3D11 context at all. See g_directAddonSubmit.
+        return;
+    } else if (g_usingD3D12AddonPath) {
         // No D3D9 backbuffer/CPU readback at all in this path - straight
         // GPU-side CopySubresourceRegion from the addon's shared D3D12
         // frame (already opened as a D3D11 texture) into both eye slots.
@@ -2170,6 +2371,15 @@ XRBridgePoseId VRBridge_GetCurrentPoseId()
 void VRBridge_NoteFramePresented(XRBridgePoseId poseId)
 {
     g_poseOfPresentedFrame.store(poseId, std::memory_order_release);
+
+    // Direct-submit path: nothing of ours stages this frame, so tag the
+    // addon's own slot here instead - dgVoodoo has just published into it
+    // during the Present we are returning from.
+    if (g_directAddonSubmit.load(std::memory_order_relaxed)) {
+        const int slot = D3D12AddonBridge_GetFrontSlot();
+        if (slot >= 0 && slot < 2)
+            g_addonSlotPoseId[slot].store(poseId, std::memory_order_release);
+    }
 }
 
 bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)

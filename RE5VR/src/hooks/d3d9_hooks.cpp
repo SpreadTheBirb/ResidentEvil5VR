@@ -22,8 +22,9 @@
 // Developer diagnostics: the probes and captures used to find things in the
 // game, plus the Phase 0 blinking quad. Off in released builds - players hit
 // F-keys by accident, and some of these visibly break the camera or write
-// large files into the game folder. Set to 1 for a debugging build.
-#define RE5VR_DIAGNOSTICS 0
+// large files into the game folder. Now shared, so the experiment hotkeys in
+// the VR bridge and stereo path are gated by the same switch.
+#include "../util/build_config.h"
 
 namespace {
 

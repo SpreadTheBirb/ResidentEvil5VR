@@ -156,14 +156,50 @@ int D3D12AddonBridge_GetFrontSlot()
     return (slot < 0 || slot > 1) ? -1 : slot;
 }
 
+namespace {
+
+// Wall-clock milliseconds, high resolution.
+double AddonNowMs()
+{
+    static LARGE_INTEGER freq = {};
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+}
+
+// Spin on a predicate until it comes true or the budget runs out. Yields the
+// rest of the timeslice between polls rather than burning the core, and
+// always returns - the deadline is the whole point.
+template <typename Predicate>
+bool SpinUntil(Predicate ready, double maxWaitMs)
+{
+    if (ready())
+        return true;
+    if (maxWaitMs <= 0.0)
+        return false;
+    const double deadline = AddonNowMs() + maxWaitMs;
+    while (AddonNowMs() < deadline) {
+        SwitchToThread();
+        if (ready())
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
 bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
     ID3D11Texture2D* leftDst, ID3D11Texture2D* rightDst, UINT eyeWidth, UINT eyeHeight,
-    int* outSlot)
+    int* outSlot, double maxWaitMs, bool* outCopied)
 {
+    if (outCopied)
+        *outCopied = false;
     if (!g_active || !g_pGetFrontSlot)
         return false;
 
-    const int frontSlot = g_pGetFrontSlot();
+    int frontSlot = g_pGetFrontSlot();
     if (frontSlot < 0 || frontSlot > 1)
         return false; // addon hasn't published a frame yet
     if (outSlot)
@@ -213,9 +249,15 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
         // skip almost every copy because the slot stayed locked.
         // Passing 0 lets GetData flush and then answer; it still returns
         // immediately either way, so this is a single poll, not a wait.
-        const HRESULT hr = g_syncQuery
-            ? d3d11Context->GetData(g_syncQuery, &done, sizeof(done), 0)
-            : S_OK; // no query available - treat as done, see step 3
+        HRESULT hr = S_OK; // no query available - treat as done, see step 3
+        if (g_syncQuery) {
+            SpinUntil(
+                [&]() {
+                    hr = d3d11Context->GetData(g_syncQuery, &done, sizeof(done), 0);
+                    return hr == S_OK && done;
+                },
+                maxWaitMs);
+        }
 
         if (hr == S_OK && done) {
             if (g_pEndReadSlot && g_pendingSlot >= 0)
@@ -230,6 +272,17 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
             if (s_notDoneCount <= 10 || (s_notDoneCount % 300) == 0)
                 Log_Printf("D3D12AddonBridge_CopyToEyeSlots #%u: previous read of slot=%d not finished on GPU yet, reusing last frame (skip #%u)",
                     s_copyCount, g_pendingSlot, s_notDoneCount);
+            // Returns TRUE deliberately, even though nothing was copied. The
+            // staged caller treats this as "the frame you already have is
+            // still good", which is true - its eye textures keep valid
+            // contents - and it goes on publishing and pose-tagging them.
+            // Returning false here (tried 2026-09-12 for direct submit)
+            // silently killed the tagging on the staged path: tags stopped
+            // being written, the 16-entry pose ring wrapped past the last
+            // one, and every submit fell back to a freshly located pose.
+            // Visible in the cloud-PC log as hits frozen at 4845 while
+            // fallbacks climbed 555 -> 1155 -> 1755, with image age 0.0.
+            // This fires on roughly every other call, so it matters.
             return true;
         }
     }
@@ -240,13 +293,39 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
     // it completes, so this is the matching half of that contract: a
     // cheap fence GetCompletedValue() comparison on the addon's side. If
     // it isn't ready we reuse the previous frame rather than wait.
-    if (g_pIsSlotReady && !g_pIsSlotReady(frontSlot)) {
-        static UINT s_notReadyCount = 0;
-        ++s_notReadyCount;
-        if (s_notReadyCount <= 10 || (s_notReadyCount % 300) == 0)
-            Log_Printf("D3D12AddonBridge_CopyToEyeSlots #%u: slot=%d published but its GPU copy hasn't completed yet, reusing last frame (skip #%u)",
-                s_copyCount, frontSlot, s_notReadyCount);
-        return true;
+    // If the newest slot's GPU copy still hasn't landed, the OTHER slot holds
+    // the previous frame and is complete by definition - one frame old beats
+    // no frame at all. This matters enormously for the direct-submit caller:
+    // there, "skip" means submitting a swapchain image nothing was written
+    // into, and swapchain images cycle, so the headset shows a frame from two
+    // or three displays ago. That backwards jump is exactly the hitching the
+    // user felt. The staged caller never noticed, because its eye textures
+    // always still held the previous frame.
+    if (g_pIsSlotReady && !SpinUntil([&]() { return g_pIsSlotReady(frontSlot) != 0; }, maxWaitMs)) {
+        const int otherSlot = 1 - frontSlot;
+        if (g_fullFrameTex[otherSlot] && g_pIsSlotReady(otherSlot)) {
+            static UINT s_otherSlotCount = 0;
+            ++s_otherSlotCount;
+            if (s_otherSlotCount <= 5 || (s_otherSlotCount % 300) == 0)
+                Log_Printf("D3D12AddonBridge_CopyToEyeSlots #%u: slot=%d not ready, using slot=%d (previous frame) "
+                           "instead of skipping (#%u)",
+                    s_copyCount, frontSlot, otherSlot, s_otherSlotCount);
+            frontSlot = otherSlot;
+            src = g_fullFrameTex[otherSlot];
+            if (outSlot)
+                *outSlot = otherSlot;
+        } else {
+            // Same reasoning as the skip above: true means "keep using what
+            // you have", which is correct for the staged caller and keeps its
+            // pose tagging alive. Only the direct-submit path needs to know
+            // the difference, and that path is off.
+            static UINT s_notReadyCount = 0;
+            ++s_notReadyCount;
+            if (s_notReadyCount <= 10 || (s_notReadyCount % 300) == 0)
+                Log_Printf("D3D12AddonBridge_CopyToEyeSlots #%u: slot=%d published but its GPU copy hasn't completed yet, reusing last frame (skip #%u)",
+                    s_copyCount, frontSlot, s_notReadyCount);
+            return true;
+        }
     }
 
     // --- Step 3: the slot is genuinely ours to read. Mark and copy.
@@ -271,6 +350,8 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
     d3d11Context->CopySubresourceRegion(rightDst, 0, 0, 0, 0, src, 0, &rightBox);
     if (verboseLog)
         Log_Printf("D3D12AddonBridge_CopyToEyeSlots #%u: right copy returned OK", s_copyCount);
+    if (outCopied)
+        *outCopied = true; // real pixels went into both destinations
 
     // Mark where the GPU is in our copies so step 1 can retire this read
     // next frame without blocking. If the query couldn't be created we

@@ -6,6 +6,7 @@
 #include "../hooks/pixel_constant_probe.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
+#include "../util/build_config.h"
 #include "mat3.h"
 
 #include <MinHook.h>
@@ -93,7 +94,9 @@ constexpr float kHalfSeparationStep = 0.25f;
 // and has no effect on orientation.
 // Draw post-process buffers (anything meaningfully smaller than the
 // backbuffer) once instead of splitting them per eye - see
-// RenderTargetIsScreenShaped. '/' toggles.
+// RenderTargetIsScreenShaped. This is the light-leak fix, confirmed by the
+// user on 2026-09-12, so it is ON by default; '/' turns it back off to get
+// the old (leaking) per-eye behaviour for comparison.
 std::atomic<bool> g_monoSmallTargets{ true };
 
 // Don't rotate the eye bases by the head delta while F9 is already steering
@@ -435,8 +438,11 @@ bool RenderTargetIsScreenShaped(IDirect3DDevice9* pDevice)
     // bright wedges the user reported as "light leaks" - present with
     // culling on or off, wide FOV or not, because it was never a culling
     // problem. Anything meaningfully smaller than the backbuffer is now
-    // drawn ONCE, untouched, and composited mono. '/' toggles this back for
-    // comparison.
+    // drawn ONCE, untouched, and composited mono - and with that on the
+    // leaks are gone (user-confirmed 2026-09-12). An earlier run of this
+    // same toggle read as a miss; that was before the post-process revert,
+    // so trust this result over that one. '/' puts the per-eye splitting
+    // back for comparison.
     if (g_monoSmallTargets.load(std::memory_order_relaxed)) {
         const bool fullSize = d.Width * 10 >= g_backBufferWidth * 9 && d.Height * 10 >= g_backBufferHeight * 9;
         if (!fullSize) {
@@ -808,10 +814,12 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
         const bool on = !g_monoSmallTargets.load(std::memory_order_relaxed);
         g_monoSmallTargets.store(on, std::memory_order_relaxed);
         Log_Printf("StereoTest: '/' pressed, post-process buffers now drawn %s",
-            on ? "MONO (small render targets not split per eye)" : "per eye (old behaviour)");
+            on ? "MONO (small render targets not split per eye - default, no light leaks)"
+               : "per eye (old behaviour - expect light leaks)");
     }
     prevSlashDown = slashDown;
 
+#if RE5VR_DIAGNOSTICS
     // '\' = apply the head delta to the eyes even while head-follow is
     // steering the camera (i.e. the old, double-rotating behaviour).
     static bool prevBackslashDown = false;
@@ -823,6 +831,7 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
             on ? "ON (eyes not rotated again while F9 steers the camera)" : "OFF (old behaviour)");
     }
     prevBackslashDown = backslashDown;
+#endif // RE5VR_DIAGNOSTICS
 
     prevF8Down = f8Down;
 
