@@ -53,6 +53,19 @@ steps in the release notes.
 
 You do **not** need to clone this repository to play.
 
+### Do this first: the 4GB patch
+
+**Strongly recommended, with or without VR.** RE5 is 32-bit and capped at 2 GB
+of address space no matter how much memory or VRAM you have. Raising that cap
+to 4 GB made stutters disappear outright - on a 5090 flat screen, and on a
+laptop in VR. It is not extra VRAM; it is headroom the game runs out of long
+before your graphics card does.
+
+Get [the 4GB patch](https://ntcore.com/4gb-patch/), run it, and point it at
+`...\Steam\steamapps\common\Resident Evil 5\re5dx9.exe`. It keeps the original
+alongside as `re5dx9.exe.Bak`. Steam verifying or updating the game restores
+the unpatched exe, so re-run it if stutters return.
+
 ## Repository layout
 
 ```
