@@ -22,7 +22,7 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 - [Features](#features)
 - [Playing in VR](#playing-in-vr)
 - [Performance](#performance)
-- [Known issues](#known-issues)
+- [Known issues](#known-issues) · [Reporting a problem](#reporting-a-problem)
 - [Next up](#next-up)
 - [How it works](#how-it-works) · [Repository layout](#repository-layout) · [Building from source](#building-from-source) · [Third-party components](#third-party-components)
 
@@ -135,7 +135,8 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 
 ### Status tab
 
-Live values, useful for troubleshooting and for bug reports:
+Live values, useful for troubleshooting — **screenshot this page when
+reporting a problem** (see [Reporting a problem](#reporting-a-problem)):
 
 - **Mod** — release or developer build, VR or flatscreen install, address
   space used, whether the **4GB patch** is applied
@@ -240,9 +241,25 @@ A controller is recommended over mouse and keyboard.
   than vanish instantly as the camera returns.
 - Split-screen co-op: Chris's head stays hidden. **Online co-op is untested.**
 
-If something goes wrong, `re5vr.log` (and `re5vr_addon.log` in VR) in the game
-folder say what happened. `re5vr.log` is replaced every launch, so grab it
-before starting the game again.
+### Reporting a problem
+
+Please include these with any bug report or issue:
+
+1. **A screenshot of the menu's Status tab** — open the menu (Insert, or click
+   both sticks), switch to **Status**, and screenshot it, ideally while the
+   problem is happening. It shows your frame rate, resolution per eye,
+   headset and runtime, refresh rate, whether the 4GB patch is applied, and
+   more, in one picture.
+2. **The log files** from the game folder
+   (`...\Steam\steamapps\common\Resident Evil 5\`):
+   - `re5vr.log` — always
+   - `re5vr_addon.log` — as well, if you were playing in VR
+
+   `re5vr.log` is **replaced every time the game starts**, so copy it before
+   launching again, or the session with the problem is gone.
+
+Say roughly when it happened too (the logs have timestamps), and which
+download you're using.
 
 ---
 
