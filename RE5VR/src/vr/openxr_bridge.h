@@ -111,3 +111,7 @@ XRBridgePoseId VRBridge_GetCurrentPoseId();
 // passing the pose id that frame was rendered with. Associates it with
 // whichever addon slot the producer just published.
 void VRBridge_NoteFramePresented(XRBridgePoseId poseId);
+
+// Reset view: the next usable head pose becomes "forward" again, yaw only -
+// up and down stay tied to gravity. Safe from any thread. source is for the log.
+void VRBridge_RequestRecenter(const char* source);

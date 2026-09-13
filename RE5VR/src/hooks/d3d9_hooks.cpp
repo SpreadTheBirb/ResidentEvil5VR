@@ -12,12 +12,17 @@
 #include "state_probe.h"
 #include "laser_patch.h"
 #include "filter_patch.h"
+#include "hud_probe.h"
 #include "../render/stereo_test.h"
+#include "../render/hud_shaders.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
 
 #include <MinHook.h>
 #include <windows.h>
+
+#include <cstdio>
+#include <cstring>
 
 // Developer diagnostics: the probes and captures used to find things in the
 // game, plus the Phase 0 blinking quad. Off in released builds - players hit
@@ -52,6 +57,111 @@ void EnsureMinHookInitialized()
     Log_Printf("MH_Initialize -> %d", static_cast<int>(st));
 }
 
+
+// ---- Forced backbuffer resolution (2026-09-12) --------------------------
+// Each VR eye is HALF the backbuffer width - stereo is every draw issued
+// twice into opposite halves, split by scissor - so at 1920x1080 an eye is
+// 960x1080 and the runtime upscales it to ~1632 wide before the tester sees
+// it. That is the "super pixelated" report, and it is also why his SteamVR
+// 150% and Virtual Desktop Godlike changed nothing: both raise resolution
+// downstream of a source that is fixed by the game.
+//
+// The source is what this moves. Overriding the presentation parameters makes
+// the game render wider, and each half then lands in the eye texture with
+// more pixels - at 3264x1072 an eye is 1632x1072, a 1:1 match for a Quest 3's
+// recommendation with no upscale at all.
+//
+// Driven by a file rather than a constant, because the useful resolution
+// depends on the headset and the GPU, and this way a test run costs a text
+// edit instead of a rebuild:
+//
+//     re5vr_res.txt, next to re5dx9.exe, containing e.g.   3264x1072
+//
+// Windowed mode is worth knowing about here: the backbuffer does NOT have to
+// match the window, so the desktop window can stay small and cheap while the
+// VR image is rendered large. dgVoodoo scales for the monitor either way.
+struct ForcedRes {
+    UINT width = 0;
+    UINT height = 0;
+    bool checked = false;
+};
+ForcedRes g_forcedRes;
+
+const ForcedRes& ForcedBackbufferSize()
+{
+    if (g_forcedRes.checked)
+        return g_forcedRes;
+    g_forcedRes.checked = true;
+
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* slash = strrchr(path, 0x5C); // backslash
+    if (!slash) {
+        Log_Printf("ForcedBackbufferSize: no module path, resolution left alone");
+        return g_forcedRes;
+    }
+    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "re5vr_res.txt");
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || !f) {
+        Log_Printf("ForcedBackbufferSize: %s not found - the game's own resolution is used", path);
+        return g_forcedRes;
+    }
+    unsigned w = 0, h = 0;
+    const int fields = fscanf_s(f, "%ux%u", &w, &h);
+    fclose(f);
+
+    // Sanity: refuse nonsense rather than hand D3D a device it cannot make.
+    if (fields != 2 || w < 640 || h < 480 || w > 16384 || h > 16384) {
+        Log_Printf("ForcedBackbufferSize: %s did not parse as WIDTHxHEIGHT (got %d field(s), %ux%u) - ignoring",
+            path, fields, w, h);
+        return g_forcedRes;
+    }
+    g_forcedRes.width = w;
+    g_forcedRes.height = h;
+    Log_Printf("ForcedBackbufferSize: %s says %ux%u - each VR eye will be %ux%u", path, w, h, w / 2, h);
+    return g_forcedRes;
+}
+
+// Logs what the backbuffer ACTUALLY ended up as, which is the only proof that
+// an override stuck: D3D9 is free to hand back something else, and dgVoodoo
+// sits in the middle with opinions of its own.
+void LogActualBackbuffer(IDirect3DDevice9* pDevice, const char* when)
+{
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) {
+        Log_Printf("LogActualBackbuffer(%s): GetBackBuffer failed", when);
+        return;
+    }
+    D3DSURFACE_DESC d = {};
+    const HRESULT hr = bb->GetDesc(&d);
+    bb->Release();
+    if (FAILED(hr)) {
+        Log_Printf("LogActualBackbuffer(%s): GetDesc failed (0x%08lX)", when, hr);
+        return;
+    }
+    Log_Printf("LogActualBackbuffer(%s): backbuffer is %ux%u (format %d, multisample %d) - each VR eye gets %ux%u",
+        when, d.Width, d.Height, static_cast<int>(d.Format), static_cast<int>(d.MultiSampleType),
+        d.Width / 2, d.Height);
+}
+
+// Applies the override to a presentation-parameters block, logging what it
+// changed. Shared by CreateDevice and Reset - a Reset with the game's own
+// numbers would silently undo the whole thing.
+void ApplyForcedRes(D3DPRESENT_PARAMETERS* pp, const char* when)
+{
+    const ForcedRes& forced = ForcedBackbufferSize();
+    if (!pp || !forced.width)
+        return;
+    if (pp->BackBufferWidth == forced.width && pp->BackBufferHeight == forced.height) {
+        Log_Printf("ApplyForcedRes(%s): already %ux%u, nothing to do", when, forced.width, forced.height);
+        return;
+    }
+    Log_Printf("ApplyForcedRes(%s): game asked for %ux%u, forcing %ux%u (windowed=%d)",
+        when, pp->BackBufferWidth, pp->BackBufferHeight, forced.width, forced.height, pp->Windowed);
+    pp->BackBufferWidth = forced.width;
+    pp->BackBufferHeight = forced.height;
+}
 // ---- IDirect3D9::CreateDevice -------------------------------------------
 //
 // Phase 0 only needs to prove this proxy's hooks run inside the game's real
@@ -93,11 +203,14 @@ HRESULT WINAPI hkCreateDevice(
         pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
         pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0);
 
+    ApplyForcedRes(pPresentationParameters, "CreateDevice");
+
     HRESULT hr = oCreateDevice(This, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
         pPresentationParameters, ppReturnedDeviceInterface);
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
         Log_Printf("hkCreateDevice: real CreateDevice succeeded");
+        LogActualBackbuffer(*ppReturnedDeviceInterface, "after CreateDevice");
         Hooks_OnDeviceCreated(*ppReturnedDeviceInterface);
     } else {
         Log_Printf("hkCreateDevice: real CreateDevice failed (hr=0x%08lX)", hr);
@@ -149,6 +262,31 @@ void DrawDebugQuad(IDirect3DDevice9* pDevice)
 }
 #endif
 
+
+// ---- IDirect3DDevice9::Reset: keep the forced resolution ---------------
+// The game resets the device whenever display settings change, and on some
+// alt-tab paths. A reset carries its own presentation parameters, so without
+// this the override would quietly disappear mid-session and the eyes would go
+// back to half of whatever the game wanted.
+constexpr size_t kIDirect3DDevice9_Reset = 16;
+
+typedef HRESULT(WINAPI* Reset_t)(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentationParameters);
+Reset_t oReset = nullptr;
+
+HRESULT WINAPI hkReset(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentationParameters)
+{
+    Log_Printf("hkReset: game asked for %ux%u (windowed=%d)",
+        pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
+        pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0,
+        pPresentationParameters ? pPresentationParameters->Windowed : -1);
+    ApplyForcedRes(pPresentationParameters, "Reset");
+    const HRESULT hr = oReset(This, pPresentationParameters);
+    if (SUCCEEDED(hr))
+        LogActualBackbuffer(This, "after Reset");
+    else
+        Log_Printf("hkReset: Reset failed (hr=0x%08lX) - the forced size may be one the device will not take", hr);
+    return hr;
+}
 // ---- IDirect3DDevice9::Present: the one true frame boundary ------------
 // EndScene fires several times per rendered frame here (once per pass), so
 // it can't mark "a new frame starts now". Present can: stereo_test latches
@@ -164,6 +302,9 @@ HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const 
 {
     const HRESULT hr = oPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     StereoTest_OnPresent();
+#if RE5VR_DIAGNOSTICS
+    HudProbe_OnPresent(); // K: record the HUD's draw calls
+#endif
     return hr;
 }
 
@@ -255,6 +396,8 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     ConstantProbe_Install(pDevice);
     PixelConstantProbe_Install(pDevice);
     QueryProbe_Install(pDevice);
+    // Before the game loads its shaders, so every one of them is hashed at creation.
+    HudShaders_Install(pDevice);
     StereoTest_Install(pDevice);
     VRBridge_Install();
     CameraRigHook_Install();
@@ -262,4 +405,7 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     CullingPatch_Install();
     LaserPatch_Install();
     FilterPatch_Install();
+#if RE5VR_DIAGNOSTICS
+    HudProbe_Install();
+#endif
 }

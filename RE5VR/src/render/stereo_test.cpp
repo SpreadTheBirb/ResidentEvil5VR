@@ -4,6 +4,8 @@
 #include "../hooks/fade_probe.h"
 #include "../hooks/head_hide_probe.h"
 #include "../hooks/pixel_constant_probe.h"
+#include "../hooks/hud_probe.h"
+#include "hud_shaders.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
 #include "../util/build_config.h"
@@ -11,6 +13,7 @@
 
 #include <MinHook.h>
 
+#include <algorithm>
 #include <atomic>
 #include <windows.h>
 #include <cmath>
@@ -111,6 +114,10 @@ constexpr float kFovWidenStep = 0.1f;
 
 bool g_enabled = false;
 bool g_suppressed = false;
+// Which branch BeginStereoDraw took for the draw in progress - read by the HUD
+// recorder (hud_probe.cpp) right after the decision, so it can say exactly
+// what VR did to each HUD draw. Game thread only.
+int g_stereoPath = kStereoPathOff;
 
 // See "2026-09-11 VR hole fixes" above BeginStereoDraw. '`' toggles them.
 bool g_frameFixes = true;
@@ -473,25 +480,33 @@ bool GetEyeViewsForDraw(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
 
 bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
 {
-    if (!g_enabled || g_suppressed)
+    if (!g_enabled || g_suppressed) {
+        g_stereoPath = kStereoPathOff;
         return false;
+    }
 
     float baseMatrix[16];
-    if (!ConstantProbe_GetCachedCameraMatrix(baseMatrix))
+    if (!ConstantProbe_GetCachedCameraMatrix(baseMatrix)) {
+        g_stereoPath = kStereoPathNoMatrix;
         return false;
+    }
 
     XRBridgeEyeView leftView, rightView;
     const bool haveEyeViews = GetEyeViewsForDraw(leftView, rightView);
     if (g_frameFixes && haveEyeViews) {
-        if (!RenderTargetIsScreenShaped(pDevice))
+        if (!RenderTargetIsScreenShaped(pDevice)) {
+            g_stereoPath = kStereoPathOffscreen;
             return false; // shadow map etc: one untouched draw
+        }
         if (IsScreenSpaceMatrix(baseMatrix)) {
             BuildScreenSpaceEyes(baseMatrix, ctx);
             ++g_census.screenSpace;
+            g_stereoPath = kStereoPathScreenSpace;
             return true;
         }
     }
     if (!haveEyeViews || !IsPlausibleCameraMatrix(baseMatrix)) {
+        g_stereoPath = kStereoPathNudged;
         if (haveEyeViews)
             ++g_census.nudged;
         // No HMD pose yet (VR mode off, or headset not ready), or this
@@ -584,6 +599,7 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
             leftCentre, rightCentre, rightCentre - leftCentre);
     }
     ++g_census.split3d;
+    g_stereoPath = kStereoPathCamera;
     return true;
 }
 
@@ -617,6 +633,134 @@ void EndStereoDraw(IDirect3DDevice9* pDevice)
     pDevice->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
 }
 
+// ---- HUD: one draw per eye through the viewport (2026-09-13) ------------
+// The HUD recorder (hud_probe.cpp) showed why the HUD has never been visible
+// in VR. Its shader does not read c0-c3, so those registers still hold the 3D
+// scene's camera when it draws - which looks like a perfectly plausible camera
+// - and every HUD draw took the per-eye CAMERA path: drawn twice, scissored to
+// one half each time. The left eye got the left half of a full-screen HUD and
+// the right eye the right half, so health and ammo, which sit at the screen
+// edges, ended up in the outer corners of each eye image, outside the lenses.
+//
+// Nothing about the fix needs to know how the shader positions its vertices:
+// D3D maps clip space into whatever viewport is set, AFTER the vertex shader.
+// So each HUD draw is issued once into each eye's half, sized to keep the
+// frame's aspect. No matrix writes.
+//
+// PLACEMENT (2026-09-13). The first version put the HUD at the same pixel spot
+// in both halves, as if the centre of each half were straight ahead. It works
+// - and it does not fuse: the user saw "two images next to each other, like
+// going cross-eyed". Headset FOVs are ASYMMETRIC (each eye sees further out
+// than in), so the two half-centres point in different directions, and the
+// copies land at angles no pair of eyes can converge on.
+//
+// Instead the HUD is placed at a real distance straight ahead of the head,
+// and each eye's copy goes where THAT point falls in THAT eye's projection,
+// using the per-eye angles OpenXR reports every frame. A point at distance D
+// ahead of the head centre sits ipd/2 to one side of each eye, so its tangent
+// is +-(ipd/2)/D, and an asymmetric frustum maps a tangent t to
+//     ndc = (2t - (tanRight + tanLeft)) / (tanRight - tanLeft).
+// The two copies then converge exactly at D. Lens canting (toe-in) is ignored
+// - fine for Quest-style parallel displays, may need the rotation on Index.
+//
+// Scissored to the eye's half, because the shifted viewport can overhang it.
+constexpr float kHudDistanceMeters = 2.0f; // how far away the HUD appears
+constexpr float kHudScale = 0.8f;          // HUD width as a fraction of one eye's half
+constexpr float kFallbackIpdMeters = 0.063f;
+
+template <typename DrawFn>
+HRESULT DrawHudPerEye(IDirect3DDevice9* pDevice, DrawFn draw)
+{
+    D3DVIEWPORT9 vp;
+    if (FAILED(pDevice->GetViewport(&vp)) || vp.Width < 4 || vp.Height < 4)
+        return draw();
+    DWORD scissor = FALSE;
+    if (FAILED(pDevice->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor)))
+        scissor = FALSE;
+    RECT oldScissor = {};
+    pDevice->GetScissorRect(&oldScissor);
+
+    XRBridgeEyeView views[2];
+    const bool haveViews = GetEyeViewsForDraw(views[0], views[1]);
+    float ipd = kFallbackIpdMeters;
+    if (haveViews) {
+        const float d[3] = { views[1].positionMeters[0] - views[0].positionMeters[0],
+            views[1].positionMeters[1] - views[0].positionMeters[1],
+            views[1].positionMeters[2] - views[0].positionMeters[2] };
+        const float measured = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (measured > 0.04f && measured < 0.09f)
+            ipd = measured;
+    }
+
+    const float halfW = vp.Width * 0.5f;
+    const float hudW = halfW * kHudScale;
+    const float hudH = vp.Height * kHudScale * 0.5f; // keeps the full frame's aspect
+
+    HRESULT hr = D3D_OK;
+    for (int eye = 0; eye < 2; ++eye) {
+        const float halfX0 = vp.X + (eye ? halfW : 0.0f);
+        float centreX = halfX0 + halfW * 0.5f;
+        float centreY = vp.Y + vp.Height * 0.5f;
+        if (haveViews) {
+            const XRBridgeEyeView& v = views[eye];
+            const float tl = std::tan(v.angleLeft), tr = std::tan(v.angleRight);
+            const float tu = std::tan(v.angleUp), td = std::tan(v.angleDown);
+            if (tr - tl > 1e-3f && tu - td > 1e-3f) {
+                // Left eye is ipd/2 to the left, so a point ahead of the head
+                // centre is to its RIGHT (positive tangent), and vice versa.
+                const float t = (eye == 0 ? 0.5f : -0.5f) * ipd / kHudDistanceMeters;
+                const float ndcX = (2.0f * t - (tr + tl)) / (tr - tl);
+                const float ndcY = -(tu + td) / (tu - td); // straight ahead vertically
+                centreX = halfX0 + (ndcX + 1.0f) * 0.5f * halfW;
+                centreY = vp.Y + (1.0f - ndcY) * 0.5f * vp.Height;
+            }
+        }
+
+        // D3D9 rejects a viewport that leaves the render target, so clamp to
+        // the frame; the scissor keeps any overhang out of the other eye.
+        float x = centreX - hudW * 0.5f, y = centreY - hudH * 0.5f;
+        x = (std::max)(static_cast<float>(vp.X), (std::min)(x, vp.X + vp.Width - hudW));
+        y = (std::max)(static_cast<float>(vp.Y), (std::min)(y, vp.Y + vp.Height - hudH));
+
+        D3DVIEWPORT9 hud = vp;
+        hud.X = static_cast<DWORD>(x + 0.5f);
+        hud.Y = static_cast<DWORD>(y + 0.5f);
+        hud.Width = static_cast<DWORD>(hudW + 0.5f);
+        hud.Height = static_cast<DWORD>(hudH + 0.5f);
+        pDevice->SetViewport(&hud);
+
+        RECT half = { static_cast<LONG>(halfX0), static_cast<LONG>(vp.Y), static_cast<LONG>(halfX0 + halfW),
+            static_cast<LONG>(vp.Y + vp.Height) };
+        pDevice->SetScissorRect(&half);
+        pDevice->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+
+        const HRESULT r = draw();
+        if (eye == 0)
+            hr = r;
+    }
+    pDevice->SetViewport(&vp);
+    pDevice->SetScissorRect(&oldScissor);
+    pDevice->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor);
+    return hr;
+}
+
+// Whether this draw should take the HUD path. Only while stereo is actually
+// running - flat, the HUD draws exactly as the game intends.
+bool IsHudDrawForStereo(IDirect3DDevice9* pDevice)
+{
+    if (!g_enabled || g_suppressed)
+        return false;
+    // Recognised by bytecode hash from launch (hud_shaders.cpp). The K capture
+    // stays available in developer builds, for finding shaders not listed yet.
+    if (HudShaders_IsHudDraw(pDevice))
+        return true;
+#if RE5VR_DIAGNOSTICS
+    return HudProbe_IsHudDraw(pDevice);
+#else
+    return false;
+#endif
+}
+
 typedef HRESULT(WINAPI* DrawPrimitive_t)(IDirect3DDevice9* This, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount);
 DrawPrimitive_t oDrawPrimitive = nullptr;
 
@@ -628,8 +772,19 @@ HRESULT WINAPI hkDrawPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE Primitiv
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
+    if (IsHudDrawForStereo(This)) {
+#if RE5VR_DIAGNOSTICS
+        HudProbe_OnDraw(This, 0, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
+#endif
+        return DrawHudPerEye(This, [&] { return oDrawPrimitive(This, PrimitiveType, StartVertex, PrimitiveCount); });
+    }
+
     StereoDrawContext ctx;
-    if (!BeginStereoDraw(This, ctx))
+    const bool stereo = BeginStereoDraw(This, ctx);
+#if RE5VR_DIAGNOSTICS
+    HudProbe_OnDraw(This, 0, PrimitiveType, PrimitiveCount, g_stereoPath);
+#endif
+    if (!stereo)
         return oDrawPrimitive(This, PrimitiveType, StartVertex, PrimitiveCount);
 
     SetEyeState(This, ctx, true);
@@ -653,8 +808,21 @@ HRESULT WINAPI hkDrawIndexedPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE T
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
+    if (IsHudDrawForStereo(This)) {
+#if RE5VR_DIAGNOSTICS
+        HudProbe_OnDraw(This, 1, Type, primCount, kStereoPathHudViewport);
+#endif
+        return DrawHudPerEye(This, [&] {
+            return oDrawIndexedPrimitive(This, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+        });
+    }
+
     StereoDrawContext ctx;
-    if (!BeginStereoDraw(This, ctx)) {
+    const bool stereo = BeginStereoDraw(This, ctx);
+#if RE5VR_DIAGNOSTICS
+    HudProbe_OnDraw(This, 1, Type, primCount, g_stereoPath);
+#endif
+    if (!stereo) {
         return oDrawIndexedPrimitive(This, Type, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     }
 
@@ -678,8 +846,21 @@ HRESULT WINAPI hkDrawPrimitiveUP(IDirect3DDevice9* This, D3DPRIMITIVETYPE Primit
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
+    if (IsHudDrawForStereo(This)) {
+#if RE5VR_DIAGNOSTICS
+        HudProbe_OnDraw(This, 2, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
+#endif
+        return DrawHudPerEye(This, [&] {
+            return oDrawPrimitiveUP(This, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+        });
+    }
+
     StereoDrawContext ctx;
-    if (!BeginStereoDraw(This, ctx)) {
+    const bool stereo = BeginStereoDraw(This, ctx);
+#if RE5VR_DIAGNOSTICS
+    HudProbe_OnDraw(This, 2, PrimitiveType, PrimitiveCount, g_stereoPath);
+#endif
+    if (!stereo) {
         return oDrawPrimitiveUP(This, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
 
@@ -703,8 +884,22 @@ HRESULT WINAPI hkDrawIndexedPrimitiveUP(IDirect3DDevice9* This, D3DPRIMITIVETYPE
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
+    if (IsHudDrawForStereo(This)) {
+#if RE5VR_DIAGNOSTICS
+        HudProbe_OnDraw(This, 3, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
+#endif
+        return DrawHudPerEye(This, [&] {
+            return oDrawIndexedPrimitiveUP(This, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData,
+                IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+        });
+    }
+
     StereoDrawContext ctx;
-    if (!BeginStereoDraw(This, ctx)) {
+    const bool stereo = BeginStereoDraw(This, ctx);
+#if RE5VR_DIAGNOSTICS
+    HudProbe_OnDraw(This, 3, PrimitiveType, PrimitiveCount, g_stereoPath);
+#endif
+    if (!stereo) {
         return oDrawIndexedPrimitiveUP(This, PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount,
             pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }

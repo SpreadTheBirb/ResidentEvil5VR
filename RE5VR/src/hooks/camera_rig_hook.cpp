@@ -4,13 +4,16 @@
 #include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
 #include "../util/log.h"
+#include "../util/build_config.h"
 
 #include <MinHook.h>
 #include <windows.h>
 #include <Xinput.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -724,6 +727,7 @@ constexpr int kOffJointLinks = 0x04;       // byte 1 = parent index, byte 3 = jo
 constexpr int kOffJointBindOffset = 0x10;  // rest-pose offset from the parent, parent space
 constexpr int kOffJointScale = 0x30;
 constexpr int kOffJointWorldPos = 0x80;    // row 3 of the world matrix at +0x50
+constexpr int kOffJointWorldMatrix = 0x50; // row 0 of the world matrix (rows are 0x10 apart)
 
 // Joints are found by ID, never by position in the array: Sheva's array is
 // ordered differently from Chris's (her head is index 23, his index 4, and
@@ -752,6 +756,45 @@ bool IsSharedFaceJoint(unsigned char id)
 constexpr float kPlayerHeadMaxDistance = 50.0f;
 constexpr unsigned long long kHeadTrackExpiryMs = 250;
 
+// ---- Which skeleton is this? (2026-09-12) -------------------------------
+// Proximity alone decides who the player is, and in co-op it gets it wrong:
+// Sheva keeps losing her head (user, recurring). Tightening the distances
+// helps but cannot fix the shape of the rule - it re-decides every frame from
+// a noisy measurement, so it only ever takes one bad moment.
+//
+// The user's framing is the right one: work out WHOSE skeleton this is, and
+// if it is not the player's, never touch its head. Chris and Sheva are
+// trivially distinguishable - their joint arrays are ordered differently (his
+// head is index 4, hers 23) and their faces are different sizes (12.00
+// against 9.54, already measured for the eye offset). So the player's
+// skeleton gets identified once, latched, and every head after that is
+// matched by identity rather than by who happens to be near the camera.
+//
+// This works whichever character is being played: nothing here knows or cares
+// which one is Chris. It latches whoever the camera is genuinely inside.
+struct SkeletonId
+{
+    bool valid = false;
+    int jointCount = 0;
+    int headIndex = 0;
+    int faceSize10 = 0; // mean face-joint offset x10, 0 when too few were found
+};
+
+bool SkeletonMatches(const SkeletonId& a, const SkeletonId& b)
+{
+    if (!a.valid || !b.valid)
+        return false;
+    if (a.jointCount != b.jointCount || a.headIndex != b.headIndex)
+        return false;
+    // Face size is a float average, so allow a little slack; 0 means it could
+    // not be measured on one side, in which case the first two already agree.
+    if (!a.faceSize10 || !b.faceSize10)
+        return true;
+    const int d = a.faceSize10 - b.faceSize10;
+    return (d < 0 ? -d : d) <= 3;
+}
+
+
 struct HeadTrack {
     unsigned char* controller;
     unsigned char* joints; // the followed character's joint array; a change means a different character
@@ -762,11 +805,88 @@ struct HeadTrack {
     bool collapsed;
     bool isPlayer;         // this frame: the character nearest the rendered camera
     bool direct;           // active controller embedded in a main camera (a candidate)
+    SkeletonId skel;       // who this character is, for the player latch
+    bool headShown;        // the game has the camera, so the head is drawn even in first person
+    unsigned long long headNearSinceMs; // since when the camera has been back near the eye (0 = it is not)
+    float prevDistance;    // last measured camera-to-eye distance, for the one-frame jump
+    bool havePrevDistance;
+    float histDistance;    // distance as of histMs, for "is it closing?"
+    unsigned long long histMs;
+    float camWorld[3], eyeWorld[3], headPivotWorld[3]; // trace only - the endpoints behind track->distance
 };
 HeadTrack g_heads[8] = {};
 std::atomic<unsigned long> g_headCollapseFrames{0};
 std::atomic<unsigned long> g_headScaleResets{0};
+// How often the game took the camera away and got the head back, and the
+// furthest the camera got from the eye while the head was still fully
+// collapsed - i.e. what first person really costs, which is the number the
+// bottom of the ramp band has to clear.
+std::atomic<unsigned long> g_headShownEvents{0};
+std::atomic<long> g_headNearMaxDistance{0};
+std::atomic<long> g_headNearMaxJump{0};
 std::atomic<int> g_eyeLogsRemaining{0};
+
+// Sprint is Shift on the keyboard. The user's idea: tag head events with it,
+// so a false pop while sprinting is identifiable in the log instead of being
+// inferred from the timing. Says nothing about a controller sprint.
+bool ShiftHeld()
+{
+    return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+}
+
+// A window opened by pressing F (see CameraRigHook_OnEndScene), during which
+// every frame's camera-to-eye distance is logged. ~2 s covers a punch, a
+// vault or a grab from start to finish.
+constexpr unsigned long long kActionTraceMs = 2000;
+unsigned long long g_actionTraceUntilMs = 0;
+// The head is hidden by one write of 0 to the joint scale, so it should
+// vanish in a single frame - but the user sees it "shrink down like someone
+// drained the air out of his head". Either the game interpolates the value we
+// write, or something writes it back. Every hide therefore opens a short
+// trace of its own: the scale read-back and the world-matrix scale, frame by
+// frame, for as long as the shrink appears to take.
+constexpr unsigned long long kHideTraceMs = 400;
+
+// All of the head tracing is developer instrumentation: the per-frame lines
+// below run for 400 ms after every hide, and EndScene fires ~20 times a
+// frame, so one hide is several hundred lines in re5vr.log. Useful here,
+// unacceptable in a build a tester runs - so it compiles out with the rest of
+// the diagnostics. The head on/off and watchdog lines are NOT gated: they are
+// one line per event and they are what makes a bug report readable.
+void HideTrace_Open(unsigned long long now)
+{
+#if RE5VR_DIAGNOSTICS
+    g_actionTraceUntilMs = now + kHideTraceMs;
+#else
+    (void)now;
+#endif
+}
+
+// ---- The camera hook stops running during scripted actions ---------------
+// Measured 2026-09-12, and it invalidates every threshold above as an
+// explanation for "the head never comes back during a vault". Tracing an edge
+// jump frame by frame left a 1370 ms HOLE: no trace lines at all through the
+// fall, then one at 88.2 the moment Chris stood up. The trace only runs while
+// our controller is the player, so for the whole action our camera hook was
+// not deciding anything for it - the head scale simply stayed at the 0.00 it
+// had from first person, because nothing was there to write 1.0.
+//
+// That is also why the head "appears as he stands": that is the first frame
+// the hook runs again, not the detector catching a cut.
+//
+// The fix has to live somewhere that keeps running when the game's camera
+// code does not. CameraRigHook_OnEndScene is called from the D3D9 EndScene
+// hook every single frame, so it can watch for the camera hook going quiet
+// and give the head back on its own. Writing to a joint we have not seen for
+// a while is the risk, so the pointer is re-validated (class word, joint id,
+// parent id) before any write - the same checks FindHeadJoint uses.
+constexpr unsigned long long kHookQuietMs = 100;  // no camera-hook update for this long -> watchdog takes over
+constexpr float kWatchdogHideDistance = 35.0f;   // camera this close to the head pivot -> hide it again
+unsigned char* g_lastPlayerHead = nullptr;       // head joint of whoever was last the player
+unsigned char* g_lastPlayerJoints = nullptr;     // and the array it came from, for validation
+unsigned long long g_lastPlayerHeadMs = 0;
+bool g_watchdogRestored = false;                 // the watchdog, not UpdateHead, owns the head now
+std::atomic<unsigned long> g_watchdogRestores{0};
 
 bool TryRead(void* dst, const void* src, size_t n)
 {
@@ -820,7 +940,8 @@ unsigned char* JointArray(unsigned char* controller)
 // The head joint (ID 4, child of ID 3), and the eye offset from it - or null
 // if this isn't the skeleton layout found on 2026-09-11 (e.g. a
 // non-character target). The array ends where the joint class changes.
-unsigned char* FindHeadJoint(unsigned char* joints, float* eyeUp, float* eyeAhead)
+// outId, when given, receives this skeleton's identity - see SkeletonId.
+unsigned char* FindHeadJoint(unsigned char* joints, float* eyeUp, float* eyeAhead, SkeletonId* outId = nullptr)
 {
     DWORD rootClass = 0;
     if (!TryRead(&rootClass, joints, sizeof(rootClass)))
@@ -866,6 +987,14 @@ unsigned char* FindHeadJoint(unsigned char* joints, float* eyeUp, float* eyeAhea
             *eyeAhead = kEyeAheadOfPivot * ratio;
         }
     }
+    if (outId) {
+        outId->valid = true;
+        outId->jointCount = count;
+        outId->headIndex = head;
+        outId->faceSize10 = faceJoints >= kMinFaceJoints
+            ? static_cast<int>((total / faceJoints) * 10.0f + 0.5f)
+            : 0;
+    }
     return joints + head * kJointStride;
 }
 
@@ -893,10 +1022,191 @@ void RigToWorld(const unsigned char* controller, DWORD transformOff, const float
 // camera (kPlayerKeepDistance) for kPlayerSwitchDelayMs - what a real change
 // of character looks like, and what Sheva standing close never does.
 const unsigned char* g_playerController = nullptr;
-constexpr float kPlayerEyeMaxDistance = 25.0f;
-constexpr float kPlayerKeepDistance = 75.0f;
+// Both numbers were guesses made before anything was measured, and one of
+// them is why Sheva keeps losing her head in co-op (user, recurring). The
+// steal is gated on the CURRENT player looking "clearly away" from the camera
+// for a second - but sprinting puts the player's own eye 85-111 from the
+// rendered camera for half a second to nearly two (measured 2026-09-12), so
+// a sprint past 75 starts that clock, and if Sheva happens to be near the
+// camera when it expires she takes the pick and her head collapses instead.
+// So "clearly away" now means past 130, above anything sprinting produces,
+// and a challenger has to be within 15 rather than 25 - in first person the
+// real player measures 0-14, so 15 is all a genuine character change needs.
+constexpr float kPlayerEyeMaxDistance = 15.0f;
+constexpr float kPlayerKeepDistance = 130.0f;
 constexpr unsigned long long kPlayerSwitchDelayMs = 1000;
+// The player's identity, once established: every head decision after that is
+// made by matching this, not by measuring distances. Latched only from a
+// camera that is genuinely INSIDE a character's head (kPlayerLatchDistance,
+// far tighter than the pick's own threshold), because a latch on the wrong
+// character would be sticky in exactly the way this is designed to be.
+// Cleared if nothing matches it for a while - a chapter change, or the game
+// handing the player a different character.
+SkeletonId g_playerSkeleton;
+constexpr float kPlayerLatchDistance = 12.0f;
+constexpr unsigned long long kPlayerSkeletonGoneMs = 5000;
+unsigned long long g_playerSkeletonSeenMs = 0;
+
+// ---- Give the head back when the game takes the camera (2026-09-12) -----
+// Melee attacks, window vaults and cutscenes pull the view out to a scripted
+// camera. First person can't follow those (the animation swings the skull,
+// which is nauseating in a headset), so the view leaves the body - and what
+// it finds there is a headless character, because the head joint is still
+// collapsed.
+//
+// The trigger is deliberately NOT a list of actions. Enumerating them means
+// missing the ones nobody thought of, and every miss ships a decapitated
+// Chris. The rendered camera's own position answers it directly: it is
+// decoded from the vertex constants every frame (LastCameraPosition), so it
+// is where the game actually drew from, whatever code put it there. In first
+// person the eye IS the camera - the measured distance is ~0 - so anything
+// beyond arm's reach means the camera is no longer ours.
+//
+// Measured over two sessions on 2026-09-12, and the numbers are decisive:
+//
+//   normal first person   <= 14 from the eye
+//   sprinting             one- and two-frame spikes to 15.6-19.1 (10-30 ms)
+//   a real action camera  88, 124, 134, 155, 156, 194, 238
+//
+// The spikes are an artefact, not the camera moving: the measurement is LAST
+// frame's rendered camera against THIS frame's eye, so running fast opens a
+// gap that was never there. They are also brief, where an action camera
+// stays out for hundreds of milliseconds. Either way there is a clean empty
+// gap between 19 and 88 to put the threshold in.
+//
+// It pops, it does not fade in. A ramp was tried first, on the theory that a
+// smooth pan would hide a smooth grow - but the head is hidden by scaling the
+// joint, so a partial value is a SHRUNKEN head, and watching Chris's head
+// swell as he throws a punch is worse than any pop ("comical, but not ideal",
+// user). A correctly-sized head appearing while the camera is already moving
+// is close to invisible; a wrong-sized one is not.
+//
+// Asymmetric, because the action camera does not go far and stay there - it
+// pans out past 88, then settles about a third of a metre off the eye (33-40
+// measured) and looks at Chris for the rest of the animation. Hiding again at
+// anything near that distance takes the head away mid-punch, which is the
+// first version's bug. So: show high, and only hide again below 25 once it
+// has stayed there long enough to be real.
+//
+// DISTANCE ALONE CANNOT DO THIS (measured 2026-09-12, fourth run). Sprinting
+// puts the rendered camera 70.5, 104.9 and 111.4 from the eye, and it STAYS
+// there for half a second to nearly two. A door kick puts it at 124.5. Those
+// ranges touch, so every level-based threshold tried here has either popped
+// the head while running or missed the kick - both, at 40.
+//
+// The SHAPE separates them completely. Traced frame by frame, a door kick
+// reads 1.8, 1.2, 124.5: a hundred and twenty units in one frame, which is a
+// camera being cut to somewhere else, not a camera moving. Sprint climbs
+// there gradually, because that is the game's own camera trailing a running
+// character. Nothing that trails can teleport.
+//
+// So the trigger is the JUMP, with a level floor to keep ordinary jitter out.
+// Getting hit by a zombie - traced start to finish - never leaves 0.3-7.8, so
+// it stays first person, which is what it should do.
+constexpr float kHeadShowDistance = 60.0f;             // never on a camera nearer than this...
+constexpr float kHeadShowJump = 50.0f;                 // ...and only when it got there in one frame
+constexpr float kHeadHideDistance = 25.0f;             // and back inside this...
+constexpr unsigned long long kHeadHideDwellMs = 100;   // ...for this long -> hide it again
+
+// That pair hides FAR too late on the way back in. Measured 2026-09-12: every
+// hide in a session landed at an eye distance of 2.7 to 9.4, and the user's
+// screenshot at the moment it should have gone shows the camera already
+// through the back of the skull, looking at hair - "it hid after I make it
+// into the head and see teeth". The camera covers that last stretch in a few
+// frames, so a 100 ms dwell spends the whole of it inside his head.
+//
+// Hiding early is only dangerous for a camera that PARKS near the head, which
+// is what an action camera does (33-40, measured) - hide on distance alone at
+// that range and the head vanishes mid-punch again. A camera on its way back
+// to the eye is different in a way that has nothing to do with where it is:
+// it is closing, fast. So the early hide asks for both - inside 45, and at
+// least 10 units closer than it was 150 ms ago. A parked camera drifts a unit
+// or two in that time and never qualifies; the return leg closes 2-4 units
+// per frame, which is 20-40.
+// 45 -> 60 (user: "could be slightly faster"). The camera closes 2-4 units a
+// frame on the way in, so starting 15 earlier buys about 4-7 frames. Only the
+// closing test makes this safe at 60 - a parked action camera at 33-40 is
+// well inside this distance and must still keep the head.
+constexpr float kHeadHideCloseDistance = 60.0f;        // or inside this...
+constexpr float kHeadHideClosingDrop = 10.0f;          // ...while closing by at least this much...
+constexpr unsigned long long kHeadHideClosingMs = 150; // ...over this long -> hide it now
+
+// The 150 ms test alone is EVALUATED only once per 150 ms, and the return leg
+// covers the whole distance inside one such window: measured 2026-09-12, the
+// hides fired at 2.2-3.9 from the eye having "closed 146-190 in 150 ms", i.e.
+// the camera was already home before the check next ran. That lateness is the
+// hair-clipping. So the per-frame closing rate decides it too: 8 units in a
+// single frame is a camera travelling home (it was doing ~21), while a parked
+// action camera drifts a unit or two. This fires on the first frame inside
+// kHeadHideCloseDistance instead of up to 150 ms later.
+constexpr float kHeadHideClosingRate = 8.0f;           // ...or this much closer in ONE frame
+
+// THE HEAD DOES NOT VANISH WHEN WE COLLAPSE IT - it deflates like a balloon
+// over several frames, anchored at the neck (user screenshots, 2026-09-12).
+// Both read-backs, taken at opposite ends of the frame and across every pass,
+// only ever show 1.0 or 0.0, so the renderer is not skinning from the joint
+// scale at +0x30 or the world matrix at +0x50: the animation system almost
+// certainly blends the scale channel toward our target over its normal blend
+// time and feeds a separate matrix palette. Writing that palette means
+// finding it first.
+//
+// Until then, the deflate is not prevented but moved. It takes roughly the
+// same time wherever it happens, so the trick is to start it while the camera
+// is still far away, where a shrinking head is small, off to one side, and
+// mostly behind you - instead of at half a metre, where it fills the view. A
+// camera rushing home does ~20 units a frame, so requiring 15 in one frame
+// keeps this off everything else: an action camera drifting near the head
+// never qualifies, and neither does sprint (measured 2-4 a frame).
+constexpr float kHeadHideEarlyDistance = 160.0f;       // this far out is fine to hide...
+constexpr float kHeadHideEarlyRate = 15.0f;            // ...but only for a camera racing home
 unsigned long long g_playerFarSinceMs = 0; // 0 = the player's eye is near the camera (or unmeasured)
+
+// ---- Flicker guard: split screen, and anything else like it -------------
+// Split screen renders two viewports per frame with two different cameras,
+// and "the camera" here is whatever matrix was last left in the vertex
+// constants - so the measured distance alternates between the two players'
+// views and the head toggles with it. Tested 2026-09-12: Chris's head
+// flickers, Sheva's is untouched (the identity latch protects her).
+//
+// Detecting split screen specifically would mean finding the game's local
+// player count. This does not bother: a head that changes state several times
+// a second is wrong whatever the cause, so when that happens the head is
+// locked hidden for a few seconds. Hidden is the safe state - it is what the
+// mod did for months before any of this - and the lockout expires on its own,
+// so a one-off burst costs nothing and a permanent condition just keeps
+// renewing it.
+constexpr int kFlickerTransitions = 4;
+constexpr unsigned long long kFlickerWindowMs = 1000;
+constexpr unsigned long long kFlickerLockoutMs = 5000;
+unsigned long long g_headFlickerFirstMs = 0;
+int g_headFlickerCount = 0;
+unsigned long long g_headLockoutUntilMs = 0;
+std::atomic<unsigned long> g_headLockouts{0};
+
+// Called on every show and every hide. Returns nothing - it only decides
+// whether things are changing too fast to be real.
+void NoteHeadTransition(unsigned long long now)
+{
+    if (!g_headFlickerFirstMs || now - g_headFlickerFirstMs > kFlickerWindowMs) {
+        g_headFlickerFirstMs = now;
+        g_headFlickerCount = 1;
+        return;
+    }
+    if (++g_headFlickerCount < kFlickerTransitions)
+        return;
+    g_headLockoutUntilMs = now + kFlickerLockoutMs;
+    g_headFlickerFirstMs = 0;
+    g_headFlickerCount = 0;
+    g_headLockouts.fetch_add(1, std::memory_order_relaxed);
+    Log_Printf("CameraRigHook: head changed state %d times in under %llu ms - something is feeding us two cameras "
+               "(split screen?); holding it hidden for %llu ms",
+        kFlickerTransitions, kFlickerWindowMs, kFlickerLockoutMs);
+}
+
+bool HeadLockedHidden(unsigned long long now)
+{
+    return g_headLockoutUntilMs && now < g_headLockoutUntilMs;
+}
 unsigned long long g_lastHoldLogMs = 0;
 
 // Last frame's rendered camera basis in world space (screen-right and
@@ -956,6 +1266,102 @@ void SetHeadScale(unsigned char* head, float s)
     scale[0] = scale[1] = scale[2] = s;
 }
 
+// ---- Does the game move our camera when Sheva is close? (2026-09-13) ----
+// The user found the jitter's trigger by playing: "When standing near sheva,
+// it jitters. Running away from her and moving my head, smooth ... as soon as
+// she gets close to me, jitter" - with head-follow off as well. The log
+// agrees in its own way: in those windows the rendered camera turned 2-4x
+// further than the head, and the camera hook ran more often per frame.
+//
+// The suspicion is RE5's partner avoidance: in third person the camera is
+// nudged so it does not clip through Sheva, and that correction runs AFTER
+// our rig write (we hook the merge point before the blend). In a headset,
+// being shoved every frame is jitter.
+//
+// Before hunting for that code, prove it and say what it does. Every frame
+// for the player this records how far the RENDERED camera is from the eye we
+// wrote, and how fast the rendered camera turns, split by whether any other
+// character's head is within kStrayNearDistance. Near and far side by side,
+// every 3 s: if only "near" strays, the avoidance is confirmed, and position
+// versus turn says which part of the camera it touches.
+constexpr float kStrayNearDistance = 150.0f; // ~1.5 m in render units
+constexpr unsigned long long kStrayWindowMs = 3000;
+
+struct StrayBucket {
+    unsigned frames = 0;
+    float maxOff = 0.0f;
+    double sumOff = 0.0;
+    double turnDeg = 0.0;
+};
+StrayBucket g_strayNear, g_strayFar;
+unsigned long long g_strayWindowStartMs = 0;
+unsigned long long g_strayLastMs = 0;
+float g_strayPrevCamYaw = 0.0f;
+bool g_strayHavePrev = false;
+float g_strayNearest = 1e9f;
+
+void NoteCameraStray(const HeadTrack& player, unsigned long long now)
+{
+    if (player.distance >= 1e8f)
+        return;
+
+    // Nearest other character's head to our eye.
+    float nearest = 1e9f;
+    for (const HeadTrack& t : g_heads) {
+        if (&t == &player || !t.controller || !t.head || now - t.ms > kHeadTrackExpiryMs)
+            continue;
+        const float d[3] = { t.headPivotWorld[0] - player.eyeWorld[0], t.headPivotWorld[1] - player.eyeWorld[1],
+            t.headPivotWorld[2] - player.eyeWorld[2] };
+        const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (len > 1.0f && len < nearest) // 0 means that track was never measured
+            nearest = len;
+    }
+
+    const float camYaw = std::atan2(g_camForward[0], g_camForward[2]);
+    float turn = 0.0f;
+    if (g_strayHavePrev) {
+        float a = camYaw - g_strayPrevCamYaw;
+        while (a > kPi)
+            a -= 2.0f * kPi;
+        while (a < -kPi)
+            a += 2.0f * kPi;
+        turn = std::fabs(a) * 180.0f / kPi;
+    }
+    g_strayPrevCamYaw = camYaw;
+    g_strayHavePrev = true;
+
+    StrayBucket& b = nearest < kStrayNearDistance ? g_strayNear : g_strayFar;
+    ++b.frames;
+    b.maxOff = (std::max)(b.maxOff, player.distance);
+    b.sumOff += player.distance;
+    b.turnDeg += turn;
+    g_strayNearest = (std::min)(g_strayNearest, nearest);
+
+    if (!g_strayWindowStartMs)
+        g_strayWindowStartMs = now;
+    if (now - g_strayWindowStartMs < kStrayWindowMs)
+        return;
+    const double secs = (now - g_strayWindowStartMs) * 0.001;
+    auto describe = [](const StrayBucket& s, char* out, size_t n) {
+        if (!s.frames) {
+            _snprintf_s(out, n, _TRUNCATE, "no frames");
+            return;
+        }
+        _snprintf_s(out, n, _TRUNCATE, "%u calls, camera off our eye by max %.1f / avg %.1f, turned %.0f deg total",
+            s.frames, s.maxOff, s.sumOff / s.frames, s.turnDeg);
+    };
+    char nearText[160], farText[160];
+    describe(g_strayNear, nearText, sizeof(nearText));
+    describe(g_strayFar, farText, sizeof(farText));
+    Log_Printf("CameraRigHook: camera vs our pose, last %.1f s (nearest other head %.0f) - NEAR (<%.0f): %s | "
+               "FAR: %s",
+        secs, g_strayNearest, kStrayNearDistance, nearText, farText);
+    g_strayNear = StrayBucket{};
+    g_strayFar = StrayBucket{};
+    g_strayNearest = 1e9f;
+    g_strayWindowStartMs = now;
+}
+
 // Collapses/restores this controller's character's head, and when first
 // person is on, moves both eyes onto it. Leaves the eyes untouched (the
 // fixed fallback) if the skeleton isn't there.
@@ -972,12 +1378,18 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
         // any more. The head search walks the whole array, so it only runs
         // when the character changes.
         track->joints = joints;
-        track->head = joints ? FindHeadJoint(joints, &track->eyeUp, &track->eyeAhead) : nullptr;
+        track->skel = SkeletonId{};
+        track->head = joints ? FindHeadJoint(joints, &track->eyeUp, &track->eyeAhead, &track->skel) : nullptr;
         track->collapsed = false;
+        track->headShown = false;
+        track->headNearSinceMs = 0;
+        track->havePrevDistance = false;
+        track->histMs = 0;
         if (track->head)
             Log_Printf("CameraRigHook: controller %p follows a skeleton with its head at joint index %d; eye %.1f above, "
-                       "%.1f ahead of the pivot",
-                controller, static_cast<int>((track->head - joints) / kJointStride), track->eyeUp, track->eyeAhead);
+                       "%.1f ahead of the pivot (skeleton: %d joints, head %d, face %.1f)",
+                controller, static_cast<int>((track->head - joints) / kJointStride), track->eyeUp, track->eyeAhead,
+                track->skel.jointCount, track->skel.headIndex, track->skel.faceSize10 / 10.0f);
     }
     unsigned char* head = track->head;
     track->ms = now;
@@ -993,6 +1405,10 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
             SetHeadScale(head, 1.0f);
             track->collapsed = false;
         }
+        track->headShown = false;
+        track->headNearSinceMs = 0;
+        track->havePrevDistance = false;
+        track->histMs = 0;
         return;
     }
 
@@ -1025,6 +1441,13 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
         RigToWorld(controller, kOffNormalTransform, eyeRigNormal, eyeWorld);
         const float d[3] = { eyeWorld[0] - cam[0], eyeWorld[1] - cam[1], eyeWorld[2] - cam[2] };
         track->distance = Length3(d);
+        // Kept for the trace. A distance says two points are apart; it does
+        // not say whether either of them is where it should be, and this
+        // whole investigation has been reasoning about a scalar without ever
+        // looking at its endpoints.
+        std::memcpy(track->camWorld, cam, sizeof(cam));
+        std::memcpy(track->eyeWorld, eyeWorld, sizeof(eyeWorld));
+        std::memcpy(track->headPivotWorld, headWorld, sizeof(headWorld));
     }
     // Candidates are controllers that are embedded in a main camera and
     // active in it (IsActiveMainCameraController). That alone is NOT unique:
@@ -1039,12 +1462,50 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
         if (t.controller && t.head && now - t.ms <= kHeadTrackExpiryMs && t.direct)
             anyDirect = true;
     }
+    // Identity first. Once the player's skeleton is known, a controller that
+    // is not following it cannot become the player and cannot lose its head,
+    // no matter where the camera happens to be. This is the rule that keeps
+    // Sheva's head on: not a better distance, just never asking the question
+    // about her in the first place. It is symmetric - if the player IS Sheva,
+    // the same rule protects Chris.
+    if (g_playerSkeleton.valid) {
+        bool anyMatch = false;
+        for (const HeadTrack& t : g_heads) {
+            if (t.controller && t.head && now - t.ms <= kHeadTrackExpiryMs && SkeletonMatches(t.skel, g_playerSkeleton))
+                anyMatch = true;
+        }
+        if (anyMatch) {
+            g_playerSkeletonSeenMs = now;
+        } else if (g_playerSkeletonSeenMs && now - g_playerSkeletonSeenMs >= kPlayerSkeletonGoneMs) {
+            Log_Printf("CameraRigHook: the player's skeleton (%d joints, head %d, face %.1f) has been gone for %llu ms "
+                       "- unlatching, will re-identify",
+                g_playerSkeleton.jointCount, g_playerSkeleton.headIndex, g_playerSkeleton.faceSize10 / 10.0f,
+                now - g_playerSkeletonSeenMs);
+            g_playerSkeleton = SkeletonId{};
+            g_playerSkeletonSeenMs = 0;
+        }
+    }
+
     const HeadTrack* best = nullptr;
     for (const HeadTrack& t : g_heads) {
         if (!t.controller || !t.head || now - t.ms > kHeadTrackExpiryMs || (anyDirect && !t.direct))
             continue;
+        if (g_playerSkeleton.valid && !SkeletonMatches(t.skel, g_playerSkeleton))
+            continue;
         if (!best || t.distance < best->distance)
             best = &t;
+    }
+
+    // Latching. Only from a camera essentially inside the head - being the
+    // nearest candidate is not enough, because "nearest" is whoever is left
+    // when the real player is not measurable, and a wrong latch here would
+    // stick.
+    if (!g_playerSkeleton.valid && track->skel.valid && track->distance < kPlayerLatchDistance) {
+        g_playerSkeleton = track->skel;
+        g_playerSkeletonSeenMs = now;
+        Log_Printf("CameraRigHook: the player is the skeleton with %d joints, head at index %d, face %.1f "
+                   "(camera %.1f from its eye) - no other character's head will be touched",
+            track->skel.jointCount, track->skel.headIndex, track->skel.faceSize10 / 10.0f, track->distance);
     }
     // Hold the current player (see g_playerController). Its "far" clock only
     // runs on a real measurement: an unmeasured frame (an odd pose failing
@@ -1076,20 +1537,203 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
             g_playerFarSinceMs = 0;
         }
     }
-    const bool nearest = controller == g_playerController;
+    // Belt and braces: even if the pick still points here, a mismatched
+    // skeleton is not the player. Costs nothing and means one stale pointer
+    // can never take a partner's head off.
+    const bool nearest = controller == g_playerController &&
+        (!g_playerSkeleton.valid || SkeletonMatches(track->skel, g_playerSkeleton));
 
     track->isPlayer = nearest;
+#if RE5VR_DIAGNOSTICS
+    // Near/far camera stray log, every 3 s. It ruled out partner avoidance: the
+    // near-Sheva jitter was the game dropping to ~55 fps against a 45 Hz
+    // headset on the laptop, not the camera being moved. Developer builds only.
+    if (nearest && g_enabled)
+        NoteCameraStray(*track, now);
+#endif
+
+    // Coming back from a scripted action: the watchdog has been deciding the
+    // head while this hook was not running, so adopt whatever it left on
+    // screen rather than rediscovering it. Two things would otherwise go
+    // wrong. The stale previous distance makes a huge phantom jump on the
+    // resume frame, which fires the "the game cut the camera" path for an
+    // action that is already ending; and the state machine would disagree with
+    // what is actually rendered, so the hide timer would never start. Both
+    // read to the player as the head hanging around too long afterwards.
+    if (nearest && g_lastPlayerHeadMs && now - g_lastPlayerHeadMs >= kHookQuietMs) {
+        track->headShown = g_watchdogRestored;
+        track->histDistance = track->distance;
+        track->histMs = now;
+        track->havePrevDistance = false;
+        track->headNearSinceMs = 0;
+    }
+
+    // Head on or off - never in between. Only decide on a real measurement:
+    // an unmeasured frame (1e9 sentinel - an implausible pose, or no camera
+    // matrix cached yet) is no evidence either way, and treating it as "far"
+    // would flash a head through every UI pass. Unmeasured frames hold.
+
+    if (nearest && track->distance < 1e8f) {
+        // One frame's worth of movement. Only meaningful against the previous
+        // MEASURED frame, so unmeasured frames don't manufacture a jump.
+        const float jump = track->havePrevDistance ? track->distance - track->prevDistance : 0.0f;
+        track->prevDistance = track->distance;
+        track->havePrevDistance = true;
+
+        if (!track->headShown) {
+            if (track->distance > kHeadShowDistance && jump > kHeadShowJump && !HeadLockedHidden(now)) {
+                track->headShown = true;
+                track->histDistance = track->distance;
+                track->histMs = now;
+                track->headNearSinceMs = 0;
+                g_headShownEvents.fetch_add(1, std::memory_order_relaxed);
+                NoteHeadTransition(now);
+                Log_Printf("CameraRigHook: the game cut the camera away (%.1f from the eye, +%.1f in one frame)%s"
+                           " - head on",
+                    track->distance, jump, ShiftHeld() ? " WHILE SHIFT IS DOWN (sprint?)" : "");
+            } else {
+                // Two separate things worth knowing when this misfires: how
+                // far the camera got without the head coming on, and the
+                // biggest single-frame jump that did NOT qualify. A level
+                // that climbs to 111 with no jump is a trailing camera; a
+                // jump near the threshold is a cut we nearly missed.
+                const long d = static_cast<long>(track->distance);
+                long seen = g_headNearMaxDistance.load(std::memory_order_relaxed);
+                while (d > seen && !g_headNearMaxDistance.compare_exchange_weak(seen, d, std::memory_order_relaxed)) {
+                }
+                const long j = static_cast<long>(jump);
+                long seenJump = g_headNearMaxJump.load(std::memory_order_relaxed);
+                while (j > seenJump &&
+                       !g_headNearMaxJump.compare_exchange_weak(seenJump, j, std::memory_order_relaxed)) {
+                }
+            }
+        } else {
+            // Closing test first: a camera returning to the eye should give
+            // the head back before it reaches the skull, not after.
+            const bool haveHist = track->histMs && now - track->histMs >= kHeadHideClosingMs;
+            const float closed = haveHist ? track->histDistance - track->distance : 0.0f;
+            if (haveHist) {
+                track->histDistance = track->distance;
+                track->histMs = now;
+            }
+            // -jump is this frame's closing rate: the show branch computes it
+            // as distance - prevDistance, so a camera coming home is negative.
+            const float closingNow = -jump;
+            const bool comingHome = closed >= kHeadHideClosingDrop || closingNow >= kHeadHideClosingRate;
+            // The early path: much further out, but only for a camera that is
+            // unmistakably racing back, so the deflate happens at distance.
+            const bool racingHome = track->distance < kHeadHideEarlyDistance &&
+                closingNow >= kHeadHideEarlyRate;
+            if (racingHome || (track->distance < kHeadHideCloseDistance && comingHome)) {
+                track->headShown = false;
+                track->headNearSinceMs = 0;
+                NoteHeadTransition(now);
+                HideTrace_Open(now);
+                Log_Printf("CameraRigHook: camera coming back to the eye (%.1f, closing %.1f this frame, %.1f in "
+                           "%llu ms)%s - head off",
+                    track->distance, closingNow, closed, kHeadHideClosingMs,
+                    ShiftHeld() ? " WHILE SHIFT IS DOWN (sprint?)" : "");
+            } else if (track->distance < kHeadHideDistance) {
+                // Backstop for a camera that arrives slowly enough not to
+                // count as closing: it just has to stay near the eye.
+                if (!track->headNearSinceMs)
+                    track->headNearSinceMs = now;
+                else if (now - track->headNearSinceMs >= kHeadHideDwellMs) {
+                    track->headShown = false;
+                    track->headNearSinceMs = 0;
+                    NoteHeadTransition(now);
+                    HideTrace_Open(now);
+                    Log_Printf("CameraRigHook: camera back on the eye (%.1f for %llu ms)%s - head off",
+                        track->distance, kHeadHideDwellMs,
+                        ShiftHeld() ? " WHILE SHIFT IS DOWN (sprint?)" : "");
+                }
+            } else {
+                track->headNearSinceMs = 0;
+            }
+        }
+    }
+
     if (nearest) {
+        // The watchdog needs to know who to fall back to, and that this frame
+        // happened at all - its whole job is noticing that these stop.
+        g_lastPlayerHead = head;
+        g_lastPlayerJoints = track->joints;
+        g_lastPlayerHeadMs = now;
+        g_watchdogRestored = false;
         const float* scale = reinterpret_cast<const float*>(head + kOffJointScale);
         if (track->collapsed && scale[0] != 0.0f)
             g_headScaleResets.fetch_add(1, std::memory_order_relaxed);
-        SetHeadScale(head, 0.0f);
-        track->collapsed = true;
-        g_headCollapseFrames.fetch_add(1, std::memory_order_relaxed);
+        SetHeadScale(head, track->headShown ? 1.0f : 0.0f);
+        track->collapsed = !track->headShown;
+        if (!track->headShown)
+            g_headCollapseFrames.fetch_add(1, std::memory_order_relaxed);
     } else if (track->collapsed) {
         SetHeadScale(head, 1.0f);
         track->collapsed = false;
+        track->headShown = true;
     }
+
+    // Trace, AFTER the write, so the scale reported is the one now sitting in
+    // the joint rather than the one intended. The user reports the head is
+    // not visible while the action camera is out even on frames where this
+    // code has un-collapsed it, so what we asked for and what the model does
+    // are not the same thing, and only a read-back can tell them apart.
+    // Positions are here for the same reason: "100 units apart" says nothing
+    // about whether the camera is behind Chris or in another room.
+#if RE5VR_DIAGNOSTICS
+    if (nearest && g_actionTraceUntilMs && now <= g_actionTraceUntilMs) {
+        // The renderer reads the WORLD matrix, not the local scale we write, and
+        // the game rebuilds it from the animation. If a scripted animation stops
+        // rebuilding this joint, our scale sits in memory doing nothing - which
+        // is what "head appears as Chris stands up" looks like. Row 0's length is
+        // the world scale: ~0 collapsed, ~1 restored.
+        float row0[3] = { 0.0f, 0.0f, 0.0f };
+        TryRead(row0, head + kOffJointWorldMatrix, sizeof(row0));
+        const float worldScale = Length3(row0);
+        float scaleNow[3] = { -1.0f, -1.0f, -1.0f };
+        TryRead(scaleNow, head + kOffJointScale, sizeof(scaleNow));
+        // The head joint collapses in one frame - proven by the read-back
+        // above - and the user still sees it "deflate" three times out of
+        // three. So look at what hangs OFF the head: face and hair joints are
+        // its children, and hair in particular is usually driven by its own
+        // dynamics, which would chase the collapsed head over several frames
+        // instead of snapping with it. Count how many children still have a
+        // non-zero world scale, and how big the largest one is.
+        int childrenAlive = 0;
+        float biggestChild = 0.0f;
+        if (track->joints && track->skel.valid) {
+            for (int i = 0; i < track->skel.jointCount && i < kMaxJoints; ++i) {
+                unsigned char* j = track->joints + i * kJointStride;
+                unsigned char links[4] = {};
+                if (!TryRead(links, j + kOffJointLinks, sizeof(links)) || links[1] != track->skel.headIndex)
+                    continue;
+                float childRow[3] = { 0.0f, 0.0f, 0.0f };
+                if (!TryRead(childRow, j + kOffJointWorldMatrix, sizeof(childRow)))
+                    continue;
+                const float s = Length3(childRow);
+                if (s > 0.05f)
+                    ++childrenAlive;
+                if (s > biggestChild)
+                    biggestChild = s;
+            }
+        }
+        if (track->distance < 1e8f) {
+            Log_Printf("CameraRigHook: trace - dist %.1f, head %s (joint scale %.2f, world %.2f, %d child joints alive, "
+                       "biggest %.2f), cam (%.0f %.0f %.0f) "
+                       "eye (%.0f %.0f %.0f) pivot (%.0f %.0f %.0f)",
+                track->distance, track->headShown ? "ON" : "off", scaleNow[0], worldScale, childrenAlive, biggestChild,
+                track->camWorld[0], track->camWorld[1], track->camWorld[2],
+                track->eyeWorld[0], track->eyeWorld[1], track->eyeWorld[2],
+                track->headPivotWorld[0], track->headPivotWorld[1], track->headPivotWorld[2]);
+        } else {
+            Log_Printf("CameraRigHook: trace - no measurement, head %s (joint scale %.2f, world %.2f)",
+                track->headShown ? "ON" : "off", scaleNow[0], worldScale);
+        }
+    } else if (g_actionTraceUntilMs && now > g_actionTraceUntilMs) {
+        g_actionTraceUntilMs = 0;
+        Log_Printf("CameraRigHook: trace ended");
+    }
+#endif // RE5VR_DIAGNOSTICS
 
     if (!plausible)
         return;
@@ -1179,7 +1823,9 @@ void LoadXInput()
 // Left stick of the first connected pad, deadzone removed, as forward/strafe
 // with length 0..1. Polling an empty XInput slot is slow, so while no pad is
 // connected the slots are only rescanned every 2 s.
-bool ReadLeftStick(float* forward, float* strafe)
+// The first connected pad's whole state. Shared by walk-while-aiming and the
+// recenter combo, so both see the same pad and the slot scan happens once.
+bool ReadPadState(XINPUT_STATE* out)
 {
     static bool s_loaded = false;
     if (!s_loaded) {
@@ -1207,6 +1853,15 @@ bool ReadLeftStick(float* forward, float* strafe)
             return false;
         Log_Printf("CameraRigHook: gamepad found in XInput slot %d", s_pad);
     }
+    *out = st;
+    return true;
+}
+
+bool ReadLeftStick(float* forward, float* strafe)
+{
+    XINPUT_STATE st = {};
+    if (!ReadPadState(&st))
+        return false;
 
     const float x = st.Gamepad.sThumbLX, y = st.Gamepad.sThumbLY;
     const float len = std::sqrt(x * x + y * y);
@@ -1477,10 +2132,20 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
     // switches rig sets anyway, so the change rides an existing transition.
     unsigned char aimFlag = 0;
     const bool aiming = TryRead(&aimFlag, controller + kOffControllerAimFlag, sizeof(aimFlag)) && aimFlag == 1;
-    if (vrActive && g_headFollow.load(std::memory_order_relaxed))
+    // Only YOUR camera follows your head (2026-09-13). This hook runs for every
+    // camera controller the game updates, and Sheva's goes through it too -
+    // both showed up in the same session (controllers 09B9D6C0 and 09BE4020).
+    // Head-follow had no player check, so her camera was being steered by the
+    // headset as well, the measurement below counted both (~240 calls/sec
+    // instead of ~165, in exactly the windows the user felt as jitter), and
+    // g_headFollowDriving was overwritten by whichever controller ran last.
+    // Not yet proven to be the jitter; wrong regardless.
+    const bool isPlayer = IsPlayerController(controller);
+    if (vrActive && isPlayer && g_headFollow.load(std::memory_order_relaxed))
         MeasureHeadFollowLag();
-    const bool headFollow = vrActive && !aiming && g_headFollow.load(std::memory_order_relaxed);
-    g_headFollowDriving.store(headFollow, std::memory_order_release);
+    const bool headFollow = vrActive && isPlayer && !aiming && g_headFollow.load(std::memory_order_relaxed);
+    if (isPlayer)
+        g_headFollowDriving.store(headFollow, std::memory_order_release);
     for (int i = 0; i < 3; ++i) {
         unsigned char* normalRig = controller + kOffNormalRigs + i * kRigStride;
         float baseDy = 0.0f, baseDz = 1.0f;
@@ -1520,6 +2185,88 @@ __declspec(naked) void RigsReadyHook_Stub()
     }
 }
 
+
+// Is this still the head joint we think it is? Same three checks
+// FindHeadJoint makes, so a freed or reused allocation fails them rather than
+// being written to. Cheap enough to run every frame the hook is quiet.
+bool HeadJointStillValid(unsigned char* joints, unsigned char* head)
+{
+    if (!joints || !head)
+        return false;
+    DWORD rootClass = 0, headClass = 0;
+    unsigned char links[4] = {};
+    if (!TryRead(&rootClass, joints, sizeof(rootClass)) || !rootClass)
+        return false;
+    if (!TryRead(&headClass, head, sizeof(headClass)) || headClass != rootClass)
+        return false;
+    if (!TryRead(links, head + kOffJointLinks, sizeof(links)))
+        return false;
+    if (links[3] != kHeadJointId)
+        return false;
+    const unsigned char* parent = joints + links[1] * kJointStride;
+    unsigned char parentLinks[4] = {};
+    if (!TryRead(parentLinks, parent + kOffJointLinks, sizeof(parentLinks)))
+        return false;
+    return parentLinks[3] == kChestJointId;
+}
+
+// Called every frame from EndScene, which keeps running when the game's own
+// camera code does not. If the camera hook has gone quiet, the character is
+// in something scripted - a vault, a stomp, a cutscene - and the head must
+// not be left collapsed for the duration of it.
+void HeadWatchdog_Tick()
+{
+    if (!g_enabled || !g_lastPlayerHead || !g_lastPlayerHeadMs)
+        return;
+    const unsigned long long now = GetTickCount64();
+    if (now - g_lastPlayerHeadMs < kHookQuietMs)
+        return; // the camera hook is alive; UpdateHead owns the head
+    if (!HeadJointStillValid(g_lastPlayerJoints, g_lastPlayerHead)) {
+        // Whoever that was is gone. Forget them rather than write into it.
+        g_lastPlayerHead = nullptr;
+        g_lastPlayerJoints = nullptr;
+        g_watchdogRestored = false;
+        return;
+    }
+
+    // While the hook is quiet the watchdog owns the head completely - showing
+    // it is not enough. Measured 2026-09-12: after a vault, the watchdog gave
+    // the head back in 109 ms (good) and it then stayed visible for 3.5
+    // SECONDS, because only UpdateHead can hide it again and the game had not
+    // handed the camera back yet. The action was long over.
+    //
+    // Nothing about hiding needs the camera hook, though. The head joint's own
+    // world position is readable here, and the rendered camera comes from the
+    // vertex constants, so the same question - is the camera back inside the
+    // head? - can be answered every frame regardless. In first person the
+    // camera sits about 19 from the head PIVOT (the eye is 15 ahead and 11
+    // above it), so 35 is inside-the-head with margin to spare.
+    bool wantVisible = true;
+    float pivot[3], cam[3];
+    if (TryRead(pivot, g_lastPlayerHead + kOffJointWorldPos, sizeof(pivot)) && LastCameraPosition(cam)) {
+        const float d[3] = { pivot[0] - cam[0], pivot[1] - cam[1], pivot[2] - cam[2] };
+        wantVisible = Length3(d) > kWatchdogHideDistance;
+    }
+    // The flicker guard outranks this: if two cameras are being read as one,
+    // the watchdog would happily join in the strobing.
+    if (HeadLockedHidden(now))
+        wantVisible = false;
+
+    if (wantVisible == g_watchdogRestored)
+        return; // already in the state we want
+    SetHeadScale(g_lastPlayerHead, wantVisible ? 1.0f : 0.0f);
+    g_watchdogRestored = wantVisible;
+    if (wantVisible) {
+        g_watchdogRestores.fetch_add(1, std::memory_order_relaxed);
+        Log_Printf("CameraRigHook: camera hook quiet for %llu ms and the camera is away from the head "
+                   "- scripted action, head restored by the watchdog",
+            now - g_lastPlayerHeadMs);
+    } else {
+        HideTrace_Open(now);
+        Log_Printf("CameraRigHook: camera back inside the head while the hook is still quiet - head hidden again "
+                   "by the watchdog");
+    }
+}
 } // namespace
 
 void CameraRigHook_Install()
@@ -1571,6 +2318,45 @@ void CameraRigHook_Install()
 
 void CameraRigHook_OnEndScene()
 {
+    // Before anything else: the game's camera code may not have run this
+    // frame, and if it has not run for a while the head is stuck collapsed.
+    HeadWatchdog_Tick();
+
+    // The camera hook reads the head scale back immediately after writing it,
+    // which is the one moment it is guaranteed to look correct. The user sees
+    // the head deflate "like a balloon" over several frames regardless, so
+    // sample the same joint at the OTHER end of the frame - here, after the
+    // game has run its own animation and skeleton work. If these two readings
+    // disagree, the game is easing our value and the write needs to move.
+#if RE5VR_DIAGNOSTICS
+    if (g_actionTraceUntilMs && GetTickCount64() <= g_actionTraceUntilMs && g_lastPlayerHead &&
+        HeadJointStillValid(g_lastPlayerJoints, g_lastPlayerHead)) {
+        float localScale[3] = { -1.0f, -1.0f, -1.0f }, row0[3] = { 0.0f, 0.0f, 0.0f };
+        TryRead(localScale, g_lastPlayerHead + kOffJointScale, sizeof(localScale));
+        TryRead(row0, g_lastPlayerHead + kOffJointWorldMatrix, sizeof(row0));
+        Log_Printf("CameraRigHook: endscene trace - head joint scale %.3f, world %.3f",
+            localScale[0], Length3(row0));
+    }
+#endif // RE5VR_DIAGNOSTICS
+
+    // F is the user's action button, so it is ground truth for "an action
+    // starts now" - but it is also the action itself, which makes it useless
+    // for tracing anything that is NOT an action (sprinting, say: pressing F
+    // there kicks or stomps instead). Scroll Lock does the same job with no
+    // side effect in game, so either key opens the window.
+#if RE5VR_DIAGNOSTICS
+    static bool prevActionDown = false;
+    const bool fDown = (GetAsyncKeyState('F') & 0x8000) != 0;
+    const bool scrollDown = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0;
+    const bool actionDown = fDown || scrollDown;
+    if (actionDown && !prevActionDown && g_enabled) {
+        g_actionTraceUntilMs = GetTickCount64() + kActionTraceMs;
+        Log_Printf("CameraRigHook: %s pressed - tracing the camera for %llu ms",
+            fDown ? "F (action)" : "Scroll Lock (no action)", kActionTraceMs);
+    }
+    prevActionDown = actionDown;
+#endif // RE5VR_DIAGNOSTICS
+
     static bool prevF4Down = false;
     bool f4Down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
     if (f4Down && !prevF4Down) {
@@ -1579,9 +2365,16 @@ void CameraRigHook_OnEndScene()
         // First person puts the camera inside Chris, which is exactly what
         // triggers the game's near-camera fade - so the fade goes with it.
         FadePatch_SetEnabled(g_enabled);
-        Log_Printf("CameraRigHook: head collapse so far - %lu frame(s), game reset the head scale %lu time(s)",
-            g_headCollapseFrames.load(std::memory_order_relaxed), g_headScaleResets.load(std::memory_order_relaxed));
-        g_eyeLogsRemaining.store(g_enabled ? 3 : 0, std::memory_order_relaxed);
+        Log_Printf("CameraRigHook: head collapse so far - %lu frame(s), game reset the head scale %lu time(s); "
+                   "the game cut the camera away %lu time(s). While the head stayed hidden the camera reached %ld "
+                   "from the eye, biggest single-frame move %ld (needs %.0f away AND +%.0f in one frame)",
+            g_headCollapseFrames.load(std::memory_order_relaxed), g_headScaleResets.load(std::memory_order_relaxed),
+            g_headShownEvents.load(std::memory_order_relaxed), g_headNearMaxDistance.load(std::memory_order_relaxed),
+            g_headNearMaxJump.load(std::memory_order_relaxed), kHeadShowDistance, kHeadShowJump);
+        Log_Printf("CameraRigHook: the watchdog gave the head back %lu time(s) (camera hook quiet over %llu ms)",
+            g_watchdogRestores.load(std::memory_order_relaxed), kHookQuietMs);
+        Log_Printf("CameraRigHook: the flicker guard locked the head hidden %lu time(s)",
+            g_headLockouts.load(std::memory_order_relaxed));
         // Stub hit counts since process start. If these stay at 0 across a
         // whole session, the hook sites are never executed and no amount of
         // tuning the written values will ever do anything.
@@ -1627,6 +2420,39 @@ void CameraRigHook_OnEndScene()
             on ? " - VR only; the game aims where its camera points, so you will aim with your head" : "");
     }
     prevF9Down = f9Down;
+
+    // Reset view (testers: "def needs some reset view function"). F5 on the
+    // keyboard, or both sticks clicked in and HELD for a second on a pad - in
+    // a headset you cannot see the keyboard. Stick clicks were picked because
+    // RE5 leans on the d-pad and face buttons (inventory, "hold B + d-pad" to
+    // call Sheva), and the hold keeps a stray double-click from firing it.
+    // Diagnostics builds also bind F5 to the boom finder; release builds don't.
+    const bool vrOn = g_vrActive.load(std::memory_order_relaxed);
+    static bool prevF5Down = false;
+    const bool f5Down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    if (f5Down && !prevF5Down && vrOn)
+        VRBridge_RequestRecenter("F5");
+    prevF5Down = f5Down;
+
+    // EndScene runs many times a frame; the pad only needs looking at ~20x/s.
+    static ULONGLONG s_lastPadPollMs = 0, s_sticksHeldSinceMs = 0;
+    static bool s_sticksFired = false;
+    const ULONGLONG padNowMs = GetTickCount64();
+    if (vrOn && padNowMs - s_lastPadPollMs >= 50) {
+        s_lastPadPollMs = padNowMs;
+        XINPUT_STATE pad = {};
+        constexpr WORD kBothSticks = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+        const bool held = ReadPadState(&pad) && (pad.Gamepad.wButtons & kBothSticks) == kBothSticks;
+        if (!held) {
+            s_sticksHeldSinceMs = 0;
+            s_sticksFired = false;
+        } else if (!s_sticksHeldSinceMs) {
+            s_sticksHeldSinceMs = padNowMs;
+        } else if (!s_sticksFired && padNowMs - s_sticksHeldSinceMs >= 1000) {
+            s_sticksFired = true; // once per hold
+            VRBridge_RequestRecenter("both sticks held");
+        }
+    }
 
     // F6 = the co-op aim-walk sync test (see g_aimWalkCommit).
     static bool prevF6Down = false;

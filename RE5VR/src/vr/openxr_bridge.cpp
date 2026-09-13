@@ -309,6 +309,61 @@ SRWLOCK g_eyeViewsLock = SRWLOCK_INIT;
 bool g_haveEyeReference[2] = { false, false };
 Mat3 g_eyeReference[2] = { Mat3Identity(), Mat3Identity() };
 
+// ---- Recenter and yaw-only references (2026-09-13) ----------------------
+// Testers asked for a "reset view". The reference above was only ever
+// captured when XR mode turned on, so the only way to recenter was F7 off and
+// on - tearing the whole session down. A request now just clears the
+// references and the next usable pose re-captures them.
+//
+// The capture is also YAW ONLY now, for recenter and F7 alike. It used to take
+// the head's full orientation, so if you were looking slightly down or had
+// your head tilted when you pressed F7, that tilt became "level" for the rest
+// of the session - a world subtly pitched or rolled against gravity, the kind
+// of wrongness nobody can name. A recenter should only change which way is
+// forward; up and down stay tied to the tracking space, which is gravity-
+// aligned. So the reference is the head's forward flattened onto the ground,
+// true up, and the right that completes them.
+//
+// Convention (checked against QuaternionToMat3): rows are the head's Right,
+// Up and Forward axes in world space, Forward being OpenXR's -Z, and
+// Forward = Up x Right, so Right = Forward x Up.
+// Note this is NOT Mat3Identity(): with Forward along -Z the rows form a
+// determinant -1 basis, exactly as QuaternionToMat3 produces for a real pose -
+// which is what makes delta = now * transpose(reference) a proper rotation.
+std::atomic<bool> g_recenterRequested{ false };
+
+Mat3 YawOnlyReference(const Mat3& head)
+{
+    float f[3] = { head.m[6], 0.0f, head.m[8] };
+    float len = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+    if (len < 0.15f) {
+        // Looking almost straight up or down: forward has no usable heading,
+        // so take it from the right axis instead (Forward = Up x Right).
+        const float r[3] = { head.m[0], 0.0f, head.m[2] };
+        const float rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+        if (rl < 1e-4f)
+            return QuaternionToMat3(0.0f, 0.0f, 0.0f, 1.0f); // same convention as a captured pose
+        // Up x Right = (0,1,0) x (rx,0,rz) = (rz, 0, -rx)
+        f[0] = r[2] / rl;
+        f[2] = -r[0] / rl;
+    } else {
+        f[0] /= len;
+        f[2] /= len;
+    }
+    Mat3 out = Mat3Identity();
+    // Right = Forward x Up = (fx,0,fz) x (0,1,0) = (-fz, 0, fx)
+    out.m[0] = -f[2];
+    out.m[1] = 0.0f;
+    out.m[2] = f[0];
+    out.m[3] = 0.0f;
+    out.m[4] = 1.0f;
+    out.m[5] = 0.0f;
+    out.m[6] = f[0];
+    out.m[7] = 0.0f;
+    out.m[8] = f[2];
+    return out;
+}
+
 // Sticky "has this XR session ever actually completed a real frame" latch.
 // The first several hundred frames after xrBeginSession reliably fail
 // xrEndFrame with XR_ERROR_POSE_INVALID (normal/expected, tracking not
@@ -1586,6 +1641,11 @@ void XrSubmitOneFrame()
                 // thread is the only writer, so reading them here is safe.)
                 XRBridgeEyeView next[2];
                 std::memcpy(next, g_eyeViews, sizeof(next));
+                if (g_recenterRequested.exchange(false, std::memory_order_acquire)) {
+                    g_haveEyeReference[0] = false;
+                    g_haveEyeReference[1] = false;
+                    Log_Printf("XRBridge: recentering - forward is now wherever the headset faces (yaw only)");
+                }
                 for (int eye = 0; eye < static_cast<int>(viewCount); ++eye) {
                     next[eye].positionMeters[0] = views[eye].pose.position.x;
                     next[eye].positionMeters[1] = views[eye].pose.position.y;
@@ -1622,7 +1682,7 @@ void XrSubmitOneFrame()
                         // reference.
                         const Mat3 nowMat = QuaternionToMat3(q.x, q.y, q.z, q.w);
                         if (!g_haveEyeReference[eye]) {
-                            g_eyeReference[eye] = nowMat;
+                            g_eyeReference[eye] = YawOnlyReference(nowMat);
                             g_haveEyeReference[eye] = true;
                             // NOTE: XrViewStateFlags is a 64-bit XrFlags64 -
                             // must NOT be passed to a 32-bit %X on this
@@ -2392,4 +2452,10 @@ bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
     }
     ReleaseSRWLockShared(&g_eyeViewsLock);
     return have;
+}
+
+void VRBridge_RequestRecenter(const char* source)
+{
+    g_recenterRequested.store(true, std::memory_order_release);
+    Log_Printf("XRBridge: recenter requested (%s)", source ? source : "?");
 }

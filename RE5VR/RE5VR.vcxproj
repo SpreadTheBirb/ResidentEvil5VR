@@ -106,9 +106,11 @@
     <ClCompile Include="src\hooks\state_probe.cpp" />
     <ClCompile Include="src\hooks\laser_patch.cpp" />
     <ClCompile Include="src\hooks\filter_patch.cpp" />
+    <ClCompile Include="src\hooks\hud_probe.cpp" />
     <ClCompile Include="src\hooks\culling_patch.cpp" />
     <ClCompile Include="src\hooks\query_probe.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
+    <ClCompile Include="src\render\hud_shaders.cpp" />
     <ClCompile Include="src\vr\openxr_bridge.cpp" />
     <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
     <ClCompile Include="thirdparty\minhook\src\buffer.c" />
@@ -136,9 +138,11 @@
     <ClInclude Include="src\hooks\state_probe.h" />
     <ClInclude Include="src\hooks\laser_patch.h" />
     <ClInclude Include="src\hooks\filter_patch.h" />
+    <ClInclude Include="src\hooks\hud_probe.h" />
     <ClInclude Include="src\hooks\culling_patch.h" />
     <ClInclude Include="src\hooks\query_probe.h" />
     <ClInclude Include="src\render\stereo_test.h" />
+    <ClInclude Include="src\render\hud_shaders.h" />
     <ClInclude Include="src\vr\openxr_bridge.h" />
     <ClInclude Include="src\vr\d3d12_addon_bridge.h" />
   </ItemGroup>
