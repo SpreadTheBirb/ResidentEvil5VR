@@ -201,7 +201,7 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
 
 ## Playing in VR
 
-1. **Use SteamVR as your OpenXR runtime.** Meta's own runtime closes the game
+1. **Use SteamVR or Virtual Desktop as your OpenXR runtime.** Meta's own runtime closes the game
    the moment VR starts. Same headset, same Link cable, works fine under
    SteamVR: *SteamVR → Settings → OpenXR → Set SteamVR as OpenXR Runtime*.
 2. Start SteamVR and put the headset on.
