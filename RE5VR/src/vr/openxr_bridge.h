@@ -115,3 +115,35 @@ void VRBridge_NoteFramePresented(XRBridgePoseId poseId);
 // Reset view: the next usable head pose becomes "forward" again, yaw only -
 // up and down stay tied to gravity. Safe from any thread. source is for the log.
 void VRBridge_RequestRecenter(const char* source);
+
+// ---- In-game menu (ui/menu.cpp) -----------------------------------------
+// What Page Up/Down, Home/End, Insert and Delete used to change.
+struct VRBridgeSettings {
+    float headRotationGain = 1.0f; // 1.0 = 1:1 with your neck
+    float headPredictMs = 0.0f;    // head-rotation prediction, 0 = off
+    bool directSubmit = true;      // developer
+    bool waitForConsumer = false;  // developer
+};
+VRBridgeSettings VRBridge_GetSettings();
+void VRBridge_ApplySettings(const VRBridgeSettings& s);
+
+// VR on/off (was F7). Handled on the render thread at the next EndScene;
+// ignored on a flat-screen install. Safe from any thread.
+void VRBridge_RequestXrMode(bool on);
+// True when dgVoodoo2 is installed alongside us, i.e. VR can work at all.
+bool VRBridge_IsAvailable();
+
+struct VRBridgeStatus {
+    bool available = false;      // dgVoodoo2 install
+    bool modeEnabled = false;    // VR switched on
+    bool initFailed = false;     // no runtime / no headset last time we tried
+    bool sessionRunning = false;
+    const char* runtimeName = "";
+    const char* systemName = "";
+    unsigned recommendedEyeWidth = 0, recommendedEyeHeight = 0;
+    unsigned eyeWidth = 0, eyeHeight = 0; // what we actually send per eye
+    float predictedDisplayPeriodMs = 0.0f;
+    float submitHz = 0.0f;
+    float imageAgeMs = 0.0f;
+};
+void VRBridge_GetStatus(VRBridgeStatus& out);

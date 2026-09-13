@@ -58,3 +58,31 @@ float StereoTest_GetBackbufferAspect();
 // of the same head, sampled moments apart, make a fast turn overshoot and
 // snap back as they reconverge.
 bool StereoTest_GetLatchedHeadForward(float out[3]);
+
+// ---- In-game menu (ui/menu.cpp) -----------------------------------------
+// Everything the old F8, '/', '\', '[' ']' '-' and ';' '\'' hotkeys changed,
+// plus the HUD's distance and size. Apply clamps and logs what changed.
+struct StereoSettings {
+    bool stereoEnabled = false;        // developer: side-by-side without VR (VR turns it on itself)
+    float halfSeparation = 2.75f;      // world scale: larger = the world looks smaller
+    float fovWiden = 1.0f;
+    bool monoSmallTargets = true;      // the light-leak fix
+    bool compensateHeadFollow = false; // developer
+    float hudDistanceMeters = 2.0f;
+    float hudScale = 0.67f;
+};
+StereoSettings StereoTest_GetSettings();
+void StereoTest_ApplySettings(const StereoSettings& s);
+bool StereoTest_IsEnabled();
+
+// Where a flat panel straight ahead at distanceMeters lands in each eye's half
+// of a side-by-side frame, using the same per-eye convergence as the HUD, plus
+// how many pixels one unit of view tangent covers in that eye (x and y differ:
+// an eye's half is usually narrower in pixels than the angle it covers).
+// Returns false when no headset views are available (centred fallback).
+struct StereoPanelEye {
+    float centreX, centreY;
+    float halfX0, halfWidth;
+    float pxPerTanX, pxPerTanY;
+};
+bool StereoTest_GetPanelPlacement(float distanceMeters, UINT frameWidth, UINT frameHeight, StereoPanelEye eyes[2]);

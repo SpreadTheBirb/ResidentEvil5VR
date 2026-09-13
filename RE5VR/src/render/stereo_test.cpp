@@ -664,9 +664,49 @@ void EndStereoDraw(IDirect3DDevice9* pDevice)
 // - fine for Quest-style parallel displays, may need the rotation on Index.
 //
 // Scissored to the eye's half, because the shifted viewport can overhang it.
-constexpr float kHudDistanceMeters = 2.0f; // how far away the HUD appears
-constexpr float kHudScale = 0.8f;          // HUD width as a fraction of one eye's half
+// Both are menu options now (2026-09-13); these are the defaults.
+float g_hudDistanceMeters = 2.0f; // how far away the HUD appears
+float g_hudScale = 0.67f;         // HUD width as a fraction of one eye's half - the user's pick in the headset, 2026-09-13 (was 0.8)
 constexpr float kFallbackIpdMeters = 0.063f;
+
+float MeasuredIpd(bool haveViews, const XRBridgeEyeView* views)
+{
+    float ipd = kFallbackIpdMeters;
+    if (haveViews) {
+        const float d[3] = { views[1].positionMeters[0] - views[0].positionMeters[0],
+            views[1].positionMeters[1] - views[0].positionMeters[1],
+            views[1].positionMeters[2] - views[0].positionMeters[2] };
+        const float measured = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (measured > 0.04f && measured < 0.09f)
+            ipd = measured;
+    }
+    return ipd;
+}
+
+// Where a point straight ahead at distanceMeters lands in one eye's half of a
+// frame at (x0, y0, w, h) - see the explanation above.
+void EyeCentreForDistance(const XRBridgeEyeView* views, bool haveViews, float ipd, int eye, float distanceMeters,
+    float x0, float y0, float w, float h, float& centreX, float& centreY)
+{
+    const float halfW = w * 0.5f;
+    const float halfX0 = x0 + (eye ? halfW : 0.0f);
+    centreX = halfX0 + halfW * 0.5f;
+    centreY = y0 + h * 0.5f;
+    if (!haveViews)
+        return;
+    const XRBridgeEyeView& v = views[eye];
+    const float tl = std::tan(v.angleLeft), tr = std::tan(v.angleRight);
+    const float tu = std::tan(v.angleUp), td = std::tan(v.angleDown);
+    if (tr - tl <= 1e-3f || tu - td <= 1e-3f)
+        return;
+    // Left eye is ipd/2 to the left, so a point ahead of the head centre is
+    // to its RIGHT (positive tangent), and vice versa.
+    const float t = (eye == 0 ? 0.5f : -0.5f) * ipd / distanceMeters;
+    const float ndcX = (2.0f * t - (tr + tl)) / (tr - tl);
+    const float ndcY = -(tu + td) / (tu - td); // straight ahead vertically
+    centreX = halfX0 + (ndcX + 1.0f) * 0.5f * halfW;
+    centreY = y0 + (1.0f - ndcY) * 0.5f * h;
+}
 
 template <typename DrawFn>
 HRESULT DrawHudPerEye(IDirect3DDevice9* pDevice, DrawFn draw)
@@ -682,39 +722,18 @@ HRESULT DrawHudPerEye(IDirect3DDevice9* pDevice, DrawFn draw)
 
     XRBridgeEyeView views[2];
     const bool haveViews = GetEyeViewsForDraw(views[0], views[1]);
-    float ipd = kFallbackIpdMeters;
-    if (haveViews) {
-        const float d[3] = { views[1].positionMeters[0] - views[0].positionMeters[0],
-            views[1].positionMeters[1] - views[0].positionMeters[1],
-            views[1].positionMeters[2] - views[0].positionMeters[2] };
-        const float measured = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        if (measured > 0.04f && measured < 0.09f)
-            ipd = measured;
-    }
+    const float ipd = MeasuredIpd(haveViews, views);
 
     const float halfW = vp.Width * 0.5f;
-    const float hudW = halfW * kHudScale;
-    const float hudH = vp.Height * kHudScale * 0.5f; // keeps the full frame's aspect
+    const float hudW = halfW * g_hudScale;
+    const float hudH = vp.Height * g_hudScale * 0.5f; // keeps the full frame's aspect
 
     HRESULT hr = D3D_OK;
     for (int eye = 0; eye < 2; ++eye) {
         const float halfX0 = vp.X + (eye ? halfW : 0.0f);
-        float centreX = halfX0 + halfW * 0.5f;
-        float centreY = vp.Y + vp.Height * 0.5f;
-        if (haveViews) {
-            const XRBridgeEyeView& v = views[eye];
-            const float tl = std::tan(v.angleLeft), tr = std::tan(v.angleRight);
-            const float tu = std::tan(v.angleUp), td = std::tan(v.angleDown);
-            if (tr - tl > 1e-3f && tu - td > 1e-3f) {
-                // Left eye is ipd/2 to the left, so a point ahead of the head
-                // centre is to its RIGHT (positive tangent), and vice versa.
-                const float t = (eye == 0 ? 0.5f : -0.5f) * ipd / kHudDistanceMeters;
-                const float ndcX = (2.0f * t - (tr + tl)) / (tr - tl);
-                const float ndcY = -(tu + td) / (tu - td); // straight ahead vertically
-                centreX = halfX0 + (ndcX + 1.0f) * 0.5f * halfW;
-                centreY = vp.Y + (1.0f - ndcY) * 0.5f * vp.Height;
-            }
-        }
+        float centreX = 0.0f, centreY = 0.0f;
+        EyeCentreForDistance(views, haveViews, ipd, eye, g_hudDistanceMeters, static_cast<float>(vp.X),
+            static_cast<float>(vp.Y), static_cast<float>(vp.Width), static_cast<float>(vp.Height), centreX, centreY);
 
         // D3D9 rejects a viewport that leaves the render target, so clamp to
         // the frame; the scissor keeps any overhang out of the other eye.
@@ -746,18 +765,64 @@ HRESULT DrawHudPerEye(IDirect3DDevice9* pDevice, DrawFn draw)
 
 // Whether this draw should take the HUD path. Only while stereo is actually
 // running - flat, the HUD draws exactly as the game intends.
-bool IsHudDrawForStereo(IDirect3DDevice9* pDevice)
+// ---- The laser in the HUD (2026-09-13) ----------------------------------
+// The user saw the laser sight both in the world and copied onto the flat HUD
+// panel. One HUD vertex shader (1D73ACCB) is shared with a laser sprite.
+//
+// Ruled out: depth - every HUD-shader draw is depth-tested (LESSEQUAL, no
+// write), so keeping depth-tested draws off the panel removed the whole HUD.
+//
+// Found by counting each kind of HUD-shader draw with the aim flag on and off:
+// one kind was drawn 3722 times while aiming and 19 while not (the frames
+// around raising and lowering the gun) - 4 primitives, additive blend
+// (SRCALPHA/ONE), a 64x64 DXT5 texture. No other HUD-shader draw uses a 64x64
+// texture. It is a flat glow sprite the game places on screen itself; the
+// beam in the world is drawn separately and is unaffected, so the sprite is
+// simply not drawn in stereo - on the panel it was only ever in the wrong place.
+enum HudDrawClass { kNotHud, kHudPanel, kHudDrop };
+
+bool IsLaserGlowSprite(IDirect3DDevice9* dev, UINT prims)
+{
+    (void)prims; // 4 in the census; not needed to tell it apart
+    DWORD dst = 0;
+    if (FAILED(dev->GetRenderState(D3DRS_DESTBLEND, &dst)) || dst != D3DBLEND_ONE)
+        return false;
+    IDirect3DBaseTexture9* base = nullptr;
+    dev->GetTexture(0, &base);
+    if (!base)
+        return false;
+    bool laser = false;
+    IDirect3DTexture9* tex = nullptr;
+    if (SUCCEEDED(base->QueryInterface(IID_IDirect3DTexture9, reinterpret_cast<void**>(&tex))) && tex) {
+        D3DSURFACE_DESC d = {};
+        laser = SUCCEEDED(tex->GetLevelDesc(0, &d)) && d.Width == 64 && d.Height == 64;
+        tex->Release();
+    }
+    base->Release();
+    return laser;
+}
+
+HudDrawClass ClassifyHudDraw(IDirect3DDevice9* pDevice, UINT prims)
 {
     if (!g_enabled || g_suppressed)
-        return false;
+        return kNotHud;
     // Recognised by bytecode hash from launch (hud_shaders.cpp). The K capture
     // stays available in developer builds, for finding shaders not listed yet.
-    if (HudShaders_IsHudDraw(pDevice))
-        return true;
+    if (HudShaders_IsHudDraw(pDevice)) {
+        if (IsLaserGlowSprite(pDevice, prims)) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                Log_Printf("StereoTest: laser glow sprite (HUD shader, 64x64 additive) kept off the HUD panel");
+            }
+            return kHudDrop;
+        }
+        return kHudPanel;
+    }
 #if RE5VR_DIAGNOSTICS
-    return HudProbe_IsHudDraw(pDevice);
+    return HudProbe_IsHudDraw(pDevice) ? kHudPanel : kNotHud;
 #else
-    return false;
+    return kNotHud;
 #endif
 }
 
@@ -772,7 +837,10 @@ HRESULT WINAPI hkDrawPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE Primitiv
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
-    if (IsHudDrawForStereo(This)) {
+    const HudDrawClass hudClass = ClassifyHudDraw(This, PrimitiveCount);
+    if (hudClass == kHudDrop)
+        return D3D_OK;
+    if (hudClass == kHudPanel) {
 #if RE5VR_DIAGNOSTICS
         HudProbe_OnDraw(This, 0, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
 #endif
@@ -808,7 +876,10 @@ HRESULT WINAPI hkDrawIndexedPrimitive(IDirect3DDevice9* This, D3DPRIMITIVETYPE T
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
-    if (IsHudDrawForStereo(This)) {
+    const HudDrawClass hudClass = ClassifyHudDraw(This, primCount);
+    if (hudClass == kHudDrop)
+        return D3D_OK;
+    if (hudClass == kHudPanel) {
 #if RE5VR_DIAGNOSTICS
         HudProbe_OnDraw(This, 1, Type, primCount, kStereoPathHudViewport);
 #endif
@@ -846,7 +917,10 @@ HRESULT WINAPI hkDrawPrimitiveUP(IDirect3DDevice9* This, D3DPRIMITIVETYPE Primit
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
-    if (IsHudDrawForStereo(This)) {
+    const HudDrawClass hudClass = ClassifyHudDraw(This, PrimitiveCount);
+    if (hudClass == kHudDrop)
+        return D3D_OK;
+    if (hudClass == kHudPanel) {
 #if RE5VR_DIAGNOSTICS
         HudProbe_OnDraw(This, 2, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
 #endif
@@ -884,7 +958,10 @@ HRESULT WINAPI hkDrawIndexedPrimitiveUP(IDirect3DDevice9* This, D3DPRIMITIVETYPE
     if (HeadHideHook_ShouldSkip(This))
         return D3D_OK;
 
-    if (IsHudDrawForStereo(This)) {
+    const HudDrawClass hudClass = ClassifyHudDraw(This, PrimitiveCount);
+    if (hudClass == kHudDrop)
+        return D3D_OK;
+    if (hudClass == kHudPanel) {
 #if RE5VR_DIAGNOSTICS
         HudProbe_OnDraw(This, 3, PrimitiveType, PrimitiveCount, kStereoPathHudViewport);
 #endif
@@ -997,40 +1074,7 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
         g_presentCount = 0;
     }
 
-    static bool prevF8Down = false;
-    bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (f8Down && !prevF8Down) {
-        g_enabled = !g_enabled;
-        Log_Printf("StereoTest: F8 pressed, scissor-split stereo test now %s", g_enabled ? "ON" : "OFF");
-    }
-
-    // '/' = draw post-process buffers mono instead of per eye.
-    static bool prevSlashDown = false;
-    const bool slashDown = (GetAsyncKeyState(VK_OEM_2) & 0x8000) != 0;
-    if (slashDown && !prevSlashDown) {
-        const bool on = !g_monoSmallTargets.load(std::memory_order_relaxed);
-        g_monoSmallTargets.store(on, std::memory_order_relaxed);
-        Log_Printf("StereoTest: '/' pressed, post-process buffers now drawn %s",
-            on ? "MONO (small render targets not split per eye - default, no light leaks)"
-               : "per eye (old behaviour - expect light leaks)");
-    }
-    prevSlashDown = slashDown;
-
-#if RE5VR_DIAGNOSTICS
-    // '\' = apply the head delta to the eyes even while head-follow is
-    // steering the camera (i.e. the old, double-rotating behaviour).
-    static bool prevBackslashDown = false;
-    const bool backslashDown = (GetAsyncKeyState(VK_OEM_5) & 0x8000) != 0;
-    if (backslashDown && !prevBackslashDown) {
-        const bool on = !g_compensateHeadFollow.load(std::memory_order_relaxed);
-        g_compensateHeadFollow.store(on, std::memory_order_relaxed);
-        Log_Printf("StereoTest: '\\' pressed, head-follow double-rotation compensation now %s",
-            on ? "ON (eyes not rotated again while F9 steers the camera)" : "OFF (old behaviour)");
-    }
-    prevBackslashDown = backslashDown;
-#endif // RE5VR_DIAGNOSTICS
-
-    prevF8Down = f8Down;
+    // F8, '/', backslash, '[' ']' '-' and ';' quote are menu options now (ui/menu.cpp).
 
     // Does F4 actually move the game's camera while VR is on? The user
     // reports it doesn't reach the head position, but "where the camera
@@ -1096,11 +1140,9 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
         }
     }
 
-    // Phase 4 prep: dumps the camera's actual computed world-space
-    // position (decoded from c0-c3, not a guess) so it can be searched
-    // for directly in a live memory scanner (Cheat Engine/x64dbg) instead
-    // of a blind "unknown initial value" scan - we already know the exact
-    // float value to search for.
+#if RE5VR_DIAGNOSTICS
+    // Phase 4 prep: dumps the camera's decoded world position (F5, developer
+    // builds - F5 is the boom finder there too).
     static bool prevF5Down = false;
     bool f5Down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
     if (f5Down && !prevF5Down) {
@@ -1116,65 +1158,7 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
         }
     }
     prevF5Down = f5Down;
-
-    // Live eye-separation tuning (Phase 4 follow-up) - '[' and ']' are
-    // used instead of a function key (all of F1-F12 are already claimed
-    // elsewhere in this project) or Numpad +/- (not present on every
-    // keyboard, same concern as the earlier Home/End/Insert swaps this
-    // session). Adjust in small steps while in the headset until depth
-    // perception/comfort feels right, then report the final value back so
-    // g_halfSeparation's starting default can be updated to match.
-    static bool prevBracketDownDown = false;
-    bool bracketDownDown = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0; // '['
-    if (bracketDownDown && !prevBracketDownDown) {
-        g_halfSeparation = (g_halfSeparation > kHalfSeparationStep) ? g_halfSeparation - kHalfSeparationStep : 0.0f;
-        Log_Printf("StereoTest: '[' pressed, eye half-separation now %.2f", g_halfSeparation);
-    }
-    prevBracketDownDown = bracketDownDown;
-
-    static bool prevBracketUpDown = false;
-    bool bracketUpDown = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0; // ']'
-    if (bracketUpDown && !prevBracketUpDown) {
-        g_halfSeparation += kHalfSeparationStep;
-        Log_Printf("StereoTest: ']' pressed, eye half-separation now %.2f", g_halfSeparation);
-    }
-    prevBracketUpDown = bracketUpDown;
-
-    // Reset to the default. Needed because '[' clamps to exactly 0.00,
-    // which re-bases the value onto a clean 0.25 grid - and the default
-    // (3.18, derived from a real half-IPD) is NOT on that grid, so once
-    // the floor has been touched it can never be returned to by tuning.
-    // A tuning session that cannot get back to its own starting point
-    // cannot A/B against it either, which is exactly how a full sweep
-    // still left the default unverified.
-    static bool prevResetDown = false;
-    bool resetDown = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0; // '-'
-    if (resetDown && !prevResetDown) {
-        g_halfSeparation = kDefaultHalfSeparation;
-        Log_Printf("StereoTest: '-' pressed, eye half-separation RESET to default %.2f", g_halfSeparation);
-    }
-    prevResetDown = resetDown;
-
-    // Live FOV widen tuning (see g_fovWidenMultiplier's declaration) -
-    // ';'/'\'' continue the same increase-on-the-right key layout as
-    // '['/']'. Completely separate from eye orientation (now real OpenXR
-    // per-eye toe-in) and position (g_halfSeparation) - widening FOV here
-    // cannot disturb either.
-    static bool prevSemicolonDown = false;
-    bool semicolonDown = (GetAsyncKeyState(VK_OEM_1) & 0x8000) != 0; // ';'
-    if (semicolonDown && !prevSemicolonDown) {
-        g_fovWidenMultiplier = (g_fovWidenMultiplier > kFovWidenStep) ? g_fovWidenMultiplier - kFovWidenStep : kFovWidenStep;
-        Log_Printf("StereoTest: ';' pressed, FOV widen multiplier now %.2f", g_fovWidenMultiplier);
-    }
-    prevSemicolonDown = semicolonDown;
-
-    static bool prevQuoteDown = false;
-    bool quoteDown = (GetAsyncKeyState(VK_OEM_7) & 0x8000) != 0; // '\''
-    if (quoteDown && !prevQuoteDown) {
-        g_fovWidenMultiplier += kFovWidenStep;
-        Log_Printf("StereoTest: '\\'' pressed, FOV widen multiplier now %.2f", g_fovWidenMultiplier);
-    }
-    prevQuoteDown = quoteDown;
+#endif // RE5VR_DIAGNOSTICS
 }
 
 void StereoTest_SetSuppressed(bool suppressed)
@@ -1218,4 +1202,77 @@ void StereoTest_OnPresent()
     g_frameViewsPoseId = g_haveFrameViews ? VRBridge_GetCurrentPoseId() : 0;
     g_lastPresentMs = GetTickCount64();
     ++g_presentCount;
+}
+
+// ---- In-game menu (2026-09-13) -----------------------------------------
+StereoSettings StereoTest_GetSettings()
+{
+    StereoSettings s;
+    s.stereoEnabled = g_enabled;
+    s.halfSeparation = g_halfSeparation;
+    s.fovWiden = g_fovWidenMultiplier;
+    s.monoSmallTargets = g_monoSmallTargets.load(std::memory_order_relaxed);
+    s.compensateHeadFollow = g_compensateHeadFollow.load(std::memory_order_relaxed);
+    s.hudDistanceMeters = g_hudDistanceMeters;
+    s.hudScale = g_hudScale;
+    return s;
+}
+
+void StereoTest_ApplySettings(const StereoSettings& in)
+{
+    StereoSettings s = in;
+    const auto clamp = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    s.halfSeparation = clamp(s.halfSeparation, 0.0f, 20.0f);
+    s.fovWiden = clamp(s.fovWiden, 0.5f, 2.0f);
+    s.hudDistanceMeters = clamp(s.hudDistanceMeters, 0.5f, 10.0f);
+    s.hudScale = clamp(s.hudScale, 0.3f, 1.0f);
+
+    const StereoSettings old = StereoTest_GetSettings();
+    if (s.stereoEnabled != old.stereoEnabled)
+        Log_Printf("StereoTest: stereo rendering now %s", s.stereoEnabled ? "ON" : "OFF");
+    g_enabled = s.stereoEnabled;
+    g_monoSmallTargets.store(s.monoSmallTargets, std::memory_order_relaxed);
+    if (s.monoSmallTargets != old.monoSmallTargets)
+        Log_Printf("StereoTest: post-process buffers now drawn %s",
+            s.monoSmallTargets ? "MONO (default, no light leaks)" : "per eye (expect light leaks)");
+    g_compensateHeadFollow.store(s.compensateHeadFollow, std::memory_order_relaxed);
+    g_halfSeparation = s.halfSeparation;
+    g_fovWidenMultiplier = s.fovWiden;
+    g_hudDistanceMeters = s.hudDistanceMeters;
+    g_hudScale = s.hudScale;
+    if (s.halfSeparation != old.halfSeparation || s.fovWiden != old.fovWiden ||
+        s.hudDistanceMeters != old.hudDistanceMeters || s.hudScale != old.hudScale) {
+        Log_Printf("StereoTest: eye half-separation %.2f, FOV widen %.2f, HUD %.2f m at scale %.2f",
+            g_halfSeparation, g_fovWidenMultiplier, g_hudDistanceMeters, g_hudScale);
+    }
+}
+
+bool StereoTest_IsEnabled()
+{
+    return g_enabled;
+}
+
+bool StereoTest_GetPanelPlacement(float distanceMeters, UINT frameWidth, UINT frameHeight, StereoPanelEye eyes[2])
+{
+    XRBridgeEyeView views[2];
+    const bool haveViews = GetEyeViewsForDraw(views[0], views[1]);
+    const float ipd = MeasuredIpd(haveViews, views);
+    const float w = static_cast<float>(frameWidth), h = static_cast<float>(frameHeight);
+    for (int eye = 0; eye < 2; ++eye) {
+        StereoPanelEye& e = eyes[eye];
+        EyeCentreForDistance(views, haveViews, ipd, eye, distanceMeters, 0.0f, 0.0f, w, h, e.centreX, e.centreY);
+        e.halfX0 = eye ? w * 0.5f : 0.0f;
+        e.halfWidth = w * 0.5f;
+        // Pixels per unit of tangent. Without views, assume ~100 deg square.
+        float spanX = 2.4f, spanY = 2.4f;
+        if (haveViews) {
+            spanX = std::tan(views[eye].angleRight) - std::tan(views[eye].angleLeft);
+            spanY = std::tan(views[eye].angleUp) - std::tan(views[eye].angleDown);
+            if (spanX < 0.1f || spanY < 0.1f)
+                spanX = spanY = 2.4f;
+        }
+        e.pxPerTanX = e.halfWidth / spanX;
+        e.pxPerTanY = h / spanY;
+    }
+    return haveViews;
 }

@@ -173,6 +173,17 @@ double g_frameAgeSumMs = 0.0;
 unsigned long long g_frameAgeCount = 0;
 double g_frameAgeWorstMs = 0.0;
 
+// What the in-game menu's Status page shows (2026-09-13). Strings are written
+// once at init, before anything reads them; numbers are atomics.
+char g_statusRuntimeName[128] = "";
+char g_statusSystemName[128] = "";
+std::atomic<float> g_statusPredictedPeriodMs{ 0.0f };
+std::atomic<float> g_statusImageAgeMs{ 0.0f };
+std::atomic<float> g_statusSubmitHz{ 0.0f };
+// Menu requests for VR on/off, consumed on the render thread in OnEndScene.
+// 0 = none, 1 = on, 2 = off.
+std::atomic<int> g_xrModeRequest{ 0 };
+
 // Multiplies the head's rotation before it reaches anything: 1.0 is honest
 // 1:1, higher means a smaller neck turn covers more world. Page Up / Page
 // Down tune it live.
@@ -1054,6 +1065,7 @@ bool InitOpenXRInstanceAndSystem()
     if (XR_SUCCEEDED(xrGetInstanceProperties(g_xrInstance, &instanceProps))) {
         Log_Printf("XRBridge: xrCreateInstance OK - runtime \"%s\" version 0x%llX",
             instanceProps.runtimeName, static_cast<unsigned long long>(instanceProps.runtimeVersion));
+        strncpy_s(g_statusRuntimeName, instanceProps.runtimeName, _TRUNCATE);
 
         // 2026-09-12: a tester on Meta Link (Quest 3, "Oculus" runtime) lost
         // the whole process inside xrCreateSession - no exception for the
@@ -1082,6 +1094,7 @@ bool InitOpenXRInstanceAndSystem()
     XrSystemProperties systemProps{ XR_TYPE_SYSTEM_PROPERTIES };
     if (XR_SUCCEEDED(xrGetSystemProperties(g_xrInstance, g_xrSystemId, &systemProps))) {
         Log_Printf("XRBridge: xrGetSystem OK - system \"%s\" (vendorId=%u)", systemProps.systemName, systemProps.vendorId);
+        strncpy_s(g_statusSystemName, systemProps.systemName, _TRUNCATE);
     }
 
     uint32_t viewCount = 0;
@@ -1560,6 +1573,22 @@ void XrSubmitOneFrame()
     {
         ScopedTimer t("xrWaitFrame", logThisIteration);
         r = xrWaitFrame(g_xrSession, &waitInfo, &frameState);
+        if (XR_SUCCEEDED(r)) {
+            g_statusPredictedPeriodMs.store(static_cast<float>(frameState.predictedDisplayPeriod) / 1000000.0f,
+                std::memory_order_relaxed);
+            static ULONGLONG s_rateStartMs = 0;
+            static unsigned s_rateFrames = 0;
+            const ULONGLONG rateNowMs = GetTickCount64();
+            if (!s_rateStartMs)
+                s_rateStartMs = rateNowMs;
+            ++s_rateFrames;
+            if (rateNowMs - s_rateStartMs >= 1000) {
+                g_statusSubmitHz.store(s_rateFrames * 1000.0f / static_cast<float>(rateNowMs - s_rateStartMs),
+                    std::memory_order_relaxed);
+                s_rateStartMs = rateNowMs;
+                s_rateFrames = 0;
+            }
+        }
     }
     if (XR_FAILED(r)) {
         Log_Printf("XRBridge: xrWaitFrame failed -> %s", XrResultName(r));
@@ -2083,6 +2112,8 @@ void XrSubmitOneFrame()
             // a pose the image was never rendered with.
             const unsigned long long ageCount = g_frameAgeCount;
             const double ageSum = g_frameAgeSumMs;
+            if (ageCount)
+                g_statusImageAgeMs.store(static_cast<float>(ageSum / static_cast<double>(ageCount)), std::memory_order_relaxed);
             const double ageWorst = g_frameAgeWorstMs;
             g_frameAgeCount = 0;
             g_frameAgeSumMs = 0.0;
@@ -2211,77 +2242,12 @@ void VRBridge_Install()
 
 void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
 {
-    // Page Up / Page Down: head-rotation gain (see g_headRotationGain).
-    {
-        static bool prevUp = false, prevDown = false;
-        const bool up = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
-        const bool down = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
-        if ((up && !prevUp) || (down && !prevDown)) {
-            float g = g_headRotationGain.load(std::memory_order_relaxed) + (up && !prevUp ? kHeadGainStep : -kHeadGainStep);
-            if (g < kHeadGainMin)
-                g = kHeadGainMin;
-            if (g > kHeadGainMax)
-                g = kHeadGainMax;
-            g_headRotationGain.store(g, std::memory_order_relaxed);
-            Log_Printf("XRBridge: head rotation gain now %.1fx (1.0 = 1:1 with your neck)", g);
-        }
-        prevUp = up;
-        prevDown = down;
-    }
-
-    // Home / End: head-rotation prediction in ms (see g_headPredictMs).
-    {
-        static bool prevHome = false, prevEnd = false;
-        const bool home = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
-        const bool end = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
-        if ((home && !prevHome) || (end && !prevEnd)) {
-            float ms = g_headPredictMs.load(std::memory_order_relaxed) +
-                (home && !prevHome ? kHeadPredictStep : -kHeadPredictStep);
-            if (ms < 0.0f)
-                ms = 0.0f;
-            if (ms > kHeadPredictMax)
-                ms = kHeadPredictMax;
-            g_headPredictMs.store(ms, std::memory_order_relaxed);
-            Log_Printf("XRBridge: head rotation prediction now %.0f ms (0 = off; only acts while you are turning)", ms);
-        }
-        prevHome = home;
-        prevEnd = end;
-    }
-
-#if RE5VR_DIAGNOSTICS
-    // Insert: producer waits for the consumer, or always keeps the newest
-    // frame (see g_waitForConsumer). Watch the "image age at submit" line.
-    {
-        static bool prevInsert = false;
-        const bool insert = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-        if (insert && !prevInsert) {
-            const bool on = !g_waitForConsumer.load(std::memory_order_relaxed);
-            g_waitForConsumer.store(on, std::memory_order_relaxed);
-            Log_Printf("XRBridge: Insert pressed, producer %s",
-                on ? "WAITS for the submit thread (fewer copies)" : "always refreshes (freshest image)");
-        }
-        prevInsert = insert;
-    }
-
-    // Delete: direct submit on/off (see g_directAddonSubmit). Watch the
-    // "image age at submit" line either side of it.
-    {
-        static bool prevDel = false;
-        const bool del = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
-        if (del && !prevDel) {
-            const bool on = !g_directAddonSubmit.load(std::memory_order_relaxed);
-            g_directAddonSubmit.store(on, std::memory_order_relaxed);
-            Log_Printf("XRBridge: Delete pressed, direct submit %s",
-                on ? "ON (addon frame copied straight into the swapchain)"
-                   : "OFF (staged through the eye textures, the old path)");
-        }
-        prevDel = del;
-    }
-#endif // RE5VR_DIAGNOSTICS
-
-    static bool prevF7Down = false;
-    bool f7Down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    if (f7Down && !prevF7Down && !RealD3D9_UsingDgVoodoo()) {
+    // Page Up/Down, Home/End, Insert, Delete and F7 are menu options now
+    // (ui/menu.cpp). VR on/off arrives here as a request, so OpenXR is still
+    // only ever touched from this thread.
+    const int modeRequest = g_xrModeRequest.exchange(0, std::memory_order_acquire);
+    const bool toggleRequested = modeRequest != 0 && (modeRequest == 1) != g_xrModeEnabled;
+    if (toggleRequested && !RealD3D9_UsingDgVoodoo()) {
         // Flat-screen install (or Linux/Proton): no dgVoodoo2, so there are no
         // D3D12 frames to send a headset and VR cannot work. Refuse the key
         // outright instead of starting stereo and stranding the player in a
@@ -2289,15 +2255,14 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         static bool logged = false;
         if (!logged) {
             logged = true;
-            Log_Printf("XRBridge: F7 ignored - this is the flat-screen install (no dgVoodoo2 alongside us), so "
-                       "there is nothing to send to a headset. First person (F4) works exactly as normal.");
+            Log_Printf("XRBridge: VR request ignored - this is the flat-screen install (no dgVoodoo2 alongside us), "
+                       "so there is nothing to send to a headset. First person works exactly as normal.");
         }
-        prevF7Down = f7Down;
         return;
     }
-    if (f7Down && !prevF7Down) {
+    if (toggleRequested) {
         g_xrModeEnabled = !g_xrModeEnabled;
-        Log_Printf("XRBridge: F7 pressed, XR mode now %s", g_xrModeEnabled ? "ON" : "OFF");
+        Log_Printf("XRBridge: XR mode now %s (menu)", g_xrModeEnabled ? "ON" : "OFF");
 
         if (g_xrModeEnabled) {
             g_haveEyeViews = false;
@@ -2328,7 +2293,6 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
             StereoTest_SetEnabled(false);
         }
     }
-    prevF7Down = f7Down;
 
     if (!g_xrModeEnabled || !g_xrInitialized)
         return;
@@ -2458,4 +2422,61 @@ void VRBridge_RequestRecenter(const char* source)
 {
     g_recenterRequested.store(true, std::memory_order_release);
     Log_Printf("XRBridge: recenter requested (%s)", source ? source : "?");
+}
+
+// ---- In-game menu (2026-09-13) -----------------------------------------
+VRBridgeSettings VRBridge_GetSettings()
+{
+    VRBridgeSettings s;
+    s.headRotationGain = g_headRotationGain.load(std::memory_order_relaxed);
+    s.headPredictMs = g_headPredictMs.load(std::memory_order_relaxed);
+    s.directSubmit = g_directAddonSubmit.load(std::memory_order_relaxed);
+    s.waitForConsumer = g_waitForConsumer.load(std::memory_order_relaxed);
+    return s;
+}
+
+void VRBridge_ApplySettings(const VRBridgeSettings& in)
+{
+    VRBridgeSettings s = in;
+    s.headRotationGain = (std::min)((std::max)(s.headRotationGain, kHeadGainMin), kHeadGainMax);
+    s.headPredictMs = (std::min)((std::max)(s.headPredictMs, 0.0f), kHeadPredictMax);
+    const VRBridgeSettings old = VRBridge_GetSettings();
+    g_headRotationGain.store(s.headRotationGain, std::memory_order_relaxed);
+    g_headPredictMs.store(s.headPredictMs, std::memory_order_relaxed);
+    g_directAddonSubmit.store(s.directSubmit, std::memory_order_relaxed);
+    g_waitForConsumer.store(s.waitForConsumer, std::memory_order_relaxed);
+    if (s.headRotationGain != old.headRotationGain || s.headPredictMs != old.headPredictMs)
+        Log_Printf("XRBridge: head rotation gain %.2fx, prediction %.0f ms", s.headRotationGain, s.headPredictMs);
+    if (s.directSubmit != old.directSubmit)
+        Log_Printf("XRBridge: direct submit %s", s.directSubmit ? "ON" : "OFF");
+    if (s.waitForConsumer != old.waitForConsumer)
+        Log_Printf("XRBridge: producer %s", s.waitForConsumer ? "WAITS for the submit thread" : "always refreshes");
+}
+
+void VRBridge_RequestXrMode(bool on)
+{
+    g_xrModeRequest.store(on ? 1 : 2, std::memory_order_release);
+}
+
+bool VRBridge_IsAvailable()
+{
+    return RealD3D9_UsingDgVoodoo();
+}
+
+void VRBridge_GetStatus(VRBridgeStatus& out)
+{
+    out = VRBridgeStatus{};
+    out.available = RealD3D9_UsingDgVoodoo();
+    out.modeEnabled = g_xrModeEnabled;
+    out.initFailed = g_xrInitAttempted && !g_xrInitialized;
+    out.sessionRunning = g_xrSessionRunning;
+    out.runtimeName = g_statusRuntimeName;
+    out.systemName = g_statusSystemName;
+    out.recommendedEyeWidth = g_recommendedEyeWidth;
+    out.recommendedEyeHeight = g_recommendedEyeHeight;
+    out.eyeWidth = g_eyeWidth;
+    out.eyeHeight = g_eyeHeight;
+    out.predictedDisplayPeriodMs = g_statusPredictedPeriodMs.load(std::memory_order_relaxed);
+    out.submitHz = g_xrSessionRunning ? g_statusSubmitHz.load(std::memory_order_relaxed) : 0.0f;
+    out.imageAgeMs = g_statusImageAgeMs.load(std::memory_order_relaxed);
 }

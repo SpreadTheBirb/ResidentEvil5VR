@@ -1105,6 +1105,9 @@ unsigned long long g_playerSkeletonSeenMs = 0;
 // it stays first person, which is what it should do.
 constexpr float kHeadShowDistance = 60.0f;             // never on a camera nearer than this...
 constexpr float kHeadShowJump = 50.0f;                 // ...and only when it got there in one frame
+// Menu option "Show head during action cameras" (default on). Off keeps the
+// head hidden no matter where the game puts the camera - no pop, no deflate.
+std::atomic<bool> g_showHeadDuringActions{ true };
 constexpr float kHeadHideDistance = 25.0f;             // and back inside this...
 constexpr unsigned long long kHeadHideDwellMs = 100;   // ...for this long -> hide it again
 
@@ -1581,7 +1584,8 @@ void UpdateHead(unsigned char* controller, bool vrActive, float eyeNormal[3], fl
         track->havePrevDistance = true;
 
         if (!track->headShown) {
-            if (track->distance > kHeadShowDistance && jump > kHeadShowJump && !HeadLockedHidden(now)) {
+            if (track->distance > kHeadShowDistance && jump > kHeadShowJump && !HeadLockedHidden(now) &&
+                g_showHeadDuringActions.load(std::memory_order_relaxed)) {
                 track->headShown = true;
                 track->histDistance = track->distance;
                 track->histMs = now;
@@ -2249,7 +2253,7 @@ void HeadWatchdog_Tick()
     }
     // The flicker guard outranks this: if two cameras are being read as one,
     // the watchdog would happily join in the strobing.
-    if (HeadLockedHidden(now))
+    if (HeadLockedHidden(now) || !g_showHeadDuringActions.load(std::memory_order_relaxed))
         wantVisible = false;
 
     if (wantVisible == g_watchdogRestored)
@@ -2357,33 +2361,6 @@ void CameraRigHook_OnEndScene()
     prevActionDown = actionDown;
 #endif // RE5VR_DIAGNOSTICS
 
-    static bool prevF4Down = false;
-    bool f4Down = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
-    if (f4Down && !prevF4Down) {
-        g_enabled = !g_enabled;
-        Log_Printf("CameraRigHook: F4 pressed, first-person camera override now %s", g_enabled ? "ON" : "OFF");
-        // First person puts the camera inside Chris, which is exactly what
-        // triggers the game's near-camera fade - so the fade goes with it.
-        FadePatch_SetEnabled(g_enabled);
-        Log_Printf("CameraRigHook: head collapse so far - %lu frame(s), game reset the head scale %lu time(s); "
-                   "the game cut the camera away %lu time(s). While the head stayed hidden the camera reached %ld "
-                   "from the eye, biggest single-frame move %ld (needs %.0f away AND +%.0f in one frame)",
-            g_headCollapseFrames.load(std::memory_order_relaxed), g_headScaleResets.load(std::memory_order_relaxed),
-            g_headShownEvents.load(std::memory_order_relaxed), g_headNearMaxDistance.load(std::memory_order_relaxed),
-            g_headNearMaxJump.load(std::memory_order_relaxed), kHeadShowDistance, kHeadShowJump);
-        Log_Printf("CameraRigHook: the watchdog gave the head back %lu time(s) (camera hook quiet over %llu ms)",
-            g_watchdogRestores.load(std::memory_order_relaxed), kHookQuietMs);
-        Log_Printf("CameraRigHook: the flicker guard locked the head hidden %lu time(s)",
-            g_headLockouts.load(std::memory_order_relaxed));
-        // Stub hit counts since process start. If these stay at 0 across a
-        // whole session, the hook sites are never executed and no amount of
-        // tuning the written values will ever do anything.
-        Log_Printf("CameraRigHook: stub hits so far - NORMAL=%llu AIM=%llu",
-            g_normalHits.load(std::memory_order_relaxed),
-            g_aimHits.load(std::memory_order_relaxed));
-        g_diagSamplesRemaining.store(12, std::memory_order_relaxed);
-    }
-
     // Hand the camera hook (game thread) a plain "VR is on" flag, so it never
     // calls into the VR bridge itself.
     static unsigned long long s_lastVrCheckMs = 0;
@@ -2399,124 +2376,10 @@ void CameraRigHook_OnEndScene()
             PublishHeadForward(left.rotationDelta);
     }
 
-    // F11 = VR camera stabilisation on/off (see g_vrStabiliseEye), so the
-    // idle-animation shake can be compared directly.
-    static bool prevF11Down = false;
-    const bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-    if (f11Down && !prevF11Down) {
-        const bool on = !g_vrStabiliseEye.load(std::memory_order_relaxed);
-        g_vrStabiliseEye.store(on, std::memory_order_relaxed);
-        Log_Printf("CameraRigHook: F11 pressed, VR camera stabilisation now %s", on ? "ON" : "OFF");
-    }
-    prevF11Down = f11Down;
-
-    // F9 = the head-follow experiment (see g_headFollow). VR only.
-    static bool prevF9Down = false;
-    const bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (f9Down && !prevF9Down) {
-        const bool on = !g_headFollow.load(std::memory_order_relaxed);
-        g_headFollow.store(on, std::memory_order_relaxed);
-        Log_Printf("CameraRigHook: F9 pressed, game camera follows the head now %s%s", on ? "ON" : "OFF",
-            on ? " - VR only; the game aims where its camera points, so you will aim with your head" : "");
-    }
-    prevF9Down = f9Down;
-
-    // Reset view (testers: "def needs some reset view function"). F5 on the
-    // keyboard, or both sticks clicked in and HELD for a second on a pad - in
-    // a headset you cannot see the keyboard. Stick clicks were picked because
-    // RE5 leans on the d-pad and face buttons (inventory, "hold B + d-pad" to
-    // call Sheva), and the hold keeps a stray double-click from firing it.
-    // Diagnostics builds also bind F5 to the boom finder; release builds don't.
-    const bool vrOn = g_vrActive.load(std::memory_order_relaxed);
-    static bool prevF5Down = false;
-    const bool f5Down = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
-    if (f5Down && !prevF5Down && vrOn)
-        VRBridge_RequestRecenter("F5");
-    prevF5Down = f5Down;
-
-    // EndScene runs many times a frame; the pad only needs looking at ~20x/s.
-    static ULONGLONG s_lastPadPollMs = 0, s_sticksHeldSinceMs = 0;
-    static bool s_sticksFired = false;
-    const ULONGLONG padNowMs = GetTickCount64();
-    if (vrOn && padNowMs - s_lastPadPollMs >= 50) {
-        s_lastPadPollMs = padNowMs;
-        XINPUT_STATE pad = {};
-        constexpr WORD kBothSticks = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
-        const bool held = ReadPadState(&pad) && (pad.Gamepad.wButtons & kBothSticks) == kBothSticks;
-        if (!held) {
-            s_sticksHeldSinceMs = 0;
-            s_sticksFired = false;
-        } else if (!s_sticksHeldSinceMs) {
-            s_sticksHeldSinceMs = padNowMs;
-        } else if (!s_sticksFired && padNowMs - s_sticksHeldSinceMs >= 1000) {
-            s_sticksFired = true; // once per hold
-            VRBridge_RequestRecenter("both sticks held");
-        }
-    }
-
-    // F6 = the co-op aim-walk sync test (see g_aimWalkCommit).
-    static bool prevF6Down = false;
-    const bool f6Down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-    if (f6Down && !prevF6Down) {
-        const bool on = !g_aimWalkCommit.load(std::memory_order_relaxed);
-        g_aimWalkCommit.store(on, std::memory_order_relaxed);
-        Log_Printf("CameraRigHook: F6 pressed, aim-walk step commit now %s%s", on ? "ON" : "OFF",
-            on ? " - co-op sync test; the gun will fire several rounds per trigger pull" : "");
-    }
-    prevF6Down = f6Down;
-
-    // '`' = wide culling FOV in VR on/off (g_vrWideFov).
-    static bool prevGraveDown = false;
-    const bool graveDown = (GetAsyncKeyState(VK_OEM_3) & 0x8000) != 0;
-    if (graveDown && !prevGraveDown) {
-        const bool wide = !g_vrWideFov.load(std::memory_order_relaxed);
-        g_vrWideFov.store(wide, std::memory_order_relaxed);
-        Log_Printf("CameraRigHook: '`' pressed, VR culling FOV now %s",
-            wide ? "WIDE (derived from the headset frustum)" : "normal (90 deg horizontal)");
-    }
-    prevGraveDown = graveDown;
-
-    // Live eye tuning: ',' / '.' = back / forward, Shift with them = down / up.
-    // Whichever mode is running gets tuned, so a VR session never disturbs the
-    // flat-screen position or the other way round.
-    static bool prevCommaDown = false, prevPeriodDown = false;
-    const bool commaDown = (GetAsyncKeyState(VK_OEM_COMMA) & 0x8000) != 0;
-    const bool periodDown = (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
-    const bool commaPressed = commaDown && !prevCommaDown;
-    const bool periodPressed = periodDown && !prevPeriodDown;
-    if (commaPressed || periodPressed) {
-        const float direction = periodPressed ? 1.0f : -1.0f;
-        const bool fov = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        const bool height = !fov && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (fov) {
-            // 90 reads wide and makes Chris feel short of his 6 feet (user,
-            // 2026-09-11); 75-80 usually feels right. Flat first person only:
-            // VR renders with the headset's own FOV, and the FOV the game
-            // culls with in VR is separate again (kVrCullVerticalFovDeg).
-            g_flatFovDeg += direction * kFlatFovStep;
-            if (g_flatFovDeg < kFlatFovMin)
-                g_flatFovDeg = kFlatFovMin;
-            if (g_flatFovDeg > kFlatFovMax)
-                g_flatFovDeg = kFlatFovMax;
-            Log_Printf("CameraRigHook: flat first-person FOV now %.0f deg horizontal", g_flatFovDeg);
-        } else {
-            const bool vrActive = g_vrActive.load(std::memory_order_relaxed);
-            EyeOffsetScale& eye = vrActive ? g_vrEye : g_flatEye;
-            float& value = height ? eye.up : eye.ahead;
-            value += direction * kEyeScaleStep;
-            const float minValue = height ? 0.0f : kEyeAheadMin;
-            if (value < minValue)
-                value = minValue;
-            const float maxValue = height ? kEyeUpMax : kEyeScaleMax;
-            if (value > maxValue)
-                value = maxValue;
-            Log_Printf("CameraRigHook: %s eye %s now %.1f (1.0 = the skeleton eye, 0 = the head joint) - VR up %.1f fwd %.1f, flat up %.1f fwd %.1f",
-                vrActive ? "VR" : "flat", height ? "height" : "forward", value,
-                g_vrEye.up, g_vrEye.ahead, g_flatEye.up, g_flatEye.ahead);
-        }
-    }
-    prevCommaDown = commaDown;
-    prevPeriodDown = periodDown;
+    // Hotkeys are gone (2026-09-13): F4, F9, F11, F6, '`', ',' '.' and the F5
+    // / both-sticks reset view all live in the in-game menu now (ui/menu.cpp),
+    // which also owns the controller chord - a tap of both sticks opens it, a
+    // one-second hold still resets the view.
 
     // Nothing here dereferences a camera struct any more (2026-09-11). The
     // END-OF-FRAME and WATCH diagnostics that used to read live-list bases at
@@ -2535,7 +2398,6 @@ void CameraRigHook_OnEndScene()
     // write can never reach the blend. The rigs-ready hook is the only
     // write that counts.
     ExpireLiveBases();
-    prevF4Down = f4Down;
 }
 
 bool CameraRigHook_IsEnabled()
@@ -2571,4 +2433,105 @@ int CameraRigHook_GetLiveBases(void** outBases, bool* outAim, int maxCount)
         ++out;
     }
     return out;
+}
+
+// ---- Settings and status for the in-game menu (2026-09-13) -------------
+// Everything the old hotkeys changed. Written from the render thread and read
+// by the camera hook on the game thread - the same race the hotkeys always
+// had, and harmless for single bools and floats on x86.
+
+namespace {
+float Clamp(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+} // namespace
+
+void CameraRigHook_SetFirstPerson(bool on)
+{
+    if (on == g_enabled)
+        return;
+    g_enabled = on;
+    Log_Printf("CameraRigHook: first-person camera override now %s", g_enabled ? "ON" : "OFF");
+    // First person puts the camera inside Chris, which is exactly what
+    // triggers the game's near-camera fade - so the fade goes with it.
+    FadePatch_SetEnabled(g_enabled);
+    Log_Printf("CameraRigHook: head collapse so far - %lu frame(s), game reset the head scale %lu time(s); "
+               "the game cut the camera away %lu time(s). While the head stayed hidden the camera reached %ld "
+               "from the eye, biggest single-frame move %ld (needs %.0f away AND +%.0f in one frame)",
+        g_headCollapseFrames.load(std::memory_order_relaxed), g_headScaleResets.load(std::memory_order_relaxed),
+        g_headShownEvents.load(std::memory_order_relaxed), g_headNearMaxDistance.load(std::memory_order_relaxed),
+        g_headNearMaxJump.load(std::memory_order_relaxed), kHeadShowDistance, kHeadShowJump);
+    Log_Printf("CameraRigHook: the watchdog gave the head back %lu time(s) (camera hook quiet over %llu ms); "
+               "the flicker guard locked the head hidden %lu time(s)",
+        g_watchdogRestores.load(std::memory_order_relaxed), kHookQuietMs,
+        g_headLockouts.load(std::memory_order_relaxed));
+    g_diagSamplesRemaining.store(12, std::memory_order_relaxed);
+}
+
+CameraRigSettings CameraRigHook_GetSettings()
+{
+    CameraRigSettings s;
+    s.firstPerson = g_enabled;
+    s.headFollow = g_headFollow.load(std::memory_order_relaxed);
+    s.vrStabilise = g_vrStabiliseEye.load(std::memory_order_relaxed);
+    s.vrMatchCullFov = g_vrWideFov.load(std::memory_order_relaxed);
+    s.showHeadDuringActions = g_showHeadDuringActions.load(std::memory_order_relaxed);
+    s.aimWalkCommit = g_aimWalkCommit.load(std::memory_order_relaxed);
+    s.flatFovDeg = g_flatFovDeg;
+    s.flatEyeUp = g_flatEye.up;
+    s.flatEyeAhead = g_flatEye.ahead;
+    s.vrEyeUp = g_vrEye.up;
+    s.vrEyeAhead = g_vrEye.ahead;
+    return s;
+}
+
+void CameraRigHook_ApplySettings(const CameraRigSettings& in)
+{
+    CameraRigSettings s = in;
+    s.flatFovDeg = Clamp(s.flatFovDeg, kFlatFovMin, kFlatFovMax);
+    s.flatEyeUp = Clamp(s.flatEyeUp, 0.0f, kEyeUpMax);
+    s.vrEyeUp = Clamp(s.vrEyeUp, 0.0f, kEyeUpMax);
+    s.flatEyeAhead = Clamp(s.flatEyeAhead, kEyeAheadMin, kEyeScaleMax);
+    s.vrEyeAhead = Clamp(s.vrEyeAhead, kEyeAheadMin, kEyeScaleMax);
+
+    const CameraRigSettings old = CameraRigHook_GetSettings();
+    CameraRigHook_SetFirstPerson(s.firstPerson);
+    const auto flag = [](std::atomic<bool>& a, bool v, bool was, const char* name) {
+        a.store(v, std::memory_order_relaxed);
+        if (v != was)
+            Log_Printf("CameraRigHook: %s now %s", name, v ? "ON" : "OFF");
+    };
+    flag(g_headFollow, s.headFollow, old.headFollow, "head tracking turns the game camera");
+    flag(g_vrStabiliseEye, s.vrStabilise, old.vrStabilise, "VR camera stabilisation");
+    flag(g_vrWideFov, s.vrMatchCullFov, old.vrMatchCullFov, "VR culling FOV matched to the headset");
+    flag(g_showHeadDuringActions, s.showHeadDuringActions, old.showHeadDuringActions, "show head during action cameras");
+    flag(g_aimWalkCommit, s.aimWalkCommit, old.aimWalkCommit, "aim-walk step commit (co-op test)");
+
+    g_flatFovDeg = s.flatFovDeg;
+    g_flatEye.up = s.flatEyeUp;
+    g_flatEye.ahead = s.flatEyeAhead;
+    g_vrEye.up = s.vrEyeUp;
+    g_vrEye.ahead = s.vrEyeAhead;
+    if (s.flatFovDeg != old.flatFovDeg || s.flatEyeUp != old.flatEyeUp || s.flatEyeAhead != old.flatEyeAhead ||
+        s.vrEyeUp != old.vrEyeUp || s.vrEyeAhead != old.vrEyeAhead) {
+        Log_Printf("CameraRigHook: flat FOV %.0f, flat eye up %.2f fwd %.2f, VR eye up %.2f fwd %.2f",
+            g_flatFovDeg, g_flatEye.up, g_flatEye.ahead, g_vrEye.up, g_vrEye.ahead);
+    }
+}
+
+void CameraRigHook_GetStatus(CameraRigStatus& out)
+{
+    out = CameraRigStatus{};
+    const SkeletonId skel = g_playerSkeleton;
+    if (skel.valid) {
+        out.playerJointCount = skel.jointCount;
+        out.player = skel.headIndex == 4 ? 1 : (skel.headIndex == 23 ? 2 : 3);
+    }
+    const unsigned long long last = g_lastPlayerHeadMs;
+    out.cameraHookAgeMs = last ? GetTickCount64() - last : ~0ull;
+    out.headFollowDriving = g_headFollowDriving.load(std::memory_order_relaxed);
+    out.headCutaways = g_headShownEvents.load(std::memory_order_relaxed);
+    out.watchdogRestores = g_watchdogRestores.load(std::memory_order_relaxed);
+    out.flickerLockouts = g_headLockouts.load(std::memory_order_relaxed);
 }

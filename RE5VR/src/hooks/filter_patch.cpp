@@ -26,8 +26,8 @@
 // Forcing the jump makes that flag always 0, so the filter never turns on.
 // Unlike the laser patch this one is reversible at runtime: the game re-runs
 // this copy as settings change, so the picture follows the toggle. Applied at
-// startup - the tester who asked for it wanted the grade gone - and F10 puts
-// the original look back for anyone who prefers it.
+// startup - the tester who asked for it wanted the grade gone - and the menu
+// puts the original look back for anyone who prefers it.
 
 namespace {
 
@@ -37,7 +37,7 @@ constexpr int kJumpOffset = 4;                                // the je opcode w
 constexpr BYTE kJmpShort = 0xEB;
 
 bool g_verified = false;
-bool g_filterOff = true; // default: filter removed (user, 2026-09-12); F10 puts the original look back
+bool g_filterOff = true; // default: filter removed (user, 2026-09-12); the menu puts the original look back
 
 BYTE* Site()
 {
@@ -66,22 +66,34 @@ void FilterPatch_Install()
         std::memcmp(at, patched, sizeof(patched)) == 0;
     if (!g_verified) {
         Log_Printf("FilterPatch: exe+%lX holds %02X %02X %02X %02X %02X %02X, not the expected instructions - "
-                   "F10 will do nothing",
+                   "the menu option will do nothing",
             kRva, at[0], at[1], at[2], at[3], at[4], at[5]);
         return;
     }
     WriteJumpOpcode(kJmpShort);
-    Log_Printf("FilterPatch: RE5's colour filter removed (exe+%lX) - F10 puts the original look back", kRva + kJumpOffset);
+    Log_Printf("FilterPatch: RE5's colour filter removed (exe+%lX) - the menu can put the original look back", kRva + kJumpOffset);
 }
 
+// The menu replaced F10 (2026-09-13).
 void FilterPatch_OnEndScene()
 {
-    static bool prevDown = false;
-    const bool down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (down && !prevDown && g_verified) {
-        g_filterOff = !g_filterOff;
-        WriteJumpOpcode(g_filterOff ? kJmpShort : kOriginal[kJumpOffset]);
-        Log_Printf("FilterPatch: F10 pressed, RE5's colour filter now %s", g_filterOff ? "OFF" : "ON");
-    }
-    prevDown = down;
+}
+
+bool FilterPatch_IsAvailable()
+{
+    return g_verified;
+}
+
+bool FilterPatch_IsFilterRemoved()
+{
+    return g_verified && g_filterOff;
+}
+
+void FilterPatch_SetFilterRemoved(bool removed)
+{
+    if (!g_verified || removed == g_filterOff)
+        return;
+    g_filterOff = removed;
+    WriteJumpOpcode(g_filterOff ? kJmpShort : kOriginal[kJumpOffset]);
+    Log_Printf("FilterPatch: RE5's colour filter now %s", g_filterOff ? "OFF" : "ON");
 }

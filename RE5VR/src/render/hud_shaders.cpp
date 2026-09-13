@@ -170,3 +170,12 @@ bool HudShaders_IsHudDraw(IDirect3DDevice9* device)
     ReleaseSRWLockShared(&g_lock);
     return hud;
 }
+
+void HudShaders_GetCounts(int* hudVertexShaders, int* hudPixelShaders, unsigned* shadersSeen)
+{
+    AcquireSRWLockShared(&g_lock);
+    *hudVertexShaders = static_cast<int>(g_hudVs.size());
+    *hudPixelShaders = static_cast<int>(g_hudPs.size());
+    *shadersSeen = g_vsSeen + g_psSeen;
+    ReleaseSRWLockShared(&g_lock);
+}

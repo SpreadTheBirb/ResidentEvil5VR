@@ -16,6 +16,8 @@
 #include "../render/stereo_test.h"
 #include "../render/hud_shaders.h"
 #include "../vr/openxr_bridge.h"
+#include "../ui/input_block.h"
+#include "../ui/menu.h"
 #include "../util/log.h"
 
 #include <MinHook.h>
@@ -280,7 +282,9 @@ HRESULT WINAPI hkReset(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentat
         pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0,
         pPresentationParameters ? pPresentationParameters->Windowed : -1);
     ApplyForcedRes(pPresentationParameters, "Reset");
+    Menu_OnBeforeReset(); // the menu's D3DPOOL_DEFAULT textures and buffers must go first
     const HRESULT hr = oReset(This, pPresentationParameters);
+    Menu_OnAfterReset();
     if (SUCCEEDED(hr))
         LogActualBackbuffer(This, "after Reset");
     else
@@ -300,6 +304,9 @@ Present_t oPresent = nullptr;
 HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const RECT* pDestRect,
     HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
 {
+    // Before the real Present, so the menu is in the frame that reaches the
+    // monitor and the headset.
+    Menu_OnPresent(This);
     const HRESULT hr = oPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     StereoTest_OnPresent();
 #if RE5VR_DIAGNOSTICS
@@ -310,6 +317,9 @@ HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const 
 
 HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
 {
+    // The menu's own scene: none of the per-frame work below belongs to it.
+    if (Menu_IsDrawing())
+        return oEndScene(This);
     ++g_frameCounter;
 
     // Poll the F8 stereo-test toggle first.
@@ -323,7 +333,6 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     FadePatch_OnEndScene();
     CullingPatch_OnEndScene();
     QueryProbe_OnEndScene();
-    FilterPatch_OnEndScene(); // F10: RE5's colour filter
 
     // At this point the game's own rendering for this frame is completely
     // finished (backbuffer holds the final, fully composited/tonemapped
@@ -393,6 +402,15 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
         st = MH_EnableHook(pPresent);
     Log_Printf("Hooks_OnDeviceCreated: Present hook enabled -> %d", static_cast<int>(st));
 
+    // Reset: the menu has to release its D3DPOOL_DEFAULT resources around it
+    // (and the parked forced-resolution override rides along, doing nothing
+    // unless re5vr_res.txt exists).
+    void* pReset = VTableEntry(pDevice, kIDirect3DDevice9_Reset);
+    st = MH_CreateHook(pReset, reinterpret_cast<void*>(&hkReset), reinterpret_cast<void**>(&oReset));
+    if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED)
+        st = MH_EnableHook(pReset);
+    Log_Printf("Hooks_OnDeviceCreated: Reset hook enabled -> %d", static_cast<int>(st));
+
     ConstantProbe_Install(pDevice);
     PixelConstantProbe_Install(pDevice);
     QueryProbe_Install(pDevice);
@@ -408,4 +426,7 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
 #if RE5VR_DIAGNOSTICS
     HudProbe_Install();
 #endif
+    // Last: loading re5vr.ini applies settings through everything above.
+    InputBlock_Install();
+    Menu_Install(pDevice);
 }

@@ -13,7 +13,7 @@
 // fixed by the per-image pose tracking, but not proven, so keep it out of
 // testers' hands.
 //
-// Player-facing tuning keys are NOT gated by this and stay available in every
-// build: F4/F7/F8/F9/F10/F11, '`', '/', ';' and '\'', '[' ']' '-',
-// ',' '.', Home/End and Page Up/Down.
+// Player-facing options have no hotkeys any more (2026-09-13): they live in
+// the in-game menu (ui/menu.cpp, Insert or a click of both sticks). At 1 the
+// menu also gets a Developer tab for the experiment switches above.
 #define RE5VR_DIAGNOSTICS 0

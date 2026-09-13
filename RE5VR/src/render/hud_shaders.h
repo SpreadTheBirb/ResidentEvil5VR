@@ -11,3 +11,6 @@ void HudShaders_Install(IDirect3DDevice9* device);
 
 // True if the vertex and pixel shaders currently bound are the HUD's.
 bool HudShaders_IsHudDraw(IDirect3DDevice9* device);
+
+// For the menu's Status page: live HUD shaders recognised, and all shaders seen.
+void HudShaders_GetCounts(int* hudVertexShaders, int* hudPixelShaders, unsigned* shadersSeen);

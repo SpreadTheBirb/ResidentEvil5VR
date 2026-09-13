@@ -67,3 +67,30 @@ bool CameraRigHook_IsVrActive();
 // head rotation, so stereo_test must not rotate the eye bases by the head
 // delta a second time - see the head-follow compensation there.
 bool CameraRigHook_HeadFollowDrivingCamera();
+
+// ---- In-game menu (ui/menu.cpp) -----------------------------------------
+// Every option the old F4/F9/F11/F6/'`'/','/'.' hotkeys changed. Apply clamps,
+// logs what changed, and (for first person) toggles the fade patch with it.
+struct CameraRigSettings {
+    bool firstPerson = false;
+    bool headFollow = true;            // VR: head turns the game camera while the gun is down
+    bool vrStabilise = true;           // VR: smooth the idle-animation shake out of the eye
+    bool vrMatchCullFov = true;        // VR: cull with the headset's own FOV
+    bool showHeadDuringActions = true; // head pops back in when the game's camera leaves you
+    bool aimWalkCommit = false;        // developer: co-op aim-walk sync test
+    float flatFovDeg = 90.0f;
+    float flatEyeUp = 0.9f, flatEyeAhead = -0.4f;
+    float vrEyeUp = 1.0f, vrEyeAhead = 0.2f;
+};
+CameraRigSettings CameraRigHook_GetSettings();
+void CameraRigHook_ApplySettings(const CameraRigSettings& s);
+void CameraRigHook_SetFirstPerson(bool on);
+
+struct CameraRigStatus {
+    int player = 0;             // 0 not identified yet, 1 Chris, 2 Sheva, 3 someone else
+    int playerJointCount = 0;
+    unsigned long long cameraHookAgeMs = ~0ull; // since the player's camera last ran through our hook
+    bool headFollowDriving = false;
+    unsigned long headCutaways = 0, watchdogRestores = 0, flickerLockouts = 0;
+};
+void CameraRigHook_GetStatus(CameraRigStatus& out);
