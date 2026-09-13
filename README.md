@@ -106,7 +106,7 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 |---|---|
 | **First person camera** | Puts the camera in Chris's head. Works in VR and flat. |
 | **Show head during action cameras** | When the game swings its camera out for a kick, a vault or a grab, Chris's head pops back in so you don't see a headless body. Off keeps it hidden. |
-| **Field of view** | Flat screen, horizontal. 75–80° tends to feel right for Chris; 90° reads wide. |
+| **Field of view** | Flat screen, horizontal. 90° is the default and felt best in testing. |
 | **Eye height / Eye forward** | Flat-screen camera position. 1.0 height is the skeleton's eye. |
 | **Remove RE5's colour filter** | Removes the heavy yellow grade over everything (on by default). Untick for the original look. |
 

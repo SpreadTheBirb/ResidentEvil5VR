@@ -628,7 +628,7 @@ void DrawCameraTab(AllSettings& s, bool& changed)
 
     ImGui::SeparatorText("Flat screen view");
     changed |= ImGui::SliderFloat("Field of view", &s.cam.flatFovDeg, 50.0f, 120.0f, "%.0f deg");
-    HelpMarker("Horizontal. 75-80 tends to feel the right size for Chris; 90 reads wide.");
+    HelpMarker("Horizontal. 90 is the default and felt best in testing.");
     changed |= ImGui::SliderFloat("Eye height##flat", &s.cam.flatEyeUp, 0.0f, 3.0f, "%.2f");
     HelpMarker("1.0 is the skeleton's eye, 0 is the head joint.");
     changed |= ImGui::SliderFloat("Eye forward##flat", &s.cam.flatEyeAhead, -1.0f, 2.0f, "%.2f");
