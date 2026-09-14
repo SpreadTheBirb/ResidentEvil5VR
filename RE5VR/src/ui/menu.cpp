@@ -4,6 +4,7 @@
 #include "../hooks/filter_patch.h"
 #include "../render/stereo_test.h"
 #include "../render/hud_shaders.h"
+#include "../render/render_size.h"
 #include "../vr/openxr_bridge.h"
 #include "../vr/d3d12_addon_bridge.h"
 #include "../util/build_config.h"
@@ -49,6 +50,7 @@ struct AllSettings {
     CameraRigSettings cam;
     StereoSettings stereo;
     VRBridgeSettings vr;
+    RenderSizeSettings res;
     bool filterRemoved = true;
     MenuPrefs menu;
 };
@@ -62,6 +64,7 @@ AllSettings CaptureSettings()
     s.cam = CameraRigHook_GetSettings();
     s.stereo = StereoTest_GetSettings();
     s.vr = VRBridge_GetSettings();
+    s.res = RenderSize_GetSettings();
     s.filterRemoved = FilterPatch_IsFilterRemoved();
     s.menu = g_prefs;
     return s;
@@ -76,6 +79,7 @@ void ApplySettings(const AllSettings& in)
     st.stereoEnabled = StereoTest_IsEnabled();
     StereoTest_ApplySettings(st);
     VRBridge_ApplySettings(in.vr);
+    RenderSize_ApplySettings(in.res);
     if (FilterPatch_IsAvailable())
         FilterPatch_SetFilterRemoved(in.filterRemoved);
     g_prefs = in.menu;
@@ -93,6 +97,7 @@ void ApplySettings(const AllSettings& in)
     X("Graphics", "RemoveColourFilter", filterRemoved)               \
     X("VR", "StartInVR", menu.autoStartVr)                           \
     X("VR", "DesktopRightEye", menu.desktopRightEye)                 \
+    X("VR", "FullResolutionPerEye", res.fullResPerEye)               \
     X("VR", "HeadTurnsCamera", cam.headFollow)                       \
     X("VR", "Stabilise", cam.vrStabilise)                            \
     X("VR", "MatchCullingToHeadset", cam.vrMatchCullFov)             \
@@ -246,6 +251,10 @@ void QueueMessage(UINT msg, WPARAM w, LPARAM l)
 // input_block.cpp); this catches whatever is sent straight to the window.
 LRESULT CALLBACK MenuWndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 {
+    // The game is closing: VR has to be shut down while the process is still
+    // whole, or d3d11.dll crashes on the way out.
+    if (msg == WM_CLOSE || msg == WM_DESTROY)
+        VRBridge_Shutdown(msg == WM_CLOSE ? "game window closing" : "game window destroyed");
     // One pointer, not two: over the game's own menus Windows shows its
     // cursor too, sitting on top of ours. Windows asks for the cursor shape
     // with WM_SETCURSOR on every mouse move, so answering "none" while the
@@ -807,6 +816,49 @@ void DrawVrTab(AllSettings& s, bool& changed)
     ImGui::SameLine();
     ImGui::TextDisabled("or hold both sticks in for a second");
 
+    ImGui::SeparatorText("Resolution");
+    {
+        RenderSizeStatus rs;
+        RenderSize_GetStatus(rs);
+        ImGui::BeginDisabled(!rs.available);
+        changed |= ImGui::Checkbox("Full resolution per eye", &s.res.fullResPerEye);
+        ImGui::EndDisabled();
+        HelpMarker(rs.available
+                ? "Renders each eye at your VR runtime's own resolution - set it in SteamVR or Virtual Desktop, then "
+                  "turn VR off and on here. Off gives each eye half of the game's resolution, like older versions. Your own resolution comes back when VR "
+                  "is off."
+                : "This game executable doesn't match the one this was made for, so each eye gets half of the "
+                  "game's resolution.");
+        const ImVec4 warn(0.95f, 0.65f, 0.3f, 1);
+        if (!s.res.fullResPerEye || !rs.available) {
+            ImGui::TextDisabled("Each eye: half the game's frame");
+        } else if (vr.recommendedEyeWidth) {
+            UINT eyeW = 0, eyeH = 0;
+            const bool capped =
+                RenderSize_EyeSizeFor(vr.recommendedEyeWidth, vr.recommendedEyeHeight, &eyeW, &eyeH);
+            ImGui::TextDisabled("Each eye: %u x %u", eyeW, eyeH);
+            if (capped) {
+                ImGui::SameLine();
+                ImGui::TextColored(warn, "(runtime asks for %u x %u)", vr.recommendedEyeWidth, vr.recommendedEyeHeight);
+                HelpMarker("Your runtime's resolution needs more video memory than dgVoodoo is set to give the "
+                           "game, so it's scaled down to the most that fits. Raise VRAM in dgVoodoo.conf (2048 is "
+                           "plenty), or pick a lower resolution preset in SteamVR or Virtual Desktop.");
+            }
+        } else {
+            ImGui::TextDisabled("Each eye's size comes from your VR runtime when VR starts.");
+        }
+        const bool wantsVrSize = s.res.fullResPerEye && rs.available && !rs.failed;
+        if (vr.eyeWidth && vr.modeEnabled && !rs.pending && wantsVrSize != rs.active) {
+            ImGui::TextColored(warn, "Turn VR off and on to apply");
+        }
+        if (rs.failed)
+            ImGui::TextColored(warn, "RE5 wouldn't switch to the VR size this session - see re5vr.log");
+        if (ResetButton("res")) {
+            s.res = g_defaults.res;
+            changed = true;
+        }
+    }
+
     ImGui::SeparatorText("View");
     changed |= ImGui::Checkbox("Head turns the game camera", &s.cam.headFollow);
     HelpMarker("While the gun is down the game's camera follows your head, so what's over your shoulder gets "
@@ -909,6 +961,17 @@ void DrawStatusTab()
         }
         StatusRow("Backbuffer", "%u x %u", d.Width, d.Height);
         StatusRow("Stereo", StereoTest_IsEnabled() ? "on - each eye gets %u x %u" : "off", d.Width / 2, d.Height);
+        RenderSizeStatus rs;
+        RenderSize_GetStatus(rs);
+        if (!rs.available)
+            StatusRow("Render size", "game's own (full resolution per eye unavailable for this exe)");
+        else if (rs.active)
+            StatusRow("Render size", "%u x %u for VR (game's own %u x %u)", rs.vrWidth, rs.vrHeight, rs.gameWidth,
+                rs.gameHeight);
+        else if (rs.pending)
+            StatusRow("Render size", "switching to %u x %u", rs.vrWidth, rs.vrHeight);
+        else
+            StatusRow("Render size", rs.failed ? "game's own (RE5 refused the VR size)" : "game's own");
         int hudVs = 0, hudPs = 0;
         unsigned seen = 0;
         HudShaders_GetCounts(&hudVs, &hudPs, &seen);

@@ -14,6 +14,7 @@ using PFN_GetFrameInfo = bool(__cdecl*)(unsigned int* outWidth, unsigned int* ou
 using PFN_GetFrontSlot = int(__cdecl*)();
 using PFN_ReadSlot = void(__cdecl*)(int slot);
 using PFN_IsSlotReady = bool(__cdecl*)(int slot);
+using PFN_GetSharedGeneration = unsigned(__cdecl*)();
 
 HMODULE g_addonModule = nullptr;
 PFN_GetFrameInfo g_pGetFrameInfo = nullptr;
@@ -21,6 +22,8 @@ PFN_GetFrontSlot g_pGetFrontSlot = nullptr;
 PFN_ReadSlot g_pBeginReadSlot = nullptr;
 PFN_ReadSlot g_pEndReadSlot = nullptr;
 PFN_IsSlotReady g_pIsSlotReady = nullptr;
+PFN_GetSharedGeneration g_pGetSharedGeneration = nullptr; // optional: older addons lack it
+unsigned g_openedGeneration = 0;
 
 ID3D11Texture2D* g_fullFrameTex[2] = { nullptr, nullptr };
 bool g_active = false;
@@ -45,6 +48,81 @@ void ReleaseTextures()
     }
 }
 
+bool OpenBothSlots(ID3D11Device* d3d11Device, void* handle0, void* handle1)
+{
+    ID3D11Device1* d3d11Device1 = nullptr;
+    HRESULT hr = d3d11Device->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&d3d11Device1));
+    if (FAILED(hr)) {
+        Log_Printf("D3D12AddonBridge: QueryInterface(ID3D11Device1) failed (hr=0x%08lX) - needed to open the D3D12 NT shared handle", hr);
+        return false;
+    }
+    HANDLE handles[2] = { static_cast<HANDLE>(handle0), static_cast<HANDLE>(handle1) };
+    for (int i = 0; i < 2; ++i) {
+        hr = d3d11Device1->OpenSharedResource1(handles[i], __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(&g_fullFrameTex[i]));
+        if (FAILED(hr)) {
+            Log_Printf("D3D12AddonBridge: OpenSharedResource1 (slot=%d, handle=%p) failed (hr=0x%08lX)", i, handles[i], hr);
+            d3d11Device1->Release();
+            ReleaseTextures();
+            return false;
+        }
+    }
+    d3d11Device1->Release();
+    return true;
+}
+
+// ---- The game frame changing size mid-session (2026-09-14) -----------------
+// Full resolution per eye (render/render_size.cpp) switches RE5's frame size
+// when VR starts and stops, and the addon then recreates its shared textures
+// with new handles. The textures opened here would otherwise keep showing the
+// last frame of the old set forever. The addon counts its recreations; when
+// the count moves, reopen.
+bool RefreshSharedTextures(ID3D11DeviceContext* d3d11Context)
+{
+    if (!g_pGetSharedGeneration)
+        return true;
+    const unsigned gen = g_pGetSharedGeneration();
+    if (gen == g_openedGeneration)
+        return true;
+
+    unsigned width = 0, height = 0;
+    int dxgiFormat = 0;
+    void* handle0 = nullptr;
+    void* handle1 = nullptr;
+    // Not ready, or recreated again while we asked: try on a later frame.
+    if (!g_pGetFrameInfo(&width, &height, &dxgiFormat, &handle0, &handle1) || g_pGetSharedGeneration() != gen)
+        return false;
+
+    // Hand back our read of the old set; the copy holds its own references,
+    // so it finishes safely either way.
+    if (g_readPending && g_pEndReadSlot && g_pendingSlot >= 0)
+        g_pEndReadSlot(g_pendingSlot);
+    g_pendingSlot = -1;
+    g_readPending = false;
+    ReleaseTextures();
+
+    ID3D11Device* device = nullptr;
+    d3d11Context->GetDevice(&device);
+    const bool ok = device && OpenBothSlots(device, handle0, handle1);
+    if (device)
+        device->Release();
+    if (!ok) {
+        static ULONGLONG s_lastFailMs = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastFailMs > 2000) {
+            s_lastFailMs = now;
+            Log_Printf("D3D12AddonBridge: reopening the addon's recreated textures (generation %u, %ux%u) failed", gen,
+                width, height);
+        }
+        return false;
+    }
+    g_frameWidth = width;
+    g_frameHeight = height;
+    g_openedGeneration = gen;
+    Log_Printf("D3D12AddonBridge: addon textures recreated - reopened at %ux%u (generation %u)", width, height, gen);
+    return true;
+}
+
 } // namespace
 
 bool D3D12AddonBridge_TryInit(ID3D11Device* d3d11Device, D3D12AddonBridgeInfo* outInfo)
@@ -66,6 +144,8 @@ bool D3D12AddonBridge_TryInit(ID3D11Device* d3d11Device, D3D12AddonBridgeInfo* o
     g_pBeginReadSlot = reinterpret_cast<PFN_ReadSlot>(GetProcAddress(g_addonModule, "RE5VRAddon_BeginReadSlot"));
     g_pEndReadSlot = reinterpret_cast<PFN_ReadSlot>(GetProcAddress(g_addonModule, "RE5VRAddon_EndReadSlot"));
     g_pIsSlotReady = reinterpret_cast<PFN_IsSlotReady>(GetProcAddress(g_addonModule, "RE5VRAddon_IsSlotReady"));
+    g_pGetSharedGeneration =
+        reinterpret_cast<PFN_GetSharedGeneration>(GetProcAddress(g_addonModule, "RE5VRAddon_GetSharedGeneration"));
     if (!g_pGetFrameInfo || !g_pGetFrontSlot || !g_pBeginReadSlot || !g_pEndReadSlot || !g_pIsSlotReady) {
         Log_Printf("D3D12AddonBridge: SampleAddon.dll is loaded but missing expected exports (GetFrameInfo=%p, GetFrontSlot=%p, BeginReadSlot=%p, EndReadSlot=%p, IsSlotReady=%p)",
             g_pGetFrameInfo, g_pGetFrontSlot, g_pBeginReadSlot, g_pEndReadSlot, g_pIsSlotReady);
@@ -81,20 +161,15 @@ bool D3D12AddonBridge_TryInit(ID3D11Device* d3d11Device, D3D12AddonBridgeInfo* o
     void* handle0 = nullptr;
     void* handle1 = nullptr;
     bool ready = false;
+    unsigned generationBefore = 0; // read before the info, so a race only costs a reopen
     for (int attempt = 0; attempt < 30 && !ready; ++attempt) {
+        generationBefore = g_pGetSharedGeneration ? g_pGetSharedGeneration() : 0;
         ready = g_pGetFrameInfo(&width, &height, &dxgiFormat, &handle0, &handle1);
         if (!ready)
             Sleep(100);
     }
     if (!ready) {
         Log_Printf("D3D12AddonBridge: SampleAddon.dll loaded but never reported a ready frame after ~3s - falling back to D3D9 path");
-        return false;
-    }
-
-    ID3D11Device1* d3d11Device1 = nullptr;
-    HRESULT hr = d3d11Device->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&d3d11Device1));
-    if (FAILED(hr)) {
-        Log_Printf("D3D12AddonBridge: QueryInterface(ID3D11Device1) failed (hr=0x%08lX) - needed to open the D3D12 NT shared handle", hr);
         return false;
     }
 
@@ -116,18 +191,11 @@ bool D3D12AddonBridge_TryInit(ID3D11Device* d3d11Device, D3D12AddonBridgeInfo* o
         dxgiDevice->Release();
     }
 
-    HANDLE handles[2] = { static_cast<HANDLE>(handle0), static_cast<HANDLE>(handle1) };
-    for (int i = 0; i < 2; ++i) {
-        hr = d3d11Device1->OpenSharedResource1(handles[i], __uuidof(ID3D11Texture2D),
-            reinterpret_cast<void**>(&g_fullFrameTex[i]));
-        if (FAILED(hr)) {
-            Log_Printf("D3D12AddonBridge: OpenSharedResource1 (slot=%d, handle=%p) failed (hr=0x%08lX)", i, handles[i], hr);
-            d3d11Device1->Release();
-            ReleaseTextures();
-            return false;
-        }
-    }
-    d3d11Device1->Release();
+    if (!OpenBothSlots(d3d11Device, handle0, handle1))
+        return false;
+    // If the addon recreated its textures while these were being opened, the
+    // generation check in CopyToEyeSlots reopens them on the next frame.
+    g_openedGeneration = generationBefore;
 
     g_frameWidth = width;
     g_frameHeight = height;
@@ -150,9 +218,12 @@ bool D3D12AddonBridge_IsActive()
 
 int D3D12AddonBridge_GetFrontSlot()
 {
-    if (!g_active || !g_pGetFrontSlot)
+    // Copied first: the session teardown on the submit thread can clear the
+    // pointer between the check and the call (the addon itself stays loaded).
+    const PFN_GetFrontSlot getFrontSlot = g_pGetFrontSlot;
+    if (!g_active || !getFrontSlot)
         return -1;
-    const int slot = g_pGetFrontSlot();
+    const int slot = getFrontSlot();
     return (slot < 0 || slot > 1) ? -1 : slot;
 }
 
@@ -198,6 +269,21 @@ bool D3D12AddonBridge_CopyToEyeSlots(ID3D11DeviceContext* d3d11Context,
         *outCopied = false;
     if (!g_active || !g_pGetFrontSlot)
         return false;
+    if (!RefreshSharedTextures(d3d11Context))
+        return false;
+    // The headset images keep their size for the whole session; a frame of
+    // any other size (VR just switched off, or RE5 mid-switch) must not be
+    // cut into eye boxes that don't fit it.
+    if (eyeWidth * 2 > g_frameWidth || eyeHeight > g_frameHeight) {
+        static ULONGLONG s_lastLogMs = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastLogMs > 5000) {
+            s_lastLogMs = now;
+            Log_Printf("D3D12AddonBridge_CopyToEyeSlots: frame is %ux%u, too small for two %ux%u eyes - skipping",
+                g_frameWidth, g_frameHeight, eyeWidth, eyeHeight);
+        }
+        return false;
+    }
 
     int frontSlot = g_pGetFrontSlot();
     if (frontSlot < 0 || frontSlot > 1)
@@ -409,6 +495,8 @@ void D3D12AddonBridge_Shutdown()
     g_pBeginReadSlot = nullptr;
     g_pEndReadSlot = nullptr;
     g_pIsSlotReady = nullptr;
+    g_pGetSharedGeneration = nullptr;
+    g_openedGeneration = 0;
     g_addonModule = nullptr;
 }
 

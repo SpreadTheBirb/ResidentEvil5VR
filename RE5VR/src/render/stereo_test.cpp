@@ -1029,15 +1029,24 @@ void StereoTest_Install(IDirect3DDevice9* pDevice)
     }
 }
 
+namespace {
+unsigned long long g_lastBackBufferMs = 0;
+} // namespace
+
+void StereoTest_OnDeviceReset()
+{
+    g_lastBackBufferMs = 0;
+}
+
 void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
 {
     const unsigned long long nowMs = GetTickCount64();
 
     // Backbuffer size, for RenderTargetIsScreenShaped. Refreshed once a
-    // second - it only changes on a resolution switch.
-    static unsigned long long s_lastBackBufferMs = 0;
-    if (nowMs - s_lastBackBufferMs >= 1000) {
-        s_lastBackBufferMs = nowMs;
+    // second, and straight after a Reset - it only changes on a resolution
+    // switch.
+    if (nowMs - g_lastBackBufferMs >= 1000) {
+        g_lastBackBufferMs = nowMs;
         IDirect3DSurface9* bb = nullptr;
         if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
             D3DSURFACE_DESC d = {};

@@ -86,3 +86,8 @@ struct StereoPanelEye {
     float pxPerTanX, pxPerTanY;
 };
 bool StereoTest_GetPanelPlacement(float distanceMeters, UINT frameWidth, UINT frameHeight, StereoPanelEye eyes[2]);
+
+// After a successful device Reset: the backbuffer may have changed size (full
+// resolution per eye switches it), so re-read it before the next draw instead
+// of up to a second later.
+void StereoTest_OnDeviceReset();

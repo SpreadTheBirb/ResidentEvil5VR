@@ -5,6 +5,7 @@
 #include "../util/build_config.h"
 #include "../util/log.h"
 #include "d3d12_addon_bridge.h"
+#include "../render/render_size.h"
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
@@ -30,8 +31,26 @@ namespace {
 bool g_xrModeEnabled = false;
 bool g_xrInitAttempted = false;
 bool g_xrInitialized = false;   // instance + system (Step A) resolved
-bool g_xrSessionReady = false;  // session + swapchains built
+// Session + swapchains built. Atomic since 2026-09-14: the submit thread tears
+// the session down when VR is switched off, and the render thread reads this.
+std::atomic<bool> g_xrSessionReady{ false };
 bool g_xrSessionRunning = false; // xrBeginSession called, not yet xrEndSession'd
+// VR switched on in the menu. The session outlives switching VR off (it is
+// never torn down), so this is what everything else checks: with it off no
+// head pose reaches the game and the headset is sent no image
+// (2026-09-14: VR off used to keep head tracking and freeze the last image
+// in the headset). Written by the render thread, read by the submit thread.
+std::atomic<bool> g_xrOutputOn{ false };
+// Swapchain rebuild handshake with the submit thread (see RebuildEyeSwapchains).
+std::atomic<bool> g_submitPauseRequest{ false };
+std::atomic<bool> g_submitPaused{ false };
+// VR switched off: the submit thread ends and destroys the session, so the
+// headset goes back to the runtime's own home instead of a black void. See
+// StepSessionTeardown.
+std::atomic<bool> g_sessionTeardownRequest{ false };
+// Game closing: the submit thread stops for good (VRBridge_Shutdown).
+std::atomic<bool> g_submitExit{ false };
+std::atomic<bool> g_shuttingDown{ false };
 
 XrInstance g_xrInstance = XR_NULL_HANDLE;
 XrSystemId g_xrSystemId = XR_NULL_SYSTEM_ID;
@@ -80,6 +99,7 @@ constexpr XrViewConfigurationType kDiagnosticViewConfigType = XR_VIEW_CONFIGURAT
 constexpr int kEyeLeft = 0;
 constexpr int kEyeRight = 1;
 XrSwapchain g_xrSwapchain[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+int64_t g_xrSwapchainFormat = 0; // chosen once at session creation, reused when the swapchains are rebuilt
 std::vector<XrSwapchainImageD3D11KHR> g_xrSwapchainImages[2];
 
 // Most recently located eye views (xrLocateViews), read by
@@ -1123,26 +1143,10 @@ bool InitOpenXRInstanceAndSystem()
 // backbuffer, matching CopyResource's "identical dimensions" requirement
 // against the bridge's D3D9Ex-origin eye textures - not the runtime's
 // merely-recommended size).
-bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9Format)
+bool CreateEyeSwapchains(UINT eyeWidth, UINT eyeHeight);
+
+bool CreateD3D11DeviceFor(const XrGraphicsRequirementsD3D11KHR& gfxReq)
 {
-    auto xrGetD3D11GraphicsRequirementsKHR = reinterpret_cast<PFN_xrGetD3D11GraphicsRequirementsKHR>(
-        [] {
-            PFN_xrVoidFunction fn = nullptr;
-            xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR", &fn);
-            return fn;
-        }());
-    if (!xrGetD3D11GraphicsRequirementsKHR) {
-        Log_Printf("XRBridge: xrGetInstanceProcAddr(xrGetD3D11GraphicsRequirementsKHR) failed");
-        return false;
-    }
-
-    XrGraphicsRequirementsD3D11KHR gfxReq{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
-    XrResult r = xrGetD3D11GraphicsRequirementsKHR(g_xrInstance, g_xrSystemId, &gfxReq);
-    if (XR_FAILED(r)) {
-        Log_Printf("XRBridge: xrGetD3D11GraphicsRequirementsKHR failed -> %s", XrResultName(r));
-        return false;
-    }
-
     IDXGIFactory1* dxgiFactory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&dxgiFactory)))) {
         Log_Printf("XRBridge: CreateDXGIFactory1 failed");
@@ -1247,6 +1251,33 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
     } else {
         Log_Printf("XRBridge: WARNING - QueryInterface(ID3D11Multithread) failed; the submit thread and the game's main thread will share an unprotected D3D11 context");
     }
+    return true;
+}
+
+bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9Format)
+{
+    auto xrGetD3D11GraphicsRequirementsKHR = reinterpret_cast<PFN_xrGetD3D11GraphicsRequirementsKHR>(
+        [] {
+            PFN_xrVoidFunction fn = nullptr;
+            xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR", &fn);
+            return fn;
+        }());
+    if (!xrGetD3D11GraphicsRequirementsKHR) {
+        Log_Printf("XRBridge: xrGetInstanceProcAddr(xrGetD3D11GraphicsRequirementsKHR) failed");
+        return false;
+    }
+
+    XrGraphicsRequirementsD3D11KHR gfxReq{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
+    XrResult r = xrGetD3D11GraphicsRequirementsKHR(g_xrInstance, g_xrSystemId, &gfxReq);
+    if (XR_FAILED(r)) {
+        Log_Printf("XRBridge: xrGetD3D11GraphicsRequirementsKHR failed -> %s", XrResultName(r));
+        return false;
+    }
+
+    // One D3D11 device for the whole run: sessions come and go with VR on
+    // and off (2026-09-14), the device the runtime binds to stays.
+    if (!g_d3d11Device && !CreateD3D11DeviceFor(gfxReq))
+        return false;
 
     // 2026-09-12: the addon bridge init USED to run here, before
     // xrCreateSession, because the swapchain format below needs to match
@@ -1387,6 +1418,21 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
     }
 
     (void)d3d9Format;
+    g_xrSwapchainFormat = chosenFormat;
+    if (!CreateEyeSwapchains(eyeWidth, eyeHeight))
+        return false;
+
+    Log_Printf("XRBridge: session + swapchains ready");
+    return true;
+}
+
+// One swapchain per eye at the size we render. Split out of session creation
+// (2026-09-14) so the swapchains can be rebuilt when the render size changes
+// between VR on and off, without tearing the session down.
+bool CreateEyeSwapchains(UINT eyeWidth, UINT eyeHeight)
+{
+    const int64_t chosenFormat = g_xrSwapchainFormat;
+    XrResult r = XR_SUCCESS;
     // 2026-07-29: allocate the swapchain at the runtime's OWN recommended
     // size (queried in InitOpenXRInstanceAndSystem), not just our rendered
     // content size - suspected the runtime treats a far-below-recommended
@@ -1442,9 +1488,20 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
             eye == 0 ? "left" : "right", imageCount, swapchainW, swapchainH, eyeWidth, eyeHeight,
             static_cast<long long>(chosenFormat));
     }
-
-    Log_Printf("XRBridge: session + swapchains ready");
     return true;
+}
+
+void DestroyEyeSwapchains()
+{
+    for (int eye = 0; eye < 2; ++eye) {
+        if (g_xrSwapchain[eye] != XR_NULL_HANDLE) {
+            xrDestroySwapchain(g_xrSwapchain[eye]);
+            g_xrSwapchain[eye] = XR_NULL_HANDLE;
+        }
+        g_xrSwapchainImages[eye].clear();
+        for (auto& id : g_imagePoseId[eye])
+            id = 0;
+    }
 }
 
 // ---- Frame submission (synchronous, from the game's own EndScene) -------
@@ -2098,7 +2155,9 @@ void XrSubmitOneFrame()
         XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
         endInfo.displayTime = frameState.predictedDisplayTime;
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        endInfo.layerCount = (frameState.shouldRender && haveViews) ? 1 : 0;
+        // No layer while VR is off: the runtime shows its own empty scene
+        // instead of our last frame.
+        endInfo.layerCount = (frameState.shouldRender && haveViews && g_xrOutputOn.load(std::memory_order_acquire)) ? 1 : 0;
         endInfo.layers = layers;
         {
             ScopedTimer t("xrEndFrame", logThisIteration);
@@ -2148,13 +2207,162 @@ void XrSubmitOneFrame()
 // guard is the brief pre-session window, where every call would otherwise
 // return near-instantly (PumpXrEvents with nothing to do yet) and spin a
 // core at 100%.
+bool StepSessionTeardown();
+
 DWORD WINAPI XrSubmitThreadProc(LPVOID)
 {
-    while (true) {
+    while (!g_submitExit.load(std::memory_order_acquire)) {
+        // Parked between frames while the render thread rebuilds the
+        // swapchains (RebuildEyeSwapchains) - never inside one.
+        // Cleared before the check, so "paused" can only ever be seen while
+        // this thread is really between frames.
+        g_submitPaused.store(false, std::memory_order_release);
+        if (g_submitPauseRequest.load(std::memory_order_acquire)) {
+            g_submitPaused.store(true, std::memory_order_release);
+            Sleep(1);
+            continue;
+        }
+        if (g_sessionTeardownRequest.load(std::memory_order_acquire) && StepSessionTeardown()) {
+            Sleep(5);
+            continue;
+        }
         XrSubmitOneFrame();
         if (!g_xrSessionRunning)
             Sleep(5);
     }
+    return 0;
+}
+
+// ---- Rebuilding the swapchains (2026-09-14) -----------------------------
+// Full resolution per eye takes its size from the runtime each time VR is
+// switched on, so the eye size can differ from the one the session was built
+// with (the player changed SteamVR's or Virtual Desktop's resolution, or
+// turned the feature off). The session stays; only the two swapchains - and
+// the staged path's eye textures - are replaced, with the submit thread
+// parked between frames. Addon path only: the D3D9 readback path's surfaces
+// are sized once and it is a fallback nobody runs.
+bool RebuildEyeSwapchains(UINT eyeWidth, UINT eyeHeight)
+{
+    g_submitPauseRequest.store(true, std::memory_order_release);
+    const ULONGLONG start = GetTickCount64();
+    while (g_xrThread && !g_submitPaused.load(std::memory_order_acquire)) {
+        if (GetTickCount64() - start > 1000) {
+            Log_Printf("XRBridge: submit thread didn't park within 1 s - swapchains left at %ux%u", g_eyeWidth,
+                g_eyeHeight);
+            g_submitPauseRequest.store(false, std::memory_order_release);
+            return false;
+        }
+        Sleep(1);
+    }
+
+    DestroyEyeSwapchains();
+    for (int slot = 0; slot < 2; ++slot) {
+        if (g_d3d11LeftTex[slot]) {
+            g_d3d11LeftTex[slot]->Release();
+            g_d3d11LeftTex[slot] = nullptr;
+        }
+        if (g_d3d11RightTex[slot]) {
+            g_d3d11RightTex[slot]->Release();
+            g_d3d11RightTex[slot] = nullptr;
+        }
+    }
+    const UINT oldW = g_eyeWidth, oldH = g_eyeHeight;
+    const bool ok = CreateEyeSwapchains(eyeWidth, eyeHeight);
+    g_eyeWidth = eyeWidth;
+    g_eyeHeight = eyeHeight;
+    g_bridgeReady = false; // EnsureBridgeReady recreates the staged eye textures at the new size
+    g_submitPauseRequest.store(false, std::memory_order_release);
+    Log_Printf("XRBridge: swapchains rebuilt %ux%u -> %ux%u (%s)", oldW, oldH, eyeWidth, eyeHeight,
+        ok ? "ok" : "FAILED");
+    return ok;
+}
+
+// Asks the runtime again for its recommended eye size - it follows SteamVR's
+// and Virtual Desktop's resolution settings, which can change between runs of
+// VR mode.
+void RefreshRecommendedEyeSize()
+{
+    uint32_t viewCount = 0;
+    if (XR_FAILED(xrEnumerateViewConfigurationViews(g_xrInstance, g_xrSystemId,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr)) || viewCount == 0)
+        return;
+    std::vector<XrViewConfigurationView> views(viewCount, { XR_TYPE_VIEW_CONFIGURATION_VIEW });
+    if (XR_FAILED(xrEnumerateViewConfigurationViews(g_xrInstance, g_xrSystemId,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, views.data())))
+        return;
+    const UINT w = views[0].recommendedImageRectWidth, h = views[0].recommendedImageRectHeight;
+    if (w != g_recommendedEyeWidth || h != g_recommendedEyeHeight)
+        Log_Printf("XRBridge: runtime now recommends %ux%u per eye (was %ux%u)", w, h, g_recommendedEyeWidth,
+            g_recommendedEyeHeight);
+    g_recommendedEyeWidth = w;
+    g_recommendedEyeHeight = h;
+}
+
+// ---- Ending the session (2026-09-14) -------------------------------------
+// VR off used to leave the session running with no image, which Virtual
+// Desktop shows as a black screen. Now the session is ended and destroyed, so
+// the runtime takes the headset back, and VR on builds a fresh one. The D3D11
+// device and the OpenXR instance stay for the whole run.
+void DestroySession()
+{
+    DestroyEyeSwapchains();
+    for (int slot = 0; slot < 2; ++slot) {
+        if (g_d3d11LeftTex[slot]) {
+            g_d3d11LeftTex[slot]->Release();
+            g_d3d11LeftTex[slot] = nullptr;
+        }
+        if (g_d3d11RightTex[slot]) {
+            g_d3d11RightTex[slot]->Release();
+            g_d3d11RightTex[slot] = nullptr;
+        }
+    }
+    if (g_xrLocalSpace != XR_NULL_HANDLE) {
+        xrDestroySpace(g_xrLocalSpace);
+        g_xrLocalSpace = XR_NULL_HANDLE;
+    }
+    if (g_xrSession != XR_NULL_HANDLE) {
+        const XrResult r = xrDestroySession(g_xrSession);
+        Log_Printf("XRBridge: xrDestroySession -> %s", XrResultName(r));
+        g_xrSession = XR_NULL_HANDLE;
+    }
+    g_xrSessionRunning = false;
+    D3D12AddonBridge_Shutdown();
+    g_usingD3D12AddonPath = false;
+    g_bridgeReady = false;
+    g_eyeWidth = 0;
+    g_eyeHeight = 0;
+    g_xrSessionReady.store(false, std::memory_order_release);
+}
+
+// Submit thread, once per loop while a teardown is requested. The polite
+// order is: ask the runtime to exit, keep submitting (empty) frames until it
+// says STOPPING, end the session (PumpXrEvents does that), then destroy it.
+// Returns true when there is nothing to submit this iteration.
+bool StepSessionTeardown()
+{
+    static ULONGLONG s_requestedMs = 0;
+    if (g_xrSession == XR_NULL_HANDLE) {
+        g_sessionTeardownRequest.store(false, std::memory_order_release);
+        return true;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_xrSessionRunning) {
+        if (!s_requestedMs) {
+            s_requestedMs = now;
+            const XrResult r = xrRequestExitSession(g_xrSession);
+            Log_Printf("XRBridge: VR off - xrRequestExitSession -> %s", XrResultName(r));
+            if (XR_FAILED(r))
+                s_requestedMs = now - 10000; // runtime refused: go straight to destroying it
+        }
+        if (now - s_requestedMs < 2000)
+            return false;
+        Log_Printf("XRBridge: runtime didn't stop the session within 2 s - destroying it anyway");
+    }
+    DestroySession();
+    s_requestedMs = 0;
+    g_sessionTeardownRequest.store(false, std::memory_order_release);
+    Log_Printf("XRBridge: session ended - the headset is back with the runtime");
+    return true;
 }
 
 // 2026-07-29: starts the dedicated submit thread (see XrSubmitThreadProc)
@@ -2242,6 +2450,8 @@ void VRBridge_Install()
 
 void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
 {
+    if (g_shuttingDown.load(std::memory_order_acquire))
+        return;
     // Page Up/Down, Home/End, Insert, Delete and F7 are menu options now
     // (ui/menu.cpp). VR on/off arrives here as a request, so OpenXR is still
     // only ever touched from this thread.
@@ -2277,6 +2487,8 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
             if (!g_xrInitAttempted) {
                 g_xrInitAttempted = true;
                 g_xrInitialized = InitOpenXRInstanceAndSystem();
+            } else if (g_xrInitialized) {
+                RefreshRecommendedEyeSize();
             }
             if (!g_xrInitialized) {
                 Log_Printf("XRBridge: OpenXR instance/system init failed (no headset or no OpenXR "
@@ -2288,13 +2500,28 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
                 // anyone without a headset staring at a side-by-side image
                 // with no obvious way back - F7 again wouldn't undo it.
                 StereoTest_SetEnabled(true);
+                g_xrOutputOn.store(true, std::memory_order_release);
             }
         } else {
+            g_xrOutputOn.store(false, std::memory_order_release);
             StereoTest_SetEnabled(false);
+            RenderSize_ExitVR(); // the player's own resolution comes back
+            if (g_xrSessionReady.load(std::memory_order_acquire))
+                g_sessionTeardownRequest.store(true, std::memory_order_release);
         }
     }
 
     if (!g_xrModeEnabled || !g_xrInitialized)
+        return;
+
+    // Full resolution per eye: RE5 switches to the VR size first, and nothing
+    // is built or copied until it has - the headset images are sized from the
+    // frame, once per session (render/render_size.cpp).
+    if (!RenderSize_EnterVR(pGameDevice, g_recommendedEyeWidth, g_recommendedEyeHeight))
+        return;
+    // VR switched off and straight back on: the old session is still being
+    // ended on the submit thread. The new one is built once it's gone.
+    if (g_sessionTeardownRequest.load(std::memory_order_acquire))
         return;
 
     if (!g_xrSessionReady) {
@@ -2310,11 +2537,30 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
         if (!CreateXrSessionAndSwapchains(w / 2, h, D3DFMT_A8R8G8B8)) {
             Log_Printf("XRBridge: session/swapchain setup failed, turning XR mode back off");
             g_xrModeEnabled = false;
+            g_xrOutputOn.store(false, std::memory_order_release);
+            RenderSize_ExitVR();
             StereoTest_SetEnabled(false); // don't strand them in split-screen
             return;
         }
         g_xrSessionReady = true;
         EnsureXrThreadStarted();
+    } else if (g_usingD3D12AddonPath) {
+        // The eyes are always half of the frame RE5 is rendering now; if that
+        // isn't what the swapchains were built for, rebuild them.
+        IDirect3DSurface9* backbuffer = nullptr;
+        if (SUCCEEDED(pGameDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
+            D3DSURFACE_DESC desc = {};
+            backbuffer->GetDesc(&desc);
+            backbuffer->Release();
+            const UINT eyeW = desc.Width / 2, eyeH = desc.Height;
+            static ULONGLONG s_lastRebuildFailMs = 0;
+            if ((eyeW != g_eyeWidth || eyeH != g_eyeHeight) && eyeW && eyeH &&
+                GetTickCount64() - s_lastRebuildFailMs > 5000) {
+                if (!RebuildEyeSwapchains(eyeW, eyeH))
+                    s_lastRebuildFailMs = GetTickCount64();
+                return;
+            }
+        }
     }
 
     if (!EnsureBridgeReady(pGameDevice))
@@ -2408,6 +2654,10 @@ void VRBridge_NoteFramePresented(XRBridgePoseId poseId)
 
 bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
 {
+    // VR off: no head pose, so the camera, culling and stereo all go back to
+    // flat-screen behaviour even though the session keeps running.
+    if (!g_xrOutputOn.load(std::memory_order_acquire))
+        return false;
     AcquireSRWLockShared(&g_eyeViewsLock);
     const bool have = g_haveEyeViews;
     if (have) {
@@ -2451,6 +2701,49 @@ void VRBridge_ApplySettings(const VRBridgeSettings& in)
         Log_Printf("XRBridge: direct submit %s", s.directSubmit ? "ON" : "OFF");
     if (s.waitForConsumer != old.waitForConsumer)
         Log_Printf("XRBridge: producer %s", s.waitForConsumer ? "WAITS for the submit thread" : "always refreshes");
+}
+
+void VRBridge_Shutdown(const char* why)
+{
+    static std::atomic<bool> s_done{ false };
+    if (s_done.exchange(true))
+        return;
+    g_shuttingDown.store(true, std::memory_order_release);
+    g_xrOutputOn.store(false, std::memory_order_release);
+    if (!g_xrInitialized && !g_d3d11Device)
+        return; // VR never started this run: nothing to shut down
+    Log_Printf("XRBridge: shutting down (%s)", why ? why : "?");
+
+    // The game closing with VR objects still alive crashed inside d3d11.dll
+    // every time (0xC0000005 at DEDEDEDE on the main thread, user-confirmed
+    // 2026-09-14 as happening on exit): Windows killed the submit thread
+    // mid-call and then tore the device down underneath it. So: stop the
+    // thread, then release everything in order, while the process is still
+    // intact.
+    if (g_xrThread) {
+        g_submitExit.store(true, std::memory_order_release);
+        const DWORD waited = WaitForSingleObject(g_xrThread, 2000);
+        Log_Printf("XRBridge: submit thread %s", waited == WAIT_OBJECT_0 ? "stopped" : "did NOT stop within 2 s");
+        CloseHandle(g_xrThread);
+        g_xrThread = nullptr;
+    }
+    if (g_xrSession != XR_NULL_HANDLE)
+        DestroySession();
+    if (g_d3d11Context) {
+        g_d3d11Context->ClearState();
+        g_d3d11Context->Flush();
+        g_d3d11Context->Release();
+        g_d3d11Context = nullptr;
+    }
+    if (g_d3d11Device) {
+        g_d3d11Device->Release();
+        g_d3d11Device = nullptr;
+    }
+    if (g_xrInstance != XR_NULL_HANDLE) {
+        xrDestroyInstance(g_xrInstance);
+        g_xrInstance = XR_NULL_HANDLE;
+    }
+    Log_Printf("XRBridge: shut down cleanly");
 }
 
 void VRBridge_RequestXrMode(bool on)

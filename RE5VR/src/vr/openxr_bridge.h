@@ -130,6 +130,9 @@ void VRBridge_ApplySettings(const VRBridgeSettings& s);
 // VR on/off (was F7). Handled on the render thread at the next EndScene;
 // ignored on a flat-screen install. Safe from any thread.
 void VRBridge_RequestXrMode(bool on);
+// Game closing: stops the submit thread and releases the session, device and
+// instance in order, before Windows tears the process down. Idempotent.
+void VRBridge_Shutdown(const char* why);
 // True when dgVoodoo2 is installed alongside us, i.e. VR can work at all.
 bool VRBridge_IsAvailable();
 

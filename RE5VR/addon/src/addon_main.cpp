@@ -111,6 +111,11 @@ HANDLE g_sharedHandle[kNumSlots] = { nullptr, nullptr };
 // consumer asks via RE5VRAddon_IsSlotReady (g_slotFenceValue below).
 // Publishing early like this is what lets both sides stay non-blocking.
 std::atomic<int> g_frontSlot{ -1 };
+// Bumped every time the shared textures are recreated (the game frame changed
+// size or format, e.g. full resolution per eye switching on or off). The
+// consumer compares it to reopen the new handles; handle values alone can be
+// reused by Windows after CloseHandle.
+std::atomic<unsigned> g_sharedGeneration{ 0 };
 
 // dgVoodoo's own auto-flush fence, and the value each slot's copy will
 // have signalled once the GPU has genuinely finished writing it.
@@ -280,6 +285,7 @@ bool EnsureSharedTextures(ID3D12Resource* pSrcTexture)
     g_frameFormat = concreteFormat; // the SHARED texture's own format, not necessarily the source's
     g_lastSourceFormat = srcDesc.Format;
     g_texturesReady = true;
+    g_sharedGeneration.fetch_add(1, std::memory_order_acq_rel);
 
     AddonLog_Printf("EnsureSharedTextures: ready (%ux%u, format=%d, handles=%p/%p)",
         g_frameWidth, g_frameHeight, static_cast<int>(g_frameFormat), g_sharedHandle[0], g_sharedHandle[1]);
@@ -697,6 +703,27 @@ public:
         const int frontNow = g_frontSlot.load(std::memory_order_acquire);
         const int backSlot = (frontNow == 0) ? 1 : 0;
 
+        // Always leave the consumer one FINISHED frame. The copy into a slot
+        // lands when the GPU gets to it, which is a frame or more behind once
+        // the GPU is busy. Overwriting the back slot before the front slot's
+        // copy has landed leaves both slots unfinished, and the consumer finds
+        // nothing it may read, frame after frame: the headset froze while the
+        // game played on (2026-09-14, full resolution per eye at 2960x1616 on
+        // a Quadro M2200, ~45 skips a second). Waiting for the front copy
+        // costs nothing - the consumer could not have used a newer frame yet.
+        if (frontNow >= 0 && g_flushFence) {
+            const UINT64 frontRequired = g_slotFenceValue[frontNow].load(std::memory_order_acquire);
+            if (frontRequired != 0 && g_flushFence->GetCompletedValue() < frontRequired) {
+                static UInt32 s_behindCount = 0;
+                ++s_behindCount;
+                if (s_behindCount <= 5 || (s_behindCount % 600) == 0)
+                    AddonLog_Printf("D3D12SwapchainPresentBegin #%u: slot=%d's copy hasn't landed on the GPU yet, "
+                                    "keeping it and skipping this frame's copy (#%u)",
+                        g_presentBeginCount, frontNow, s_behindCount);
+                return;
+            }
+        }
+
         // The real fix (see this file's g_slotReaders comment above): if
         // the consumer has marked this slot as actively being read, skip
         // this frame's copy entirely rather than overwrite it. This is
@@ -853,6 +880,12 @@ bool API_EXPORT RE5VRAddon_GetFrameInfo(UInt32* outWidth, UInt32* outHeight, Int
     if (outHandleSlot0) *outHandleSlot0 = g_sharedHandle[0];
     if (outHandleSlot1) *outHandleSlot1 = g_sharedHandle[1];
     return true;
+}
+
+// See g_sharedGeneration. 0 until the first set of shared textures exists.
+UInt32 API_EXPORT RE5VRAddon_GetSharedGeneration()
+{
+    return g_sharedGeneration.load(std::memory_order_acquire);
 }
 
 Int32 API_EXPORT RE5VRAddon_GetFrontSlot()

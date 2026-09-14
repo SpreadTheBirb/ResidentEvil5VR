@@ -15,6 +15,7 @@
 #include "hud_probe.h"
 #include "../render/stereo_test.h"
 #include "../render/hud_shaders.h"
+#include "../render/render_size.h"
 #include "../vr/openxr_bridge.h"
 #include "../ui/input_block.h"
 #include "../ui/menu.h"
@@ -60,70 +61,12 @@ void EnsureMinHookInitialized()
 }
 
 
-// ---- Forced backbuffer resolution (2026-09-12) --------------------------
-// Each VR eye is HALF the backbuffer width - stereo is every draw issued
-// twice into opposite halves, split by scissor - so at 1920x1080 an eye is
-// 960x1080 and the runtime upscales it to ~1632 wide before the tester sees
-// it. That is the "super pixelated" report, and it is also why his SteamVR
-// 150% and Virtual Desktop Godlike changed nothing: both raise resolution
-// downstream of a source that is fixed by the game.
-//
-// The source is what this moves. Overriding the presentation parameters makes
-// the game render wider, and each half then lands in the eye texture with
-// more pixels - at 3264x1072 an eye is 1632x1072, a 1:1 match for a Quest 3's
-// recommendation with no upscale at all.
-//
-// Driven by a file rather than a constant, because the useful resolution
-// depends on the headset and the GPU, and this way a test run costs a text
-// edit instead of a rebuild:
-//
-//     re5vr_res.txt, next to re5dx9.exe, containing e.g.   3264x1072
-//
-// Windowed mode is worth knowing about here: the backbuffer does NOT have to
-// match the window, so the desktop window can stay small and cheap while the
-// VR image is rendered large. dgVoodoo scales for the monitor either way.
-struct ForcedRes {
-    UINT width = 0;
-    UINT height = 0;
-    bool checked = false;
-};
-ForcedRes g_forcedRes;
-
-const ForcedRes& ForcedBackbufferSize()
-{
-    if (g_forcedRes.checked)
-        return g_forcedRes;
-    g_forcedRes.checked = true;
-
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* slash = strrchr(path, 0x5C); // backslash
-    if (!slash) {
-        Log_Printf("ForcedBackbufferSize: no module path, resolution left alone");
-        return g_forcedRes;
-    }
-    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "re5vr_res.txt");
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "r") != 0 || !f) {
-        Log_Printf("ForcedBackbufferSize: %s not found - the game's own resolution is used", path);
-        return g_forcedRes;
-    }
-    unsigned w = 0, h = 0;
-    const int fields = fscanf_s(f, "%ux%u", &w, &h);
-    fclose(f);
-
-    // Sanity: refuse nonsense rather than hand D3D a device it cannot make.
-    if (fields != 2 || w < 640 || h < 480 || w > 16384 || h > 16384) {
-        Log_Printf("ForcedBackbufferSize: %s did not parse as WIDTHxHEIGHT (got %d field(s), %ux%u) - ignoring",
-            path, fields, w, h);
-        return g_forcedRes;
-    }
-    g_forcedRes.width = w;
-    g_forcedRes.height = h;
-    Log_Printf("ForcedBackbufferSize: %s says %ux%u - each VR eye will be %ux%u", path, w, h, w / 2, h);
-    return g_forcedRes;
-}
+// ---- Resolution ------------------------------------------------------------
+// Each VR eye used to be half the backbuffer. Forcing a bigger backbuffer here
+// (re5vr_res.txt, 2026-09-12 to 2026-09-14) turned out to be the wrong lever:
+// RE5 sizes its scene targets from its own render size, not the backbuffer,
+// and just copied the old-size image into the corner of the bigger frame. Full
+// resolution per eye now asks RE5 itself for the size - render/render_size.cpp.
 
 // Logs what the backbuffer ACTUALLY ended up as, which is the only proof that
 // an override stuck: D3D9 is free to hand back something else, and dgVoodoo
@@ -147,23 +90,6 @@ void LogActualBackbuffer(IDirect3DDevice9* pDevice, const char* when)
         d.Width / 2, d.Height);
 }
 
-// Applies the override to a presentation-parameters block, logging what it
-// changed. Shared by CreateDevice and Reset - a Reset with the game's own
-// numbers would silently undo the whole thing.
-void ApplyForcedRes(D3DPRESENT_PARAMETERS* pp, const char* when)
-{
-    const ForcedRes& forced = ForcedBackbufferSize();
-    if (!pp || !forced.width)
-        return;
-    if (pp->BackBufferWidth == forced.width && pp->BackBufferHeight == forced.height) {
-        Log_Printf("ApplyForcedRes(%s): already %ux%u, nothing to do", when, forced.width, forced.height);
-        return;
-    }
-    Log_Printf("ApplyForcedRes(%s): game asked for %ux%u, forcing %ux%u (windowed=%d)",
-        when, pp->BackBufferWidth, pp->BackBufferHeight, forced.width, forced.height, pp->Windowed);
-    pp->BackBufferWidth = forced.width;
-    pp->BackBufferHeight = forced.height;
-}
 // ---- IDirect3D9::CreateDevice -------------------------------------------
 //
 // Phase 0 only needs to prove this proxy's hooks run inside the game's real
@@ -204,8 +130,6 @@ HRESULT WINAPI hkCreateDevice(
         pPresentationParameters ? pPresentationParameters->Windowed : -1,
         pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
         pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0);
-
-    ApplyForcedRes(pPresentationParameters, "CreateDevice");
 
     HRESULT hr = oCreateDevice(This, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
         pPresentationParameters, ppReturnedDeviceInterface);
@@ -265,11 +189,9 @@ void DrawDebugQuad(IDirect3DDevice9* pDevice)
 #endif
 
 
-// ---- IDirect3DDevice9::Reset: keep the forced resolution ---------------
-// The game resets the device whenever display settings change, and on some
-// alt-tab paths. A reset carries its own presentation parameters, so without
-// this the override would quietly disappear mid-session and the eyes would go
-// back to half of whatever the game wanted.
+// ---- IDirect3DDevice9::Reset --------------------------------------------
+// The game resets the device whenever display settings change, on some
+// alt-tab paths, and when full resolution per eye switches its render size.
 constexpr size_t kIDirect3DDevice9_Reset = 16;
 
 typedef HRESULT(WINAPI* Reset_t)(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentationParameters);
@@ -281,14 +203,17 @@ HRESULT WINAPI hkReset(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentat
         pPresentationParameters ? pPresentationParameters->BackBufferWidth : 0,
         pPresentationParameters ? pPresentationParameters->BackBufferHeight : 0,
         pPresentationParameters ? pPresentationParameters->Windowed : -1);
-    ApplyForcedRes(pPresentationParameters, "Reset");
+    RenderSize_OnBeforeReset(pPresentationParameters);
     Menu_OnBeforeReset(); // the menu's D3DPOOL_DEFAULT textures and buffers must go first
     const HRESULT hr = oReset(This, pPresentationParameters);
     Menu_OnAfterReset();
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr)) {
         LogActualBackbuffer(This, "after Reset");
-    else
-        Log_Printf("hkReset: Reset failed (hr=0x%08lX) - the forced size may be one the device will not take", hr);
+        StereoTest_OnDeviceReset();
+    } else {
+        Log_Printf("hkReset: Reset failed (hr=0x%08lX)", hr);
+    }
+    RenderSize_OnReset(hr);
     return hr;
 }
 // ---- IDirect3DDevice9::Present: the one true frame boundary ------------
@@ -309,6 +234,7 @@ HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const 
     Menu_OnPresent(This);
     const HRESULT hr = oPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     StereoTest_OnPresent();
+    RenderSize_OnPresent(This);
 #if RE5VR_DIAGNOSTICS
     HudProbe_OnPresent(); // K: record the HUD's draw calls
 #endif
@@ -402,9 +328,7 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
         st = MH_EnableHook(pPresent);
     Log_Printf("Hooks_OnDeviceCreated: Present hook enabled -> %d", static_cast<int>(st));
 
-    // Reset: the menu has to release its D3DPOOL_DEFAULT resources around it
-    // (and the parked forced-resolution override rides along, doing nothing
-    // unless re5vr_res.txt exists).
+    // Reset: the menu has to release its D3DPOOL_DEFAULT resources around it.
     void* pReset = VTableEntry(pDevice, kIDirect3DDevice9_Reset);
     st = MH_CreateHook(pReset, reinterpret_cast<void*>(&hkReset), reinterpret_cast<void**>(&oReset));
     if (st == MH_OK || st == MH_ERROR_ALREADY_CREATED)

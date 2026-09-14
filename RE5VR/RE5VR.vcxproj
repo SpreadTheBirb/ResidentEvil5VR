@@ -111,6 +111,7 @@
     <ClCompile Include="src\hooks\query_probe.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
     <ClCompile Include="src\render\hud_shaders.cpp" />
+    <ClCompile Include="src\render\render_size.cpp" />
     <ClCompile Include="src\vr\openxr_bridge.cpp" />
     <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
     <ClCompile Include="src\ui\menu.cpp" />
@@ -151,6 +152,7 @@
     <ClInclude Include="src\hooks\query_probe.h" />
     <ClInclude Include="src\render\stereo_test.h" />
     <ClInclude Include="src\render\hud_shaders.h" />
+    <ClInclude Include="src\render\render_size.h" />
     <ClInclude Include="src\vr\openxr_bridge.h" />
     <ClInclude Include="src\vr\d3d12_addon_bridge.h" />
     <ClInclude Include="src\ui\menu.h" />

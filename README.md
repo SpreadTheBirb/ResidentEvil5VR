@@ -4,7 +4,7 @@ A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
 DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
-> **Status:** v0.4.0a, working and playable, still under active development.
+> **Status:** v0.4.1, working and playable, still under active development.
 > There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
@@ -15,6 +15,10 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 
 > **Update (v0.4.0a):** in VR the game window shows a single eye instead of
 > the side-by-side image, so streaming and recording look normal.
+
+> **Update (v0.4.1):** full resolution per eye. VR is now crisp: each eye
+> renders at the resolution your VR runtime asks for, so SteamVR's resolution
+> setting and Virtual Desktop's quality presets finally do something.
 
 ---
 
@@ -41,8 +45,8 @@ to clone this repository to play.
 
 | Download | For | Files |
 |---|---|---|
-| `RE5VR-v0.4.0-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
-| `RE5VR-v0.4.0-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
+| `RE5VR-v0.4.1-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
+| `RE5VR-v0.4.1-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
 
 ### Do this first: the 4GB patch
 
@@ -69,8 +73,9 @@ tells you whether it's applied.
 **Uninstall:** delete those files (and `re5vr.ini` if you want your settings
 gone too). No game files or saves are modified.
 
-**Updating from an older version:** overwrite the files. The old hotkeys are
-gone; everything they did is in the menu.
+**Updating from an older version:** overwrite every file, including
+`dgVoodoo.conf` and `SampleAddon.dll`: full resolution per eye needs both.
+The old hotkeys are gone; everything they did is in the menu.
 
 ---
 
@@ -120,6 +125,7 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 | **Enable VR** | Starts VR. Greyed out on the flatscreen package. Shows whether the headset is running, or why it couldn't start. |
 | **Start in VR automatically** | Turns VR on by itself a few seconds after the game launches. |
 | **Left Eye / Right Eye Desktop View** | Which eye the game window shows while in VR (right by default), so streaming and recording look normal. It fills the window at any size or shape. The headset is not affected. |
+| **Full resolution per eye** | On by default. Each eye renders at your VR runtime's own resolution (see [Resolution](#resolution)). Shows the size each eye gets, in orange if it had to be scaled down to fit the game's memory. Off gives each eye half of the game's resolution, like older versions. |
 | **Reset view** | Makes wherever you're facing "forward" again (yaw only). Same as holding both sticks. |
 | **Head turns the game camera** | While the gun is down, the game's camera follows your head so the world isn't culled away wherever your body faces. Raising the gun hands aim straight back to the mouse or stick. |
 | **Stabilise camera** | Smooths Chris's idle-animation sway out of your view. |
@@ -145,7 +151,8 @@ reporting a problem** (see [Reporting a problem](#reporting-a-problem)):
 - **Mod:** release or developer build, VR or flatscreen install, address
   space used, whether the **4GB patch** is applied
 - **Rendering:** game frame rate, backbuffer size, stereo on/off and the
-  resolution each eye actually gets, HUD recognition
+  resolution each eye actually gets, the render size in VR versus the game's
+  own, HUD recognition
 - **VR:** runtime, headset, the per-eye resolution the runtime wants versus
   what's sent, headset refresh rate, frames submitted per second, image age
 - **Camera:** first person on/off, which character you're playing, camera
@@ -182,6 +189,13 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
 - **Native stereoscopic VR through OpenXR:** each eye rendered with its own
   camera, real head tracking and the headset's actual per-eye lens FOV,
   delivered at the headset's full refresh rate.
+- **Full resolution per eye:** each eye renders at the resolution your VR
+  runtime asks for, whatever resolution the game itself is set to. Change it
+  in SteamVR or Virtual Desktop; your own resolution comes back when VR is off.
+- **Desktop view for streaming:** the game window shows one eye, filling the
+  window, instead of the side-by-side image.
+- **Clean handoff:** turning VR off returns the game to flat screen and hands
+  the headset back to SteamVR or Virtual Desktop.
 - **HUD in VR:** ammo, health, the inventory, the pause screen and most menus
   on a panel in front of you, at a distance you choose.
 - **Head tracking turns the game camera:** nothing disappears over your
@@ -219,6 +233,30 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
    tick **Start in VR automatically** once and never think about it again).
 4. Turn on **First person camera** on the Camera tab.
 
+**Play in windowed mode.** Set RE5 to windowed in its display options. In
+exclusive fullscreen, changing resolution (or turning VR on) can crash inside
+dgVoodoo2 on some PCs.
+
+### Resolution
+
+Each eye renders at the resolution your VR runtime recommends, so the
+runtime's own setting is the dial:
+
+- **SteamVR:** *Settings → Video → Render Resolution* (or per game).
+- **Virtual Desktop:** the quality preset (Potato to Godlike). Its "rendering
+  resolution" readout shows 100% when the game renders exactly what the preset
+  asks for.
+
+After changing it, turn **Enable VR** off and on again in the menu; no restart
+needed. RE5 itself switches to the VR size while VR is on, and back to your
+own resolution when it's off, so the game's own resolution setting doesn't
+affect VR at all.
+
+If the runtime asks for more than the game can hold in memory, the size is
+scaled down to the most that fits and the menu shows it in orange. The 4GB
+patch and `VRAM = 2048` in `dgVoodoo.conf` (as shipped) give it plenty of
+room; without the 4GB patch VR is held to 5 megapixels.
+
 **VR motion controllers are not supported yet.** Play with a gamepad (Xbox,
 PlayStation or similar), which is recommended, or mouse and keyboard.
 
@@ -226,10 +264,11 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 
 ## Performance
 
-- **VR renders the scene twice**, once per eye, so it costs about double a
-  flat-screen frame. If your frame rate is low, lower the game's own
-  resolution first. That is by far the biggest lever, and it beats any
-  headset-side render scale. If you have headroom, raise it.
+- **VR renders the scene twice**, once per eye, at your runtime's
+  resolution. If your frame rate is low, lower the resolution in SteamVR or
+  pick a lower Virtual Desktop preset; that is the lever now. The game's own
+  resolution setting only matters for flat screen.
+- **The desktop view is free:** it is a copy of one eye, not a second render.
 - **Stutter is a separate problem** from frame rate, and the 4GB patch is the
   fix for it.
 - **Streaming over Wi-Fi** (Virtual Desktop, Air Link) adds its own delay and
@@ -239,15 +278,13 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 
 ## Known issues
 
-- **Each eye gets half the game's resolution**, because both eyes share one
-  side-by-side frame. That's why SteamVR's resolution slider does nothing.
-  Raising the game's resolution is the only lever for now, and very high
-  resolutions can run the game out of memory.
+- **Exclusive fullscreen can crash.** Changing resolution in RE5's options
+  while fullscreen, or turning VR on while fullscreen, can crash inside
+  dgVoodoo2 on some PCs. **Play windowed.**
 - **VR motion controllers are not supported yet.** Use a gamepad (Xbox,
   PlayStation or similar) or mouse and keyboard.
-- **The desktop view is only as sharp as one eye**, so with half the game's
-  resolution per eye it looks soft on a stream. Full resolution per eye will
-  sharpen it too.
+- RE5's own mouse cursor can point at the wrong menu item while VR is on (the
+  game still maps it to the window size). A gamepad is unaffected.
 - Some menus (the title screen, parts of the Organize screen) still don't
   draw correctly in VR.
 - Look straight down and you're inside your own torso.
@@ -279,7 +316,6 @@ download you're using.
 
 ## Next up
 
-- **Full resolution per eye** instead of half the game's frame.
 - Keeping the camera inside Chris during actions.
 - Motion controllers with arm IK.
 
@@ -292,8 +328,11 @@ D3D9 calls are translated to Direct3D 12 by dgVoodoo2, a dgVoodoo2 addon plugin
 grabs each finished frame straight off the D3D12 swapchain, and the frame is
 handed to an OpenXR runtime as a pair of eye textures. The stereo image itself
 is produced by drawing the scene twice per frame into one backbuffer with a
-per-eye camera and scissor rectangle. HUD draws are recognised by their shader
-bytecode and drawn once per eye onto a panel at a fixed convergence.
+per-eye camera and scissor rectangle. While VR is on, the mod switches RE5's
+own render size (the same values its resolution setting writes) to twice the
+runtime's per-eye width by its height, so each half of that frame is a full
+resolution eye. HUD draws are recognised by their shader bytecode and drawn
+once per eye onto a panel at a fixed convergence.
 
 The menu is Dear ImGui drawn over the game's own D3D9 device. While it is open,
 the game's input is hidden at every route RE5 uses (DirectInput keyboard and
@@ -308,6 +347,7 @@ RE5VR/
     proxy/        d3d9.dll proxy - export table hand-matched to what RE5 probes
     hooks/        MinHook-based game hooks (camera rig, fade, laser, filter, ...)
     render/       stereo_test.cpp - per-eye camera, projection, scissor split
+                  render_size.cpp - full resolution per eye (RE5's render size)
                   hud_shaders.cpp - recognises the HUD's shaders for VR
     ui/           menu.cpp - the in-game Dear ImGui menu and re5vr.ini
                   input_block.cpp - keeps the game's input away while it is open
@@ -344,6 +384,10 @@ Developer tab to the menu.
 | [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) | `RE5VR/thirdparty/openxr` | vendored at `288d3a7` (SDK 1.0.34), including the prebuilt Win32 loader |
 | dgVoodoo2 addon API | `RE5VR/thirdparty/dgvoodooapi` | headers only |
 | [OpenVR SDK](https://github.com/ValveSoftware/openvr) | *not included* | see below |
+
+Thanks to [RE5Fix](https://github.com/Lyall/RE5Fix) by Lyall (MIT), whose
+resolution-limit patch pointed the way to where RE5 keeps its display
+settings.
 
 **OpenVR is deliberately not in this repository.** An earlier phase of the
 project targeted SteamVR through OpenVR; that path was replaced by OpenXR and
