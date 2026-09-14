@@ -71,3 +71,9 @@ int D3D12AddonBridge_GetFrontSlot();
 // Releases the opened D3D11 textures/module reference. Safe to call
 // even if TryInit was never called or failed.
 void D3D12AddonBridge_Shutdown();
+
+// Desktop view: show this region of the game's frame (in frame pixels) in the
+// game window instead of the whole side-by-side frame, or (enabled = false)
+// leave the window alone. Cheap; call every frame at Present. Does nothing if
+// the addon is absent or too old to support it.
+void D3D12AddonBridge_SetDesktopView(bool enabled, int x, int y, int w, int h);

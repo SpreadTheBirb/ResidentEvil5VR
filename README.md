@@ -4,7 +4,7 @@ A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
 DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
-> **Status:** v0.4.0, working and playable, still under active development.
+> **Status:** v0.4.0a, working and playable, still under active development.
 > There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
@@ -12,6 +12,9 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 
 > **Update (v0.4.0):** the HUD now works in VR. Ammo, health, the inventory
 > and the pause screen all show on a panel in front of you.
+
+> **Update (v0.4.0a):** in VR the game window shows a single eye instead of
+> the side-by-side image, so streaming and recording look normal.
 
 ---
 
@@ -116,6 +119,7 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 |---|---|
 | **Enable VR** | Starts VR. Greyed out on the flatscreen package. Shows whether the headset is running, or why it couldn't start. |
 | **Start in VR automatically** | Turns VR on by itself a few seconds after the game launches. |
+| **Left Eye / Right Eye Desktop View** | Which eye the game window shows while in VR (right by default), so streaming and recording look normal. It fills the window at any size or shape. The headset is not affected. |
 | **Reset view** | Makes wherever you're facing "forward" again (yaw only). Same as holding both sticks. |
 | **Head turns the game camera** | While the gun is down, the game's camera follows your head so the world isn't culled away wherever your body faces. Raising the gun hands aim straight back to the mouse or stick. |
 | **Stabilise camera** | Smooths Chris's idle-animation sway out of your view. |
@@ -215,7 +219,8 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
    tick **Start in VR automatically** once and never think about it again).
 4. Turn on **First person camera** on the Camera tab.
 
-A controller is recommended over mouse and keyboard.
+**VR motion controllers are not supported yet.** Play with a gamepad (Xbox,
+PlayStation or similar), which is recommended, or mouse and keyboard.
 
 ---
 
@@ -238,8 +243,11 @@ A controller is recommended over mouse and keyboard.
   side-by-side frame. That's why SteamVR's resolution slider does nothing.
   Raising the game's resolution is the only lever for now, and very high
   resolutions can run the game out of memory.
-- **The desktop window shows the side-by-side image**, so it isn't suitable
-  for streaming or recording yet.
+- **VR motion controllers are not supported yet.** Use a gamepad (Xbox,
+  PlayStation or similar) or mouse and keyboard.
+- **The desktop view is only as sharp as one eye**, so with half the game's
+  resolution per eye it looks soft on a stream. Full resolution per eye will
+  sharpen it too.
 - Some menus (the title screen, parts of the Organize screen) still don't
   draw correctly in VR.
 - Look straight down and you're inside your own torso.
@@ -272,8 +280,6 @@ download you're using.
 ## Next up
 
 - **Full resolution per eye** instead of half the game's frame.
-- **A VR view on the desktop:** a proper single-eye mirror, so streaming and
-  recording show something watchable.
 - Keeping the camera inside Chris during actions.
 - Motion controllers with arm IK.
 

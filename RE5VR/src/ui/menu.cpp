@@ -5,6 +5,7 @@
 #include "../render/stereo_test.h"
 #include "../render/hud_shaders.h"
 #include "../vr/openxr_bridge.h"
+#include "../vr/d3d12_addon_bridge.h"
 #include "../util/build_config.h"
 #include "../util/log.h"
 
@@ -41,6 +42,7 @@ struct MenuPrefs {
     bool padChord = true;        // a quick click of both sticks opens the menu
     bool startupHint = true;
     bool autoStartVr = false;
+    bool desktopRightEye = true; // VR: which eye the game window shows (never both side by side)
 };
 
 struct AllSettings {
@@ -90,6 +92,7 @@ void ApplySettings(const AllSettings& in)
     X("Camera", "FlatEyeForward", cam.flatEyeAhead)                  \
     X("Graphics", "RemoveColourFilter", filterRemoved)               \
     X("VR", "StartInVR", menu.autoStartVr)                           \
+    X("VR", "DesktopRightEye", menu.desktopRightEye)                 \
     X("VR", "HeadTurnsCamera", cam.headFollow)                       \
     X("VR", "Stabilise", cam.vrStabilise)                            \
     X("VR", "MatchCullingToHeadset", cam.vrMatchCullFov)             \
@@ -150,12 +153,38 @@ void LoadSettings(AllSettings& s)
 #undef X
 }
 
+// The whole file is written fresh from RE5VR_SETTINGS, so a setting that is
+// removed from the list also disappears from re5vr.ini. Writing key by key
+// only ever added and updated: HudDistance, VRDistance, LaserStaysInWorld and
+// DesktopSingleView all outlived their options (2026-09-13).
 void SaveSettings(const AllSettings& s)
 {
-#define X(section, key, member) \
-    WritePrivateProfileStringA(section, key, FormatValue(s.member).c_str(), g_iniPath);
+    std::string text = "; RE5VR settings - written by the in-game menu (Insert). Safe to delete.\r\n";
+    std::string section;
+#define X(sec, key, member)                                   \
+    if (section != sec) {                                     \
+        section = sec;                                        \
+        text += "\r\n[" + section + "]\r\n";                  \
+    }                                                         \
+    text += std::string(key) + "=" + FormatValue(s.member) + "\r\n";
     RE5VR_SETTINGS(X)
 #undef X
+    // The list keeps each section's keys together, so one pass is enough.
+    // Write beside the file and swap it in, so a crash mid-write can't leave
+    // half a settings file behind.
+    const std::string tmp = std::string(g_iniPath) + ".tmp";
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmp.c_str(), "wb") != 0 || !f) {
+        Log_Printf("Menu: could not write %s", tmp.c_str());
+        return;
+    }
+    const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    fclose(f);
+    if (!ok || !MoveFileExA(tmp.c_str(), g_iniPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        Log_Printf("Menu: could not save settings to %s", g_iniPath);
+        DeleteFileA(tmp.c_str());
+        return;
+    }
     Log_Printf("Menu: settings saved to %s", g_iniPath);
 }
 
@@ -415,6 +444,71 @@ void FeedPad(ImGuiIO& io, const XINPUT_STATE* pad)
     stick(ImGuiKey_GamepadLStickDown, ly, -1);
 }
 
+// ---- Desktop view (2026-09-13) ---------------------------------------------
+// In VR the game window showed both eyes side by side, which is useless to
+// stream or record. The addon can show a region of the frame instead (see
+// addon_main.cpp); this picks the region every frame: the left eye, centred
+// on where that eye looks straight ahead (the per-eye projections are off
+// centre), cropped to the window's shape. An eye's half is narrower in
+// pixels than the angle it covers, so the crop is corrected by the eye's own
+// pixels-per-tangent ratio to come out undistorted. The chosen rect also
+// drives the mouse mapping below: the window now shows that region, not the
+// whole frame.
+bool g_dvActive = false;
+int g_dvEye = 1; // 0 left, 1 right
+float g_dvX = 0, g_dvY = 0, g_dvW = 0, g_dvH = 0;
+
+void UpdateDesktopView(IDirect3DDevice9* device)
+{
+    const bool want = StereoTest_IsEnabled() && VRBridge_IsAvailable();
+    if (!want) {
+        if (g_dvActive)
+            D3D12AddonBridge_SetDesktopView(false, 0, 0, 0, 0);
+        g_dvActive = false;
+        return;
+    }
+    IDirect3DSurface9* bb = nullptr;
+    D3DSURFACE_DESC d = {};
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
+        return;
+    bb->GetDesc(&d);
+    bb->Release();
+    if (d.Width < 64 || d.Height < 64)
+        return;
+
+    StereoPanelEye eyes[2];
+    StereoTest_GetPanelPlacement(1000.0f, d.Width, d.Height, eyes); // far away = straight ahead
+    g_dvEye = g_prefs.desktopRightEye ? 1 : 0;
+    const StereoPanelEye& e = eyes[g_dvEye];
+    RECT rc;
+    float aspect = 16.0f / 9.0f;
+    if (g_hwnd && GetClientRect(g_hwnd, &rc) && rc.right > 0 && rc.bottom > 0)
+        aspect = static_cast<float>(rc.right) / static_cast<float>(rc.bottom);
+    const float sx = e.pxPerTanX / e.pxPerTanY;
+    float h = static_cast<float>(d.Height);
+    float w = aspect * h * sx;
+    if (w > e.halfWidth) {
+        w = e.halfWidth;
+        h = w / (aspect * sx);
+    }
+    float x = e.centreX - w * 0.5f, y = e.centreY - h * 0.5f;
+    x = (std::max)(e.halfX0, (std::min)(x, e.halfX0 + e.halfWidth - w));
+    y = (std::max)(0.0f, (std::min)(y, static_cast<float>(d.Height) - h));
+    g_dvX = std::round(x);
+    g_dvY = std::round(y);
+    g_dvW = std::round(w);
+    g_dvH = std::round(h);
+    D3D12AddonBridge_SetDesktopView(true, static_cast<int>(g_dvX), static_cast<int>(g_dvY), static_cast<int>(g_dvW),
+        static_cast<int>(g_dvH));
+    static int s_loggedEye = -1;
+    if (!g_dvActive || s_loggedEye != g_dvEye) {
+        s_loggedEye = g_dvEye;
+        Log_Printf("Menu: desktop shows the %s eye, frame region %.0f,%.0f %.0fx%.0f", g_dvEye ? "right" : "left", g_dvX,
+            g_dvY, g_dvW, g_dvH);
+    }
+    g_dvActive = true;
+}
+
 void FeedMouseAndKeys(ImGuiIO& io, const Layout& L)
 {
     InputBlockMouse m;
@@ -457,7 +551,13 @@ void FeedMouseAndKeys(ImGuiIO& io, const Layout& L)
     POINT p;
     RECT rc;
     if (GetCursorPos(&p) && ScreenToClient(g_hwnd, &p) && GetClientRect(g_hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
-        const float rx = (p.x * L.bbW / rc.right - L.ox[0]) / L.sx, ry = p.y * L.bbH / rc.bottom - L.oy[0];
+        // Window pixel -> frame pixel. With the desktop view on, the window
+        // shows only the region picked above.
+        const float fx = g_dvActive ? g_dvX + p.x * g_dvW / rc.right : p.x * L.bbW / rc.right;
+        const float fy = g_dvActive ? g_dvY + p.y * g_dvH / rc.bottom : p.y * L.bbH / rc.bottom;
+        // In the eye the desktop shows, so the pointer lands on that eye's copy of the menu.
+        const int eye = g_dvActive ? g_dvEye : 0;
+        const float rx = (fx - L.ox[eye]) / L.sx, ry = fy - L.oy[eye];
         const bool first = g_lastRealX <= -1e8f;
         const bool realMoved = !first && (std::fabs(rx - g_lastRealX) >= 1.0f || std::fabs(ry - g_lastRealY) >= 1.0f);
         // On opening, start where the Windows cursor already is if it is over the menu area.
@@ -676,6 +776,29 @@ void DrawVrTab(AllSettings& s, bool& changed)
         ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.3f, 1), "no headset / OpenXR runtime found last time");
     }
     changed |= ImGui::Checkbox("Start in VR automatically", &s.menu.autoStartVr);
+    // One or the other, never both: the desktop always shows a single eye in VR.
+    // Two checkboxes on one line (label first, as the user laid it out) that
+    // behave as a switch - ticking one unticks the other, and the ticked one
+    // can't be unticked on its own.
+    {
+        bool left = !s.menu.desktopRightEye, right = s.menu.desktopRightEye;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Left Eye Desktop View");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("##desktopLeft", &left)) {
+            s.menu.desktopRightEye = false;
+            changed = true;
+        }
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemSpacing.x * 4.0f);
+        ImGui::TextUnformatted("Right Eye Desktop View");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("##desktopRight", &right)) {
+            s.menu.desktopRightEye = true;
+            changed = true;
+        }
+        HelpMarker("Which eye the game window shows while in VR, so streaming and recording look normal. The "
+                   "headset is not affected.");
+    }
 
     ImGui::BeginDisabled(!vr.sessionRunning);
     if (ImGui::Button("Reset view"))
@@ -1235,6 +1358,9 @@ void Menu_Install(IDirect3DDevice9* device)
         LoadSettings(s);
         ApplySettings(s);
         Log_Printf("Menu: settings loaded from %s", g_iniPath);
+        // Rewrite straight away: drops keys no longer in the list and adds new
+        // ones at their defaults, without waiting for the player to change something.
+        SaveSettings(CaptureSettings());
     } else {
         Log_Printf("Menu: no %s yet - defaults, written on the first change", g_iniPath);
     }
@@ -1365,6 +1491,7 @@ void Menu_OnPresent(IDirect3DDevice9* device)
     const float hintAgeSec = s_hintStartMs ? (nowMs - s_hintStartMs) / 1000.0f : 0.0f;
     constexpr float kHintSec = 10.0f;
     const bool showHint = g_prefs.startupHint && hintAgeSec < kHintSec && !g_open;
+    UpdateDesktopView(device);
     // Every frame until it has one - the title screen is where it shows first.
     CaptureGameCursorOnce();
     if (!g_open && !showHint)

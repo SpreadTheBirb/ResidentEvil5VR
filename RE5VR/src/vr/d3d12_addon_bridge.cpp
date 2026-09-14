@@ -411,3 +411,33 @@ void D3D12AddonBridge_Shutdown()
     g_pIsSlotReady = nullptr;
     g_addonModule = nullptr;
 }
+
+// ---- Desktop view (2026-09-13) --------------------------------------------
+// See RE5VRAddon_SetDesktopView in addon_main.cpp. Looked up on its own,
+// not in TryInit: the desktop view matters from the moment stereo is on,
+// and TryInit only runs once the VR session starts.
+void D3D12AddonBridge_SetDesktopView(bool enabled, int x, int y, int w, int h)
+{
+    using PFN_SetDesktopView = void(__cdecl*)(bool, int, int, int, int);
+    static PFN_SetDesktopView s_fn = nullptr;
+    static ULONGLONG s_lastLookupMs = 0;
+    static bool s_reportedMissing = false;
+    if (!s_fn) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastLookupMs < 2000)
+            return;
+        s_lastLookupMs = now;
+        if (HMODULE addon = GetModuleHandleA("SampleAddon.dll"))
+            s_fn = reinterpret_cast<PFN_SetDesktopView>(GetProcAddress(addon, "RE5VRAddon_SetDesktopView"));
+        if (!s_fn) {
+            if (!s_reportedMissing && enabled) {
+                s_reportedMissing = true;
+                Log_Printf("D3D12AddonBridge: SampleAddon.dll has no RE5VRAddon_SetDesktopView (missing or an older "
+                           "addon) - the desktop keeps showing the side-by-side image");
+            }
+            return;
+        }
+        Log_Printf("D3D12AddonBridge: desktop view control found in SampleAddon.dll");
+    }
+    s_fn(enabled, x, y, w, h);
+}

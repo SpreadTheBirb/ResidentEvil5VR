@@ -77,6 +77,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <atomic>
 #include <cstring>
 
@@ -285,6 +286,170 @@ bool EnsureSharedTextures(ID3D12Resource* pSrcTexture)
     return true;
 }
 
+// ---- Desktop view (2026-09-13) --------------------------------------------
+// In VR the game's frame is both eyes side by side, and that is what the game
+// window showed - no good for streaming or recording. dgVoodoo lets an addon
+// replace the image its presenter puts in the window (PresentBeginContextOutput).
+//
+// First attempt: copy one eye's region into our own texture of that size and
+// hand it over. The docs say the output "may not have the same size", but in
+// practice the presenter still read the ORIGINAL source rect (0,0-1280,720)
+// out of our 640x375 texture: the eye sat unscaled in the top-left corner with
+// junk around it (user screenshot). So the scaling is done here instead, the
+// way dgVoodoo's own sample addon draws: a textured quad into one of the
+// swapchain's "proxy" textures (always swapchain-sized), covering the source
+// rect, sampling just the chosen eye region with a bilinear filter.
+//
+// Which region is decided by d3d9.dll (it knows the per-eye projection and
+// the window's aspect) and pushed every frame through RE5VRAddon_SetDesktopView.
+// Disabled means the presenter's input is left alone.
+std::atomic<bool> g_dvEnabled{ false };
+std::atomic<Int32> g_dvX{ 0 }, g_dvY{ 0 }, g_dvW{ 0 }, g_dvH{ 0 };
+
+ID3D12RootSignature* g_dvRootSig = nullptr;
+ID3DBlob* g_dvVS = nullptr;
+ID3DBlob* g_dvPS = nullptr;
+ID3D12PipelineState* g_dvPSO = nullptr;
+DXGI_FORMAT g_dvPSOFormat = DXGI_FORMAT_UNKNOWN;
+bool g_dvFailed = false; // setup failed once: stay out of the presenter's way for good
+
+// A full-screen triangle from the vertex id alone (no vertex buffer), with the
+// eye region's UV offset and scale in four root constants.
+constexpr const char kDesktopViewVS[] = R"(
+cbuffer Crop : register(b0) { float2 uvOffset; float2 uvScale; };
+struct V2P { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+V2P main(uint id : SV_VertexID)
+{
+    V2P o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.pos = float4(t * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    o.uv = uvOffset + t * uvScale;
+    return o;
+}
+)";
+constexpr const char kDesktopViewPS[] = R"(
+Texture2D<float4> src : register(t0);
+SamplerState bilinear : register(s0);
+struct V2P { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+float4 main(V2P i) : SV_TARGET0
+{
+    return float4(src.Sample(bilinear, i.uv).rgb, 1.0);
+}
+)";
+
+ID3DBlob* CompileDesktopShader(const char* source, size_t length, const char* target)
+{
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = D3DCompile(source, length, "RE5VRDesktopView", nullptr, nullptr, "main", target,
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+    if (FAILED(hr)) {
+        AddonLog_Printf("DesktopView: %s compile failed (hr=0x%08lX) %s", target, hr,
+            errors ? static_cast<const char*>(errors->GetBufferPointer()) : "");
+        if (code)
+            code->Release();
+        code = nullptr;
+    }
+    if (errors)
+        errors->Release();
+    return code;
+}
+
+bool EnsureDesktopPipeline(UInt32 adapterID, DXGI_FORMAT rtvFormat)
+{
+    if (g_dvFailed)
+        return false;
+    if (!g_dvVS) {
+        g_dvVS = CompileDesktopShader(kDesktopViewVS, sizeof(kDesktopViewVS) - 1, "vs_5_0");
+        g_dvPS = CompileDesktopShader(kDesktopViewPS, sizeof(kDesktopViewPS) - 1, "ps_5_0");
+        if (!g_dvVS || !g_dvPS) {
+            g_dvFailed = true;
+            return false;
+        }
+    }
+    if (!g_dvRootSig) {
+        static const D3D12_DESCRIPTOR_RANGE srvRange = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable.NumDescriptorRanges = 1;
+        params[0].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 0;
+        params[1].Constants.RegisterSpace = 0;
+        params[1].Constants.Num32BitValues = 4;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderRegister = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC desc = {};
+        desc.NumParameters = 2;
+        desc.pParameters = params;
+        desc.NumStaticSamplers = 1;
+        desc.pStaticSamplers = &sampler;
+        desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS | D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+            D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+        g_dvRootSig = g_d3d12Root->SerializeAndCreateRootSignature(adapterID, D3D_ROOT_SIGNATURE_VERSION_1, &desc, nullptr);
+        if (!g_dvRootSig) {
+            AddonLog_Printf("DesktopView: root signature creation failed");
+            g_dvFailed = true;
+            return false;
+        }
+    }
+    if (!g_dvPSO || g_dvPSOFormat != rtvFormat) {
+        static const D3D12_BLEND_DESC blend = { FALSE, FALSE,
+            { { FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+                D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, D3D12_COLOR_WRITE_ENABLE_ALL } } };
+        static const D3D12_RASTERIZER_DESC raster = { D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE, FALSE, 0, 0.0f, 0.0f,
+            TRUE, FALSE, FALSE, 0, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF };
+        static const D3D12_DEPTH_STENCIL_DESC depth = { FALSE, D3D12_DEPTH_WRITE_MASK_ZERO, D3D12_COMPARISON_FUNC_ALWAYS, FALSE,
+            0xFF, 0xFF, { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS },
+            { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS } };
+        static D3D12_INPUT_LAYOUT_DESC noInputLayout = { nullptr, 0 };
+        ID3D12Root::GraphicsPLDesc pl = {};
+        pl.pRootSignature = g_dvRootSig;
+        pl.pVS = g_dvVS;
+        pl.pPS = g_dvPS;
+        pl.pBlendState = g_d3d12Root->PLCacheGetBlend4Desc(adapterID, blend);
+        pl.SampleMask = 0xFFFFFFFF;
+        pl.pRasterizerState = g_d3d12Root->PLCacheGetRasterizerDesc(adapterID, raster);
+        pl.pDepthStencilState = g_d3d12Root->PLCacheGetDepthStencilDesc(adapterID, depth);
+        pl.pInputLayout = &noInputLayout;
+        pl.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+        pl.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pl.NumRenderTargets = 1;
+        pl.RTVFormats[0] = rtvFormat;
+        pl.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        pl.SampleDesc.Count = 1;
+        g_dvPSO = g_d3d12Root->PLCacheGetGraphicsPipeline(adapterID, pl);
+        g_dvPSOFormat = rtvFormat;
+        if (!g_dvPSO) {
+            AddonLog_Printf("DesktopView: pipeline creation failed (rtv format %d)", static_cast<int>(rtvFormat));
+            g_dvFailed = true;
+            return false;
+        }
+        AddonLog_Printf("DesktopView: pipeline ready (rtv format %d)", static_cast<int>(rtvFormat));
+    }
+    return true;
+}
+
+void ReleaseDesktopView()
+{
+    // The pipeline comes from dgVoodoo's cache and dies with it. Tell the
+    // cache about our root signature before letting it go, as the sample does.
+    if (g_dvRootSig && g_d3d12Root)
+        g_d3d12Root->GPLRootSignatureReleased(0, g_dvRootSig);
+    if (g_dvRootSig)
+        g_dvRootSig->Release();
+    g_dvRootSig = nullptr;
+    g_dvPSO = nullptr;
+    g_dvPSOFormat = DXGI_FORMAT_UNKNOWN;
+}
+
 class RE5VRAddonObserver : public ID3D12RootObserver
 {
 public:
@@ -299,6 +464,7 @@ public:
     {
         AddonLog_Printf("D3D12RootReleased (pD3D12Root=%p)", pD3D12Root);
         ReleaseSharedTextures();
+        ReleaseDesktopView();
         g_flushFence = nullptr; // dgVoodoo owns it; it dies with the root
         g_d3d12Root = nullptr;
         g_d3d12Device = nullptr;
@@ -339,6 +505,7 @@ public:
     {
         AddonLog_Printf("D3D12EndUsingAdapter (adapterID=%u)", adapterID);
         ReleaseSharedTextures();
+        ReleaseDesktopView();
         g_d3d12Device = nullptr;
     }
 
@@ -373,13 +540,125 @@ public:
 
     bool D3D12SwapchainPresentBegin(UInt32 adapterID, const PresentBeginContextInput& iCtx, PresentBeginContextOutput& oCtx) override
     {
+        CopyForHeadset(adapterID, iCtx);
+        return OverrideDesktopView(adapterID, iCtx, oCtx);
+    }
+
+    // After the headset has its copy: draw one eye, scaled to fill, into a
+    // proxy texture and present that instead of the side-by-side frame.
+    bool OverrideDesktopView(UInt32 adapterID, const PresentBeginContextInput& iCtx, PresentBeginContextOutput& oCtx)
+    {
+        if (!g_dvEnabled.load(std::memory_order_acquire) || !g_d3d12Root || !g_d3d12Device || !iCtx.pSrcTexture ||
+            !iCtx.pSwapchain)
+            return false;
+
+        const LONG frameW = iCtx.srcRect.right - iCtx.srcRect.left;
+        const LONG frameH = iCtx.srcRect.bottom - iCtx.srcRect.top;
+        LONG x = g_dvX.load(std::memory_order_acquire), y = g_dvY.load(std::memory_order_acquire);
+        LONG w = g_dvW.load(std::memory_order_acquire), h = g_dvH.load(std::memory_order_acquire);
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > frameW) w = frameW - x;
+        if (y + h > frameH) h = frameH - y;
+        if (w < 16 || h < 16 || frameW < 16 || frameH < 16)
+            return false;
+
+        // A proxy texture that isn't the incoming one (the source can itself be a proxy).
+        ID3D12Root::SwapchainProxyTextureData proxy = {};
+        bool haveProxy = false;
+        for (UInt32 i = 0; i < 2 && !haveProxy; ++i) {
+            if (g_d3d12Root->GetProxyTexture(iCtx.pSwapchain, i, &proxy) && proxy.pTexture && proxy.pTexture != iCtx.pSrcTexture)
+                haveProxy = true;
+        }
+        if (!haveProxy || !EnsureDesktopPipeline(adapterID, proxy.rtvFormat))
+            return false;
+
+        ID3D12GraphicsCommandListAuto* cmdList = g_d3d12Root->GetGraphicsCommandListAuto(adapterID);
+        ID3D12ResourceDescRingBuffer* ring = g_d3d12Root->GetCBV_SRV_UAV_RingBuffer(adapterID);
+        if (!cmdList || !ring)
+            return false;
+        ID3D12ResourceDescRingBuffer::AllocData srv = {};
+        if (!ring->Alloc(1, cmdList->AGetFence(), cmdList->GetFenceValue(), srv))
+            return false;
+        g_d3d12Device->CopyDescriptorsSimple(1, srv.cpuDescHandle, iCtx.srvCPUHandle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        const D3D12_RESOURCE_DESC srcDesc = iCtx.pSrcTexture->GetDesc();
+        const float texW = static_cast<float>(srcDesc.Width), texH = static_cast<float>(srcDesc.Height);
+        const float crop[4] = { (iCtx.srcRect.left + x) / texW, (iCtx.srcRect.top + y) / texH, w / texW, h / texH };
+
+        cmdList->ChangeId(&g_dvEnabled); // we change the list's state; whoever writes next must reset theirs
+        cmdList->AFlushLock();           // no early return until the unlock below
+        ID3D12GraphicsCommandList* list = cmdList->GetCommandListInterface();
+
+        D3D12_RESOURCE_BARRIER b[2] = {};
+        UINT nb = 0;
+        const bool srcToSrv = (iCtx.srcTextureState & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) == 0;
+        if (srcToSrv) {
+            b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[nb].Transition.pResource = iCtx.pSrcTexture;
+            b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b[nb].Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(iCtx.srcTextureState);
+            b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            ++nb;
+        }
+        if ((proxy.texState & D3D12_RESOURCE_STATE_RENDER_TARGET) == 0) {
+            b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b[nb].Transition.pResource = proxy.pTexture;
+            b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b[nb].Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(proxy.texState);
+            b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            ++nb;
+        }
+        if (nb)
+            list->ResourceBarrier(nb, b);
+
+        list->SetGraphicsRootSignature(g_dvRootSig);
+        list->SetPipelineState(g_dvPSO);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->SetDescriptorHeaps(1, &srv.pHeap);
+        list->SetGraphicsRootDescriptorTable(0, srv.gpuDescHandle);
+        list->SetGraphicsRoot32BitConstants(1, 4, crop, 0);
+        list->OMSetRenderTargets(1, &proxy.rtvHandle, TRUE, nullptr);
+        const RECT dst = iCtx.srcRect; // dgVoodoo presents only this rect of the proxy
+        list->RSSetScissorRects(1, &dst);
+        const D3D12_VIEWPORT vp = { static_cast<FLOAT>(dst.left), static_cast<FLOAT>(dst.top), static_cast<FLOAT>(frameW),
+            static_cast<FLOAT>(frameH), 0.0f, 1.0f };
+        list->RSSetViewports(1, &vp);
+        list->DrawInstanced(3, 1, 0, 0);
+
+        // The source goes back to the state dgVoodoo handed it over in.
+        if (srcToSrv) {
+            b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b[0].Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(iCtx.srcTextureState);
+            list->ResourceBarrier(1, &b[0]);
+        }
+
+        cmdList->AFlushUnlock(); // the presenter carries on writing into the same list
+
+        oCtx.pOutputTexture = proxy.pTexture;
+        oCtx.outputTexSRVCPUHandle = proxy.srvHandle;
+        oCtx.outputTextureExpectedState = static_cast<UINT>(-1); // a proxy: dgVoodoo tracks its state
+
+        static UInt32 s_logged = 0;
+        if (s_logged < 3 || (g_presentBeginCount % kPresentLogInterval) == 0) {
+            ++s_logged;
+            AddonLog_Printf("DesktopView: drew frame region %ld,%ld %ldx%ld scaled into proxy %p (srcRect %ld,%ld-%ld,%ld, "
+                            "proxy state 0x%X, source state 0x%X)",
+                x, y, w, h, proxy.pTexture, iCtx.srcRect.left, iCtx.srcRect.top, iCtx.srcRect.right, iCtx.srcRect.bottom,
+                proxy.texState, iCtx.srcTextureState);
+        }
+        return true;
+    }
+
+    void CopyForHeadset(UInt32 adapterID, const PresentBeginContextInput& iCtx)
+    {
         ++g_presentBeginCount;
         const bool verboseLog = (g_presentBeginCount <= 5 || (g_presentBeginCount % kPresentLogInterval) == 0);
 
         if (!g_d3d12Root || !g_d3d12Device || !iCtx.pSrcTexture) {
             if (verboseLog)
                 AddonLog_Printf("D3D12SwapchainPresentBegin #%u: missing root/device/srcTexture, skipping copy", g_presentBeginCount);
-            return false;
+            return;
         }
 
         // 2026-09-10: throttle the producer instead of copying on every
@@ -406,12 +685,12 @@ public:
         if (s_lastCopyTime.QuadPart != 0) {
             const double elapsedMs = static_cast<double>(now.QuadPart - s_lastCopyTime.QuadPart) * 1000.0 / static_cast<double>(s_qpcFreq.QuadPart);
             if (elapsedMs < kTargetIntervalMs)
-                return false;
+                return;
         }
         s_lastCopyTime = now;
 
         if (!EnsureSharedTextures(iCtx.pSrcTexture))
-            return false;
+            return;
 
         // Write into whichever slot ISN'T currently published as front,
         // so the consumer never reads a slot we're mid-write into.
@@ -437,14 +716,14 @@ public:
                 AddonLog_Printf("D3D12SwapchainPresentBegin #%u: slot=%d has an active reader, skipping this frame's copy (skip #%u)",
                     g_presentBeginCount, backSlot, s_skipCount);
             }
-            return false;
+            return;
         }
 
         ID3D12GraphicsCommandListAuto* cmdList = g_d3d12Root->GetGraphicsCommandListAuto(adapterID);
         if (!cmdList) {
             if (verboseLog)
                 AddonLog_Printf("D3D12SwapchainPresentBegin #%u: GetGraphicsCommandListAuto failed", g_presentBeginCount);
-            return false;
+            return;
         }
         ID3D12GraphicsCommandList* list = cmdList->GetCommandListInterface();
 
@@ -538,7 +817,6 @@ public:
                 g_frameWidth, g_frameHeight, static_cast<int>(g_frameFormat));
         }
 
-        return false; // no presentation-input override - just observing/copying
     }
 
     void D3D12SwapchainPresentEnd(UInt32 adapterID, const PresentEndContextInput& iCtx) override
@@ -612,6 +890,18 @@ bool API_EXPORT RE5VRAddon_IsSlotReady(Int32 slot)
         return false; // nothing published into this slot yet
 
     return g_flushFence->GetCompletedValue() >= required;
+}
+
+// d3d9.dll, every frame at Present: show this region of the game's frame in
+// the window instead of the whole frame (enabled), or leave it alone. See
+// "Desktop view" above.
+void API_EXPORT RE5VRAddon_SetDesktopView(bool enabled, Int32 x, Int32 y, Int32 w, Int32 h)
+{
+    g_dvX.store(x, std::memory_order_release);
+    g_dvY.store(y, std::memory_order_release);
+    g_dvW.store(w, std::memory_order_release);
+    g_dvH.store(h, std::memory_order_release);
+    g_dvEnabled.store(enabled, std::memory_order_release);
 }
 
 bool API_EXPORT AddOnInit(IAddonMainCallback* pAddonMainCB)
