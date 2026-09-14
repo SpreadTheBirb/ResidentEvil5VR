@@ -1,16 +1,16 @@
 # Resident Evil 5 VR
 
 A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
-DirectX 9 build), driven through OpenXR — and a true first-person mode that
+DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
 > **Status:** v0.4.0, working and playable, still under active development.
-> There are no hotkeys: everything is in the in-game menu — press **Insert**,
+> There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
 Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steering Claude on my end. This was one of my favorite games to play growing up and I want to experience it in VR. I've tried to make sure that all of the first person features translate to flat screen as well, so it's totally playable in first person, with no weird camera pop out as others have done in the past. My plan is to get 6dof working, or at a minimum 3dof. This hasn't been tested online. For everyone to also be aware out the gate, my solution of using dgVoodoo2 to convert RE5 from d3d9 to d3d12 has some potential risks. I discovered that it existed through the recent DLSS5 modders, and it can flag as potential malware/trojan through your antivirus. Per the author, and various other users as I've read around, this is a false positive..but I'm throwing this out there so that it's clear from the gate. 
 
-> **Update (v0.4.0):** the HUD now works in VR — ammo, health, the inventory
+> **Update (v0.4.0):** the HUD now works in VR. Ammo, health, the inventory
 > and the pause screen all show on a panel in front of you.
 
 ---
@@ -30,7 +30,7 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 
 ## Getting the mod
 
-Grab the newest **[Release](../../releases)** — it contains the built DLLs and
+Grab the newest **[Release](../../releases)**. It contains the built DLLs and
 everything needed to run, so there is nothing to compile. You do **not** need
 to clone this repository to play.
 
@@ -45,7 +45,7 @@ to clone this repository to play.
 
 **Strongly recommended, with or without VR.** RE5 is 32-bit and capped at 2 GB
 of address space no matter how much memory or VRAM you have. Raising that cap
-to 4 GB made stutters disappear outright — on a 5090 flat screen, and on a
+to 4 GB made stutters disappear outright, on a 5090 flat screen, and on a
 laptop in VR. It is not extra VRAM; it is headroom the game runs out of long
 before your graphics card does.
 
@@ -67,7 +67,7 @@ tells you whether it's applied.
 gone too). No game files or saves are modified.
 
 **Updating from an older version:** overwrite the files. The old hotkeys are
-gone — everything they did is in the menu.
+gone; everything they did is in the menu.
 
 ---
 
@@ -84,8 +84,8 @@ folder, so they come back next time you play.
 | **Click both sticks in** | Open / close (controller) |
 | **Hold both sticks in for 1 second** | Reset the VR view (without opening the menu) |
 
-While the menu is open the game doesn't see any of your input — no stray
-shots, no camera spinning, no pausing — and a button still held as you close
+While the menu is open the game doesn't see any of your input (no stray
+shots, no camera spinning, no pausing), and a button still held as you close
 it stays ignored until you let go.
 
 ### Controls
@@ -127,24 +127,24 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 
 | Option | What it does |
 |---|---|
-| **Head prediction** | 0–60 ms. Pushes the view ahead while you turn, to hide pipeline and streaming delay. Leave at 0 unless turning feels behind you, then try 15–25. |
-| **Head rotation gain** | 1.0 is 1:1 with your neck. Anything else overshoots when you stop — most people should leave it. |
+| **Head prediction** | 0 to 60 ms. Pushes the view ahead while you turn, to hide pipeline and streaming delay. Leave at 0 unless turning feels behind you, then try 15 to 25. |
+| **Head rotation gain** | 1.0 is 1:1 with your neck. Anything else overshoots when you stop, so most people should leave it. |
 | **Extra FOV** | Widens the rendered field of view beyond the headset's own. |
 | **Match culling to the headset's FOV** | Tells the game to draw everything the headset can see. Off, things at the edge of your view vanish. |
 | **Mono post-processing** | The light-leak fix: draws bloom and light shafts once instead of per eye. |
 
 ### Status tab
 
-Live values, useful for troubleshooting — **screenshot this page when
+Live values, useful for troubleshooting. **Screenshot this page when
 reporting a problem** (see [Reporting a problem](#reporting-a-problem)):
 
-- **Mod** — release or developer build, VR or flatscreen install, address
+- **Mod:** release or developer build, VR or flatscreen install, address
   space used, whether the **4GB patch** is applied
-- **Rendering** — game frame rate, backbuffer size, stereo on/off and the
+- **Rendering:** game frame rate, backbuffer size, stereo on/off and the
   resolution each eye actually gets, HUD recognition
-- **VR** — runtime, headset, the per-eye resolution the runtime wants versus
+- **VR:** runtime, headset, the per-eye resolution the runtime wants versus
   what's sent, headset refresh rate, frames submitted per second, image age
-- **Camera** — first person on/off, which character you're playing, camera
+- **Camera:** first person on/off, which character you're playing, camera
   hook activity, head-visibility counters
 
 ### Menu tab
@@ -156,45 +156,45 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
 
 ## Features
 
-### First person — VR and flat screen
+### First person, in VR and on a flat screen
 
-- **True first person** — the camera sits in Chris's head throughout
+- **True first person:** the camera sits in Chris's head throughout
   gameplay, including the unarmed intro.
-- **Full look range, no pop-out** — look straight up or down without the
+- **Full look range, no pop-out:** look straight up or down without the
   camera snapping back to third person.
-- **Only the head is hidden** — Chris's body and hands stay visible, so you
+- **Only the head is hidden:** Chris's body and hands stay visible, so you
   see your own arms and gun.
-- **Head comes back for action cameras** — kicks, vaults and grabs don't
+- **Head comes back for action cameras:** kicks, vaults and grabs don't
   leave a headless Chris on screen.
-- **No near-camera fade** — Chris, Sheva and NPCs stay solid up close instead
+- **No near-camera fade:** Chris, Sheva and NPCs stay solid up close instead
   of dissolving.
-- **Walk while aiming** — something RE5 never allowed. Keep moving with your
+- **Walk while aiming:** something RE5 never allowed. Keep moving with your
   weapon up, on WASD or a controller's left stick (analog).
 - **Laser sight always on**, including with mouse aiming.
 - **Colour filter removed** by default.
 
 ### VR
 
-- **Native stereoscopic VR through OpenXR** — each eye rendered with its own
+- **Native stereoscopic VR through OpenXR:** each eye rendered with its own
   camera, real head tracking and the headset's actual per-eye lens FOV,
   delivered at the headset's full refresh rate.
-- **HUD in VR** — ammo, health, the inventory, the pause screen and most menus
+- **HUD in VR:** ammo, health, the inventory, the pause screen and most menus
   on a panel in front of you, at a distance you choose.
-- **Head tracking turns the game camera** — nothing disappears over your
+- **Head tracking turns the game camera:** nothing disappears over your
   shoulder, and it steps aside the moment you aim.
-- **Calibrated world scale** — measured from first person, adjustable in the
+- **Calibrated world scale:** measured from first person, adjustable in the
   menu.
-- **VR culling fixes** — the game draws everything the headset can see,
+- **VR culling fixes:** the game draws everything the headset can see,
   including the ground at your feet and your partner's legs.
-- **Reset view** — from the menu, or hold both sticks in for a second.
-- **No light leaks** — post-processing is drawn once rather than split per eye.
+- **Reset view:** from the menu, or hold both sticks in for a second.
+- **No light leaks:** post-processing is drawn once rather than split per eye.
 
 ### Quality of life
 
 - **In-game menu** with saved settings, working with mouse, keyboard or
   controller, on the monitor or in the headset.
 - **Live Status page**, including a 4GB-patch check.
-- **Drop-in install** — no game files are modified; delete the files to
+- **Drop-in install:** no game files are modified; delete the files to
   uninstall.
 
 ---
@@ -223,7 +223,7 @@ A controller is recommended over mouse and keyboard.
 
 - **VR renders the scene twice**, once per eye, so it costs about double a
   flat-screen frame. If your frame rate is low, lower the game's own
-  resolution first — that is by far the biggest lever, and it beats any
+  resolution first. That is by far the biggest lever, and it beats any
   headset-side render scale. If you have headroom, raise it.
 - **Stutter is a separate problem** from frame rate, and the 4GB patch is the
   fix for it.
@@ -251,15 +251,15 @@ A controller is recommended over mouse and keyboard.
 
 Please include these with any bug report or issue:
 
-1. **A screenshot of the menu's Status tab** — open the menu (Insert, or click
+1. **A screenshot of the menu's Status tab.** Open the menu (Insert, or click
    both sticks), switch to **Status**, and screenshot it, ideally while the
    problem is happening. It shows your frame rate, resolution per eye,
    headset and runtime, refresh rate, whether the 4GB patch is applied, and
    more, in one picture.
 2. **The log files** from the game folder
    (`...\Steam\steamapps\common\Resident Evil 5\`):
-   - `re5vr.log` — always
-   - `re5vr_addon.log` — as well, if you were playing in VR
+   - `re5vr.log`: always
+   - `re5vr_addon.log`: as well, if you were playing in VR
 
    `re5vr.log` is **replaced every time the game starts**, so copy it before
    launching again, or the session with the problem is gone.
@@ -272,7 +272,7 @@ download you're using.
 ## Next up
 
 - **Full resolution per eye** instead of half the game's frame.
-- **A VR view on the desktop** — a proper single-eye mirror, so streaming and
+- **A VR view on the desktop:** a proper single-eye mirror, so streaming and
   recording show something watchable.
 - Keeping the camera inside Chris during actions.
 - Motion controllers with arm IK.
@@ -290,8 +290,8 @@ per-eye camera and scissor rectangle. HUD draws are recognised by their shader
 bytecode and drawn once per eye onto a panel at a fixed convergence.
 
 The menu is Dear ImGui drawn over the game's own D3D9 device. While it is open,
-the game's input is hidden at every route RE5 uses — DirectInput keyboard and
-mouse, XInput, the Windows cursor and key state, and its message pump — with
+the game's input is hidden at every route RE5 uses (DirectInput keyboard and
+mouse, XInput, the Windows cursor and key state, and its message pump), with
 the Win32 routes blocked only for calls made from the game's own code.
 
 ## Repository layout
@@ -322,7 +322,7 @@ dgVoodoo2 and cannot be changed.
 ## Building from source
 
 Requires Visual Studio with the C++ desktop workload and the Windows SDK. Build
-both projects as **Release | Win32** — the game is 32-bit, so a 64-bit build
+both projects as **Release | Win32**. The game is 32-bit, so a 64-bit build
 will not load.
 
 `RE5VR/src/util/build_config.h` has one switch, `RE5VR_DIAGNOSTICS`. Leave it
