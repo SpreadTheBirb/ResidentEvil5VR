@@ -202,9 +202,15 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
 ## Playing in VR
 
 1. **Use SteamVR or Virtual Desktop as your OpenXR runtime.** Meta's own runtime closes the game
-   the moment VR starts. Same headset, same Link cable, works fine under
-   SteamVR: *SteamVR → Settings → OpenXR → Set SteamVR as OpenXR Runtime*.
-2. Start SteamVR and put the headset on.
+   the moment VR starts. The same headset works fine through either of the
+   other two:
+   - **SteamVR** (Link cable, Air Link, or a PC headset): *SteamVR → Settings
+     → OpenXR → Set SteamVR as OpenXR Runtime*.
+   - **Virtual Desktop** (wireless Quest): in the headset's Virtual Desktop
+     app, set *Settings → Streaming → OpenXR Runtime* to **VDXR**. Virtual
+     Desktop registers it as the active runtime while the streamer is
+     connected.
+2. Start SteamVR, or connect Virtual Desktop, and put the headset on.
 3. Launch the game, open the menu and tick **Enable VR** on the VR tab (or
    tick **Start in VR automatically** once and never think about it again).
 4. Turn on **First person camera** on the Camera tab.
