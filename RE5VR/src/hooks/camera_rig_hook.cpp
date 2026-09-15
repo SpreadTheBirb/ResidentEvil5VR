@@ -8,6 +8,7 @@
 
 #include <MinHook.h>
 #include <windows.h>
+#include <intrin.h>
 #include <Xinput.h>
 
 #include <atomic>
@@ -537,9 +538,77 @@ constexpr float kVrCullVerticalFovDeg = 150.0f; // fallback only, see VrCullVert
 // headset already tells us its exact per-eye angles every frame; the right
 // answer is "everything the wearer can physically see, plus a margin", which
 // is far narrower than 150 and never too narrow.
-constexpr float kVrCullFovMargin = 1.15f;
+// A player option since 2026-09-14: a tester's clip showed things popping in
+// when looking over the shoulder. More margin draws them before they reach
+// the edge of your view, at the cost of LOD and draw calls (see above).
+std::atomic<float> g_vrCullMarginPct{ 15.0f };
+constexpr float kVrCullMarginMaxPct = 100.0f;
 constexpr float kVrCullFovMinDeg = 90.0f;
-constexpr float kVrCullFovMaxDeg = 170.0f;
+// 178, not 170 (2026-09-15): the tester's +60% on a Quest 3 already reached
+// 158 and still asked for more ("80% or even higher"). 180 is a flat plane
+// and can't be a frustum; 178 is as close as it's sensible to go.
+constexpr float kVrCullFovMaxDeg = 178.0f;
+// What VrCullVerticalFov returns with the head still (no turn widening), for
+// the menu. 0 until VR has run it.
+std::atomic<float> g_vrCullFovDegShown{ 0.0f };
+
+// Widen while turning (2026-09-15). With head tracking the cone already turns
+// with the head (the tester's log: head 148 deg, camera 149 deg), but the game
+// picks what to draw from where its camera pointed a moment earlier, so on a
+// fast turn your view runs ahead of the cone and meets its edge - worst on a
+// hard look behind, the fastest turn there is. Rather than a huge margin all
+// the time (lower detail everywhere), add the angle the head covers in this
+// much time at its current turn speed, on every side, and ease back after the
+// turn. Only the culling angle changes; where the camera points and the
+// headset image do not.
+std::atomic<float> g_vrCullTurnLookaheadMs{ 0.0f }; // off since the view split fixed culling at its root
+constexpr float kVrCullTurnLookaheadMaxMs = 300.0f;
+constexpr float kTurnSpeedReleaseSec = 0.35f; // how long the widening takes to fade after a turn
+constexpr float kTurnGapMaxDeg = 60.0f;
+
+// Head turn speed in deg/sec from the pose latched each frame: rises at once,
+// fades over kTurnSpeedReleaseSec, since the camera is still catching up for a
+// moment after the head stops.
+float HeadTurnSpeedEnvelope()
+{
+    static float s_prev[3] = { 0.0f, 0.0f, 1.0f };
+    static bool s_havePrev = false;
+    static LARGE_INTEGER s_prevTime = {};
+    static float s_envelope = 0.0f;
+    static LARGE_INTEGER s_freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+
+    float fwd[3];
+    if (!StereoTest_GetLatchedHeadForward(fwd)) {
+        s_havePrev = false;
+        s_envelope = 0.0f;
+        return 0.0f;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const float dt = s_havePrev
+        ? static_cast<float>(now.QuadPart - s_prevTime.QuadPart) / static_cast<float>(s_freq.QuadPart)
+        : 0.0f;
+    // The latched pose only changes once a frame while this runs several
+    // times a frame; let a few milliseconds pass between samples.
+    if (s_havePrev && dt < 0.004f)
+        return s_envelope;
+    if (s_havePrev && dt > 0.0f) {
+        const float len = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        const float plen = std::sqrt(s_prev[0] * s_prev[0] + s_prev[1] * s_prev[1] + s_prev[2] * s_prev[2]);
+        float cosA = len > 1e-4f && plen > 1e-4f
+            ? (fwd[0] * s_prev[0] + fwd[1] * s_prev[1] + fwd[2] * s_prev[2]) / (len * plen)
+            : 1.0f;
+        cosA = std::fmax(-1.0f, std::fmin(1.0f, cosA));
+        // A long gap is a pause (menu, loading), not a turn.
+        const float speed = dt < 0.25f ? std::acos(cosA) * 180.0f / kPi / dt : 0.0f;
+        const float decayed = s_envelope * std::exp(-dt / kTurnSpeedReleaseSec);
+        s_envelope = std::fmax(speed, decayed);
+    }
+    std::memcpy(s_prev, fwd, sizeof(s_prev));
+    s_prevTime = now;
+    s_havePrev = true;
+    return s_envelope;
+}
 
 float VrCullVerticalFov()
 {
@@ -564,18 +633,51 @@ float VrCullVerticalFov()
     const float horizontal = left + right;
     const float verticalForHorizontal = 2.0f * std::atan(std::tan(horizontal * 0.5f) / aspect);
 
-    float deg = std::fmax(vertical, verticalForHorizontal) * 180.0f / kPi * kVrCullFovMargin;
-    if (deg < kVrCullFovMinDeg)
-        deg = kVrCullFovMinDeg;
-    if (deg > kVrCullFovMaxDeg)
-        deg = kVrCullFovMaxDeg;
+    const float margin = 1.0f + g_vrCullMarginPct.load(std::memory_order_relaxed) / 100.0f;
+    const auto clampFov = [](float d) { return std::fmax(kVrCullFovMinDeg, std::fmin(kVrCullFovMaxDeg, d)); };
+    const float baseDeg = clampFov(std::fmax(vertical, verticalForHorizontal) * 180.0f / kPi * margin);
+    g_vrCullFovDegShown.store(baseDeg, std::memory_order_relaxed);
+
+    // The same, with the angle the head covers during the lookahead added on
+    // every side of the headset's view.
+    const float turnSpeed = HeadTurnSpeedEnvelope();
+    const float gapDeg = std::fmin(kTurnGapMaxDeg,
+        turnSpeed * g_vrCullTurnLookaheadMs.load(std::memory_order_relaxed) / 1000.0f);
+    float deg = baseDeg;
+    if (gapDeg > 0.5f) {
+        const float gap = gapDeg * kPi / 180.0f;
+        const float halfH = std::fmin(horizontal * 0.5f + gap, 89.0f * kPi / 180.0f);
+        const float verticalTurning = vertical + 2.0f * gap;
+        const float verticalForHorizontalTurning = 2.0f * std::atan(std::tan(halfH) / aspect);
+        deg = std::fmax(baseDeg,
+            clampFov(std::fmax(verticalTurning, verticalForHorizontalTurning) * 180.0f / kPi * margin));
+    }
+
+    // How far turning widened it, summarised every few seconds rather than
+    // logged on every change.
+    static float s_windowMaxDeg = 0.0f, s_windowMaxSpeed = 0.0f;
+    static ULONGLONG s_windowStartMs = 0;
+    s_windowMaxDeg = std::fmax(s_windowMaxDeg, deg - baseDeg);
+    s_windowMaxSpeed = std::fmax(s_windowMaxSpeed, turnSpeed);
+    const ULONGLONG nowMs = GetTickCount64();
+    if (!s_windowStartMs)
+        s_windowStartMs = nowMs;
+    if (nowMs - s_windowStartMs >= 3000) {
+        if (s_windowMaxDeg >= 1.0f)
+            Log_Printf("CameraRigHook: culling widened while turning - up to +%.0f deg (fastest turn %.0f deg/sec, "
+                       "lookahead %.0f ms)",
+                s_windowMaxDeg, s_windowMaxSpeed, g_vrCullTurnLookaheadMs.load(std::memory_order_relaxed));
+        s_windowStartMs = nowMs;
+        s_windowMaxDeg = 0.0f;
+        s_windowMaxSpeed = 0.0f;
+    }
 
     static float s_lastLogged = 0.0f;
-    if (std::fabs(deg - s_lastLogged) > 1.0f) {
-        s_lastLogged = deg;
+    if (std::fabs(baseDeg - s_lastLogged) > 1.0f) {
+        s_lastLogged = baseDeg;
         Log_Printf("CameraRigHook: VR culling FOV from the headset - %.0f deg vertical (headset %.0f v / %.0f h, "
                    "+%.0f%% margin)",
-            deg, vertical * 180.0f / kPi, horizontal * 180.0f / kPi, (kVrCullFovMargin - 1.0f) * 100.0f);
+            baseDeg, vertical * 180.0f / kPi, horizontal * 180.0f / kPi, (margin - 1.0f) * 100.0f);
     }
     return deg;
 }
@@ -650,22 +752,82 @@ void PublishHeadForward(const float rotationDelta[9])
 // Turns a rig direction (pitch only, in rig space) by the head rotation.
 // The rig's own basis is forward = (0, dy, dz), up = (0, dz, -dy) and
 // right = (1, 0, 0); the head's forward arrives in exactly those terms.
-void ApplyHeadFollow(float* dx, float* dy, float* dz)
+// The directions head-follow last wrote, in world space - see
+// CameraRigHook_GetHeadFollowTargets. Double-buffered like the head forward.
+HeadFollowTargets g_hfTargets[2] = {};
+std::atomic<int> g_hfTargetsFront{ -1 };
+std::atomic<unsigned long long> g_hfTargetsMs{ 0 };
+
+// The last few published updates, newest at g_hfHistoryHead - see
+// CameraRigHook_MatchHeadFollowTargets. Guarded by a lock: written a few dozen
+// times a second, read once a frame.
+constexpr int kHfHistory = 8;
+HeadFollowTargets g_hfHistory[kHfHistory] = {};
+int g_hfHistoryHead = -1;
+int g_hfHistoryCount = 0;
+SRWLOCK g_hfHistoryLock = SRWLOCK_INIT;
+
+// ---- Aim-view test (2026-09-15) - see CameraRigHook_SetAimViewTest ------
+// The view split (v0.4.2): the head turns only what is drawn and culled - see
+// GetViewMatrixHook - and never the game's own camera, which aiming and
+// walking follow. Found 2026-09-15: turning the game camera (or either stage
+// of the main camera's copy of it, +0x170/+0x190 or +0x30/+0x50) turned the gun
+// with it, and made Chris turn toward where you looked whenever you pressed aim.
+// Off only for comparison (developer).
+std::atomic<bool> g_aimViewTest{ true };
+// Published by the rigs-ready hook while aiming: each aim rig's world
+// direction as the game has it (gunDir) and as head-follow would turn it
+// (viewDir). The main-camera hook maps whichever the camera is on.
+struct AimViewTargets {
+    float gunDir[3][3];
+    float viewDir[3][3];
+};
+AimViewTargets g_aimView[2] = {};
+std::atomic<int> g_aimViewFront{ -1 };
+std::atomic<unsigned long long> g_aimViewMs{ 0 };
+std::atomic<unsigned long long> g_aimViewApplied{ 0 };
+std::atomic<unsigned long long> g_aimViewSkipped{ 0 };
+
+// Rig-space direction to world through one of the controller's transforms
+// (rotation only).
+void RigDirToWorld(const unsigned char* controller, DWORD transformOff, float dx, float dy, float dz, float out[3])
 {
-    // Take the head direction from the pose LATCHED for this frame - the very
-    // same one the eye matrices use. Reading the live published pose here
-    // instead (which is what this did until 2026-09-12) meant the camera was
-    // steered by a fresher snapshot than the image was rendered with: at
-    // moderate speed the view dragged behind, and on a fast turn it overshot
-    // and snapped back as the two reconverged. One pose per frame, everywhere;
-    // the remaining age is what the compositor's reprojection is for, and it
-    // is told exactly which pose the frame used.
-    float latched[3];
-    const bool haveLatched = StereoTest_GetLatchedHeadForward(latched);
-    const int front = g_headForwardFront.load(std::memory_order_acquire);
-    const float fx = haveLatched ? latched[0] : g_headForward[front][0];
-    const float fy = haveLatched ? latched[1] : g_headForward[front][1];
-    const float fz = haveLatched ? latched[2] : g_headForward[front][2];
+    const float* m = reinterpret_cast<const float*>(controller + transformOff);
+    for (int i = 0; i < 3; ++i)
+        out[i] = dx * m[i] + dy * m[4 + i] + dz * m[8 + i];
+}
+
+// Picture turning mode 3 ("double, culling fixed", 2026-09-15): the game
+// camera is turned by TWICE the head's yaw and pitch, so the cone it culls
+// with points where v0.4.1's picture points - see g_pictureTurnMode in
+// stereo_test.cpp. Pitch is held short of straight up/down, where the game's
+// look-at has no defined sideways axis.
+void DoubleHeadAim(const float f[3], float out[3])
+{
+    const float len = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (len < 1e-4f) {
+        std::memcpy(out, f, 3 * sizeof(float));
+        return;
+    }
+    const float yaw = std::atan2(f[0], f[2]);
+    float s = f[1] / len;
+    s = s < -1.0f ? -1.0f : (s > 1.0f ? 1.0f : s);
+    const float pitch = std::asin(s);
+    const float kMaxPitch = 80.0f * kPi / 180.0f;
+    const float yaw2 = 2.0f * yaw;
+    float pitch2 = 2.0f * pitch;
+    pitch2 = pitch2 < -kMaxPitch ? -kMaxPitch : (pitch2 > kMaxPitch ? kMaxPitch : pitch2);
+    out[0] = std::cos(pitch2) * std::sin(yaw2);
+    out[1] = std::sin(pitch2);
+    out[2] = std::cos(pitch2) * std::cos(yaw2);
+}
+
+// Turns a rig direction by the head forward f - sampled ONCE per camera
+// update by the caller (see the snapshot in OnRigsReady), so all six rigs
+// agree.
+void ApplyHeadFollow(const float f[3], float* dx, float* dy, float* dz)
+{
+    const float fx = f[0], fy = f[1], fz = f[2];
     const float rigDy = *dy, rigDz = *dz;
     // Negated 2026-09-12: tested in the headset, looking left swung the game
     // camera right and vice versa. The rig's sideways axis runs opposite to
@@ -1915,6 +2077,28 @@ void AimWalk(unsigned char* controller)
     if (fl < 1e-3f || rl < 1e-3f)
         return;
     fx /= fl; fz /= fl; rx /= rl; rz /= rl;
+    // View-only (2026-09-15): the drawn camera follows the head, so walking
+    // "forward" while aiming went where you looked. The user wants walking to
+    // always follow Chris' body forward - the game camera - aiming or not. Walk relative to the
+    // game camera - the gun's direction - instead: turn both drawn axes by the
+    // yaw from the drawn forward to the controller's own eye->target
+    // (+0x170 -> +0x190), which needs no knowledge of the world's handedness.
+    if (g_aimViewTest.load(std::memory_order_relaxed)) {
+        float eye[3], target[3];
+        if (TryRead(eye, controller + 0x170, sizeof(eye)) && TryRead(target, controller + 0x190, sizeof(target))) {
+            float gx = target[0] - eye[0], gz = target[2] - eye[2];
+            const float gl = std::sqrt(gx * gx + gz * gz);
+            if (gl > 1e-3f) {
+                gx /= gl;
+                gz /= gl;
+                const float c = fx * gx + fz * gz;
+                const float s = fx * gz - fz * gx;
+                const float nfx = c * fx - s * fz, nfz = s * fx + c * fz;
+                const float nrx = c * rx - s * rz, nrz = s * rx + c * rz;
+                fx = nfx; fz = nfz; rx = nrx; rz = nrz;
+            }
+        }
+    }
     float dx = forward * fx + strafe * rx;
     float dz = forward * fz + strafe * rz;
     const float dl = std::sqrt(dx * dx + dz * dz);
@@ -2145,11 +2329,67 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
     // g_headFollowDriving was overwritten by whichever controller ran last.
     // Not yet proven to be the jitter; wrong regardless.
     const bool isPlayer = IsPlayerController(controller);
-    if (vrActive && isPlayer && g_headFollow.load(std::memory_order_relaxed))
-        MeasureHeadFollowLag();
-    const bool headFollow = vrActive && isPlayer && !aiming && g_headFollow.load(std::memory_order_relaxed);
+
+    // View split (2026-09-15): the head never touches the game's rigs.
+    // The renderer and culling get the head view at GetViewMatrix instead, so
+    // the game camera - and aiming, which faces it - stays the game's own.
+    // Steering the rigs with the head made Chris turn toward where you looked
+    // every time you pressed aim, and the game camera glide between head and
+    // gun at every aim start and stop.
+    const bool headWanted = vrActive && isPlayer && g_headFollow.load(std::memory_order_relaxed);
+    const bool aimViewTest = headWanted && g_aimViewTest.load(std::memory_order_relaxed);
+    const bool headFollow = headWanted && !aiming && !aimViewTest;
     if (isPlayer)
         g_headFollowDriving.store(headFollow, std::memory_order_release);
+    const int hfBack = 1 - (g_hfTargetsFront.load(std::memory_order_relaxed) == 1 ? 1 : 0);
+    HeadFollowTargets& hf = g_hfTargets[hfBack];
+    const int avBack = 1 - (g_aimViewFront.load(std::memory_order_relaxed) == 1 ? 1 : 0);
+    AimViewTargets& av = g_aimView[avBack];
+    if (headFollow || aimViewTest) {
+        // Which head pose steers the camera this update.
+        //  - Double (v0.4.1): the pose LATCHED for this frame - the same one
+        //    the eye matrices add on top. Reading the live pose there made a
+        //    fast turn overshoot and snap back (2026-09-12): two snapshots of
+        //    one head, moments apart, reconverging.
+        //  - Game camera only (2026-09-15): the camera is the only thing that
+        //    turns, so there is nothing to disagree with - take the NEWEST
+        //    pose, and tag the frame with its id at Present so the compositor
+        //    corrects from the pose the camera really used. The latched pose
+        //    is taken at the previous Present, and the game updates its camera
+        //    on its own schedule, so steering from it and tagging with the
+        //    next latch plausibly made every frame claim to be newer than it
+        //    was - the "unresponsive" the user felt.
+        bool haveHead = false;
+        if (StereoTest_GetPictureTurnMode() == 1) {
+            for (int attempt = 0; attempt < 2 && !haveHead; ++attempt) {
+                const unsigned long long idBefore = VRBridge_GetCurrentPoseId();
+                XRBridgeEyeView l, r;
+                if (VRBridge_GetEyeViews(l, r) && VRBridge_GetCurrentPoseId() == idBefore && idBefore != 0) {
+                    hf.headForward[0] = l.rotationDelta[6];
+                    hf.headForward[1] = l.rotationDelta[7];
+                    hf.headForward[2] = l.rotationDelta[8];
+                    hf.poseId = idBefore;
+                    haveHead = true;
+                }
+            }
+        }
+        if (!haveHead) {
+            float latched[3];
+            if (StereoTest_GetLatchedHeadForward(latched)) {
+                std::memcpy(hf.headForward, latched, sizeof(latched));
+                hf.poseId = StereoTest_GetLatchedPoseId();
+            } else {
+                const int front = g_headForwardFront.load(std::memory_order_acquire);
+                std::memcpy(hf.headForward, g_headForward[front], sizeof(hf.headForward));
+                hf.poseId = 0;
+            }
+        }
+        if (StereoTest_GetPictureTurnMode() == 3)
+            DoubleHeadAim(hf.headForward, hf.cameraForward);
+        else
+            std::memcpy(hf.cameraForward, hf.headForward, sizeof(hf.cameraForward));
+
+    }
     for (int i = 0; i < 3; ++i) {
         unsigned char* normalRig = controller + kOffNormalRigs + i * kRigStride;
         float baseDy = 0.0f, baseDz = 1.0f;
@@ -2162,16 +2402,287 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
         }
 
         float nx = 0.0f, ny = baseDy, nz = baseDz;
-        if (headFollow)
-            ApplyHeadFollow(&nx, &ny, &nz);
+        if (headFollow) {
+            ApplyHeadFollow(hf.cameraForward, &nx, &ny, &nz);
+            RigDirToWorld(controller, kOffNormalTransform, nx, ny, nz, hf.worldDir[i]);
+        } else if (aimViewTest) {
+            float vx = nx, vy = ny, vz = nz;
+            ApplyHeadFollow(hf.cameraForward, &vx, &vy, &vz);
+            RigDirToWorld(controller, kOffNormalTransform, vx, vy, vz, hf.worldDir[i]);
+        }
         PlaceRigAtEye(normalRig, eyeNormal, nx, ny, nz, fov);
 
         float ax = 0.0f;
         float ay = aimOk[i] ? aimDy[i] : baseDy;
         float az = aimOk[i] ? aimDz[i] : baseDz;
-        if (headFollow)
-            ApplyHeadFollow(&ax, &ay, &az);
+        if (headFollow) {
+            ApplyHeadFollow(hf.cameraForward, &ax, &ay, &az);
+            RigDirToWorld(controller, kOffAimTransform, ax, ay, az, hf.worldDir[3 + i]);
+        } else if (aimViewTest) {
+            // The rigs keep the gun's direction; only record where the view
+            // would point, for the main-camera hook and stereo_test's match.
+            float vx = ax, vy = ay, vz = az;
+            ApplyHeadFollow(hf.cameraForward, &vx, &vy, &vz);
+            RigDirToWorld(controller, kOffAimTransform, ax, ay, az, av.gunDir[i]);
+            RigDirToWorld(controller, kOffAimTransform, vx, vy, vz, av.viewDir[i]);
+            std::memcpy(hf.worldDir[3 + i], av.viewDir[i], sizeof(av.viewDir[i]));
+        }
         PlaceRigAtEye(controller + kOffAimRigs + i * kRigStride, eyeAim, ax, ay, az, fov);
+    }
+    if (aimViewTest) {
+        g_aimViewFront.store(avBack, std::memory_order_release);
+        g_aimViewMs.store(GetTickCount64(), std::memory_order_release);
+    }
+    if (headFollow || aimViewTest) {
+        // The single view direction the renderer should use: the head-driven
+        // rig directions of the set in play (aim while aiming, else normal),
+        // blended exactly as the rig blend at exe+446BE9 blends their targets -
+        // factor [controller+0x1D0] > 0 toward the first rig, < 0 toward the
+        // third, from the middle one. Built here, from our own numbers, so
+        // the game's glides between gun and head never reach the picture.
+        float blend = 0.0f;
+        TryRead(&blend, controller + 0x1D0, sizeof(blend));
+        blend = blend < -1.0f ? -1.0f : (blend > 1.0f ? 1.0f : blend);
+        // Always the NORMAL set: switching to the aim set at aim start moved
+        // the view a little (their bases need not agree) - the small snap.
+        const float (*const set)[3] = hf.worldDir;
+        const float* middle = set[1];
+        const float* toward = blend >= 0.0f ? set[0] : set[2];
+        const float w = blend >= 0.0f ? blend : -blend;
+        float dir[3];
+        for (int k = 0; k < 3; ++k)
+            dir[k] = middle[k] * (1.0f - w) + toward[k] * w;
+#if RE5VR_DIAGNOSTICS
+        if (aimViewTest && aiming) {
+            // How far the aim set's view would differ, for the log.
+            const float* am = av.viewDir[1];
+            const float* at = blend >= 0.0f ? av.viewDir[0] : av.viewDir[2];
+            float ad[3];
+            for (int k = 0; k < 3; ++k)
+                ad[k] = am[k] * (1.0f - w) + at[k] * w;
+            const float la = std::sqrt(ad[0] * ad[0] + ad[1] * ad[1] + ad[2] * ad[2]);
+            const float ln = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+            if (la > 1e-4f && ln > 1e-4f) {
+                float cth = (ad[0] * dir[0] + ad[1] * dir[1] + ad[2] * dir[2]) / (la * ln);
+                cth = cth < -1.0f ? -1.0f : (cth > 1.0f ? 1.0f : cth);
+                static float s_maxDeg = 0.0f;
+                static ULONGLONG s_windowMs = 0;
+                const float deg = std::acos(cth) * 180.0f / kPi;
+                s_maxDeg = deg > s_maxDeg ? deg : s_maxDeg;
+                const ULONGLONG nowMs = GetTickCount64();
+                if (!s_windowMs)
+                    s_windowMs = nowMs;
+                if (nowMs - s_windowMs >= 3000) {
+                    Log_Printf("CameraRigHook: view-only - while aiming, the aim rigs' view would differ from the normal "
+                               "rigs' by up to %.1f deg", s_maxDeg);
+                    s_maxDeg = 0.0f;
+                    s_windowMs = nowMs;
+                }
+            }
+        }
+#endif
+        const float dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        if (dl > 1e-4f) {
+            for (int k = 0; k < 3; ++k)
+                hf.worldDir[6][k] = dir[k] / dl;
+        } else {
+            std::memcpy(hf.worldDir[6], middle, sizeof(hf.worldDir[6]));
+        }
+
+#if RE5VR_DIAGNOSTICS
+        // Diagnostic (2026-09-15): the user saw the camera creep "lower and
+        // lower to the ground" by pressing aim repeatedly with the head still.
+        // Log, at every aim press and release, each value that could creep: the
+        // game's pitch blend, the eye height we place, the game camera's pitch
+        // and the drawn view's pitch.
+        {
+            static int s_prevAim = -1;
+            const int aimNow = aiming ? 1 : 0;
+            if (aimNow != s_prevAim) {
+                s_prevAim = aimNow;
+                float ctrlEye[3] = {}, ctrlTarget[3] = {};
+                const bool haveCtrl = TryRead(ctrlEye, controller + 0x170, sizeof(ctrlEye)) &&
+                    TryRead(ctrlTarget, controller + 0x190, sizeof(ctrlTarget));
+                const auto pitchDeg = [](float x, float y, float z) {
+                    const float h = std::sqrt(x * x + z * z);
+                    return std::atan2(y, h) * 180.0f / kPi;
+                };
+                const float camPitch = haveCtrl
+                    ? pitchDeg(ctrlTarget[0] - ctrlEye[0], ctrlTarget[1] - ctrlEye[1], ctrlTarget[2] - ctrlEye[2])
+                    : 0.0f;
+                const float viewPitch = pitchDeg(hf.worldDir[6][0], hf.worldDir[6][1], hf.worldDir[6][2]);
+                const float middlePitch = pitchDeg(middle[0], middle[1], middle[2]);
+                Log_Printf("CameraRigHook: aim %s - pitch blend %.3f, eye placed (rig) up %.1f fwd %.1f, game camera eye "
+                           "height %.1f pitch %.1f deg, view pitch %.1f deg (middle rig %.1f), head pitch %.1f deg",
+                    aiming ? "PRESSED" : "released", blend, eyeNormal[1], eyeNormal[2], haveCtrl ? ctrlEye[1] : 0.0f,
+                    camPitch, viewPitch, middlePitch,
+                    std::asin(std::fmax(-1.0f, std::fmin(1.0f, hf.headForward[1]))) * 180.0f / kPi);
+            }
+        }
+#endif
+        g_hfTargetsFront.store(hfBack, std::memory_order_release);
+        g_hfTargetsMs.store(GetTickCount64(), std::memory_order_release);
+        AcquireSRWLockExclusive(&g_hfHistoryLock);
+        g_hfHistoryHead = (g_hfHistoryHead + 1) % kHfHistory;
+        g_hfHistory[g_hfHistoryHead] = hf;
+        if (g_hfHistoryCount < kHfHistory)
+            ++g_hfHistoryCount;
+        ReleaseSRWLockExclusive(&g_hfHistoryLock);
+    }
+}
+
+// ---- View-matrix caller census (2026-09-15) ----------------------------
+// The gun reads the camera, so turning the main camera's view toward the head
+// while aiming turned the gun too (both experiments). The renderer builds its
+// view on demand through the camera classes' virtual GetViewMatrix
+// (exe+435C20, vtable slot +0x34), from the canonical +0x30/+0x40/+0x50. If
+// the renderer/culling and the aim code call it from different places, the
+// view can be split by caller. This logs every distinct caller on the
+// player's main camera, with the thread it runs on, every 10 s.
+using GetViewMatrixFn = float*(__thiscall*)(void* self, float* out);
+GetViewMatrixFn g_origGetViewMatrix = nullptr;
+std::atomic<DWORD> g_renderThreadId{ 0 };
+
+struct ViewCaller {
+    std::atomic<DWORD> ret{ 0 };
+    std::atomic<DWORD> thread{ 0 };
+    std::atomic<unsigned> count{ 0 };
+    std::atomic<unsigned> otherObjects{ 0 };
+};
+constexpr int kMaxViewCallers = 48;
+ViewCaller g_viewCallers[kMaxViewCallers];
+
+void NoteViewCaller(DWORD ret, bool mainCamera)
+{
+    for (int i = 0; i < kMaxViewCallers; ++i) {
+        DWORD cur = g_viewCallers[i].ret.load(std::memory_order_relaxed);
+        if (cur == 0) {
+            DWORD expected = 0;
+            if (!g_viewCallers[i].ret.compare_exchange_strong(expected, ret)) {
+                if (expected != ret)
+                    continue;
+            } else {
+                g_viewCallers[i].thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+            }
+            cur = ret;
+        }
+        if (cur == ret) {
+            if (mainCamera)
+                g_viewCallers[i].count.fetch_add(1, std::memory_order_relaxed);
+            else
+                g_viewCallers[i].otherObjects.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+// The callers on the player's main camera (census 2026-09-15, all game-side
+// threads): +436311 builds projection * view in the camera's post-update (the
+// frustum planes), +8E235A the same on a worker thread (visibility), +0400BA
+// copies the view into a render context, +3CFD0F / +3A1FB3 read the camera's
+// position and axes for scene work. None changes rate when aiming, so the
+// gun does not aim through this function - it reads the camera's fields.
+// While aiming, these callers get a view turned toward the head and the
+// fields stay as the game set them.
+bool IsRenderViewCaller(DWORD exeOffset)
+{
+    switch (exeOffset) {
+    case 0x436311:
+    case 0x8E235A:
+    case 0x0400BA:
+    case 0x3CFD0F:
+    case 0x3A1FB3:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Rotates v about unit axis k by the angle with cosine c and sine s.
+void RotateAboutAxisRig(float v[3], const float k[3], float c, float s)
+{
+    const float kv[3] = { k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0] };
+    const float kd = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+    for (int i = 0; i < 3; ++i)
+        v[i] = v[i] * c + kv[i] * s + k[i] * kd * (1.0f - c);
+}
+
+std::atomic<unsigned long long> g_aimViewRendered{ 0 };
+
+// The main camera's view pointed along the direction head-follow published
+// this update (HeadFollowTargets::worldDir[6]), into out. False when there is
+// nothing fresh (test off, VR off, a scripted camera owns the view).
+bool BuildAimRenderView(void* self, float* out)
+{
+    if (!g_aimViewTest.load(std::memory_order_relaxed))
+        return false;
+    const int front = g_hfTargetsFront.load(std::memory_order_acquire);
+    if (front < 0 || GetTickCount64() - g_hfTargetsMs.load(std::memory_order_acquire) > 100)
+        return false;
+    // GetViewMatrix reads only eye +0x30, up +0x40 and target +0x50, so hand
+    // the game's own look-at a copy with the target moved.
+    unsigned char fake[0x60];
+    if (!TryRead(fake, static_cast<unsigned char*>(self), sizeof(fake)))
+        return false;
+    float eye[3], target[3];
+    std::memcpy(eye, fake + 0x30, sizeof(eye));
+    std::memcpy(target, fake + 0x50, sizeof(target));
+    const float d[3] = { target[0] - eye[0], target[1] - eye[1], target[2] - eye[2] };
+    float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (dl < 1e-3f)
+        dl = kFirstPersonTargetDistance;
+    const float* dir = g_hfTargets[front].worldDir[6];
+    const float vl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (vl < 1e-4f)
+        return false;
+    for (int i = 0; i < 3; ++i)
+        target[i] = eye[i] + dir[i] / vl * dl;
+    std::memcpy(fake + 0x50, target, sizeof(target));
+    g_origGetViewMatrix(fake, out);
+    g_aimViewRendered.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+float* __fastcall GetViewMatrixHook(void* self, void* /*edx*/, float* out)
+{
+    const DWORD ret = static_cast<DWORD>(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    const unsigned char* player = static_cast<unsigned char*>(CameraRigHook_GetPlayerController());
+    const bool mainCamera = player && self == static_cast<void*>(const_cast<unsigned char*>(player) - kOffMainCameraPlayerController);
+#if RE5VR_DIAGNOSTICS
+    NoteViewCaller(ret, mainCamera);
+#endif
+    if (mainCamera) {
+        static const DWORD s_base = static_cast<DWORD>(reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)));
+        if (IsRenderViewCaller(ret - s_base) && BuildAimRenderView(self, out))
+            return out;
+    }
+    return g_origGetViewMatrix(self, out);
+}
+
+void LogViewCallers()
+{
+    static ULONGLONG s_lastMs = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - s_lastMs < 10000)
+        return;
+    s_lastMs = now;
+    HMODULE exe = GetModuleHandleA(nullptr);
+    const DWORD base = static_cast<DWORD>(reinterpret_cast<uintptr_t>(exe));
+    const DWORD renderThread = g_renderThreadId.load(std::memory_order_relaxed);
+    Log_Printf("CameraRigHook: GetViewMatrix callers in the last 10 s (exe+offset of the instruction after the call; "
+               "render thread %lu; aim views turned toward the head so far %llu):",
+        renderThread, g_aimViewRendered.load(std::memory_order_relaxed));
+    for (int i = 0; i < kMaxViewCallers; ++i) {
+        const DWORD ret = g_viewCallers[i].ret.load(std::memory_order_relaxed);
+        if (!ret)
+            break;
+        const unsigned mainCount = g_viewCallers[i].count.exchange(0, std::memory_order_relaxed);
+        const unsigned others = g_viewCallers[i].otherObjects.exchange(0, std::memory_order_relaxed);
+        if (!mainCount && !others)
+            continue;
+        const DWORD thread = g_viewCallers[i].thread.load(std::memory_order_relaxed);
+        Log_Printf("CameraRigHook:   exe+%06lX  main camera %u, other cameras %u, thread %lu%s", ret - base, mainCount,
+            others, thread, thread == renderThread ? " (render)" : "");
     }
 }
 
@@ -2292,6 +2803,24 @@ void CameraRigHook_Install()
     rrSt = MH_EnableHook(rigsReadyTarget);
     Log_Printf("CameraRigHook_Install: rigs-ready hook enabled -> %d (target=%p)", static_cast<int>(rrSt), rigsReadyTarget);
 
+    {
+        // GetViewMatrix: the view split. First bytes: push ebp / mov ebp,esp /
+        // and esp,-16 (55 8B EC 83 E4 F0).
+        void* gvm = reinterpret_cast<void*>(moduleBase + 0x435C20);
+        static const unsigned char kExpected[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0 };
+        unsigned char actual[sizeof(kExpected)] = {};
+        if (TryRead(actual, reinterpret_cast<unsigned char*>(gvm), sizeof(actual)) &&
+            std::memcmp(actual, kExpected, sizeof(kExpected)) == 0) {
+            MH_STATUS gSt = MH_CreateHook(gvm, reinterpret_cast<void*>(&GetViewMatrixHook), reinterpret_cast<void**>(&g_origGetViewMatrix));
+            if (gSt == MH_OK || gSt == MH_ERROR_ALREADY_CREATED)
+                gSt = MH_EnableHook(gvm);
+            Log_Printf("CameraRigHook_Install: GetViewMatrix view-split hook -> %d (target=%p)", static_cast<int>(gSt), gvm);
+        } else {
+            Log_Printf("CameraRigHook_Install: GetViewMatrix has unexpected bytes - view split unavailable, culling "
+                       "follows the game camera");
+        }
+    }
+
     if (!kInstallLegacyWriteHooks)
         return;
 
@@ -2322,6 +2851,10 @@ void CameraRigHook_Install()
 
 void CameraRigHook_OnEndScene()
 {
+    g_renderThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+#if RE5VR_DIAGNOSTICS
+    LogViewCallers();
+#endif
     // Before anything else: the game's camera code may not have run this
     // frame, and if it has not run for a while the head is stuck collapsed.
     HeadWatchdog_Tick();
@@ -2415,6 +2948,99 @@ bool CameraRigHook_IsVrActive()
     return g_vrActive.load(std::memory_order_relaxed);
 }
 
+float CameraRigHook_GetVrCullFovDeg(bool* atCap)
+{
+    const float deg = g_vrCullFovDegShown.load(std::memory_order_relaxed);
+    if (atCap)
+        *atCap = deg >= kVrCullFovMaxDeg;
+    return deg;
+}
+
+bool CameraRigHook_MatchHeadFollowTargets(const float camForward[3], HeadFollowTargets& out, int* outAge, float* outErrDeg)
+{
+    // Deliberately NOT gated on g_headFollowDriving (2026-09-15): around the
+    // start and end of aiming the game still draws a frame or two from the
+    // camera head-follow last wrote, while the flag has already flipped, and
+    // the two maths disagreed mid-turn - the user's jitter while aiming. The
+    // question is what THIS camera was built from, so the direction decides:
+    // within kMatchToleranceDeg of a recent write, it's a head-follow camera.
+    if (GetTickCount64() - g_hfTargetsMs.load(std::memory_order_acquire) > 250)
+        return false;
+    // Left-right only (world y is up). The camera sits a steady ~2 deg off the
+    // written directions vertically - the game's look-up/look-down rig blend -
+    // while every rig gets exactly the same sideways turn, so yaw picks the right
+    // update even mid-turn, when neighbouring updates are only a few degrees
+    // apart. Matching in 3D let that vertical offset pick the wrong one: the
+    // catch-up then over-rotated 1.2-1.4x and flickered (2026-09-15).
+    const float cl = std::sqrt(camForward[0] * camForward[0] + camForward[2] * camForward[2]);
+    if (cl < 1e-4f)
+        return false;
+
+    HeadFollowTargets history[kHfHistory];
+    int head = 0, count = 0;
+    AcquireSRWLockShared(&g_hfHistoryLock);
+    std::memcpy(history, g_hfHistory, sizeof(history));
+    head = g_hfHistoryHead;
+    count = g_hfHistoryCount;
+    ReleaseSRWLockShared(&g_hfHistoryLock);
+    if (head < 0 || count == 0)
+        return false;
+
+    int bestAge = -1;
+    float bestDot = -2.0f;
+    for (int age = 0; age < count; ++age) {
+        const HeadFollowTargets& t = history[(head - age + kHfHistory) % kHfHistory];
+        for (int r = 0; r < 7; ++r) {
+            const float* d = t.worldDir[r];
+            const float dl = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+            if (dl < 1e-4f)
+                continue;
+            const float dot = (d[0] * camForward[0] + d[2] * camForward[2]) / (dl * cl);
+            // Strictly better only: at a tie the newer update, seen first, keeps it.
+            if (dot > bestDot + 1e-5f) {
+                bestDot = dot;
+                bestAge = age;
+            }
+        }
+    }
+    constexpr float kMatchToleranceDeg = 5.0f;
+    if (bestAge < 0 || bestDot < std::cos(kMatchToleranceDeg * kPi / 180.0f))
+        return false;
+    out = history[(head - bestAge + kHfHistory) % kHfHistory];
+    if (outAge)
+        *outAge = bestAge;
+    if (outErrDeg)
+        *outErrDeg = std::acos(std::fmax(-1.0f, std::fmin(1.0f, bestDot))) * 180.0f / kPi;
+    return true;
+}
+
+void CameraRigHook_SetAimViewTest(bool on)
+{
+    if (g_aimViewTest.exchange(on) != on)
+        Log_Printf("CameraRigHook: aim-view test (view follows the head while aiming) now %s", on ? "ON" : "OFF");
+}
+
+bool CameraRigHook_GetAimViewTest()
+{
+    return g_aimViewTest.load(std::memory_order_relaxed);
+}
+
+void CameraRigHook_DoubleHeadAim(const float f[3], float out[3])
+{
+    DoubleHeadAim(f, out);
+}
+
+bool CameraRigHook_GetHeadFollowTargets(HeadFollowTargets& out)
+{
+    const int front = g_hfTargetsFront.load(std::memory_order_acquire);
+    if (front < 0 || !g_headFollowDriving.load(std::memory_order_acquire))
+        return false;
+    if (GetTickCount64() - g_hfTargetsMs.load(std::memory_order_acquire) > 250)
+        return false;
+    out = g_hfTargets[front];
+    return true;
+}
+
 bool CameraRigHook_HeadFollowDrivingCamera()
 {
     return g_headFollowDriving.load(std::memory_order_acquire);
@@ -2476,6 +3102,8 @@ CameraRigSettings CameraRigHook_GetSettings()
     s.headFollow = g_headFollow.load(std::memory_order_relaxed);
     s.vrStabilise = g_vrStabiliseEye.load(std::memory_order_relaxed);
     s.vrMatchCullFov = g_vrWideFov.load(std::memory_order_relaxed);
+    s.vrCullMarginPct = g_vrCullMarginPct.load(std::memory_order_relaxed);
+    s.vrCullTurnLookaheadMs = g_vrCullTurnLookaheadMs.load(std::memory_order_relaxed);
     s.showHeadDuringActions = g_showHeadDuringActions.load(std::memory_order_relaxed);
     s.aimWalkCommit = g_aimWalkCommit.load(std::memory_order_relaxed);
     s.flatFovDeg = g_flatFovDeg;
@@ -2494,6 +3122,8 @@ void CameraRigHook_ApplySettings(const CameraRigSettings& in)
     s.vrEyeUp = Clamp(s.vrEyeUp, 0.0f, kEyeUpMax);
     s.flatEyeAhead = Clamp(s.flatEyeAhead, kEyeAheadMin, kEyeScaleMax);
     s.vrEyeAhead = Clamp(s.vrEyeAhead, kEyeAheadMin, kEyeScaleMax);
+    s.vrCullMarginPct = Clamp(s.vrCullMarginPct, 0.0f, kVrCullMarginMaxPct);
+    s.vrCullTurnLookaheadMs = Clamp(s.vrCullTurnLookaheadMs, 0.0f, kVrCullTurnLookaheadMaxMs);
 
     const CameraRigSettings old = CameraRigHook_GetSettings();
     CameraRigHook_SetFirstPerson(s.firstPerson);
@@ -2507,6 +3137,13 @@ void CameraRigHook_ApplySettings(const CameraRigSettings& in)
     flag(g_vrWideFov, s.vrMatchCullFov, old.vrMatchCullFov, "VR culling FOV matched to the headset");
     flag(g_showHeadDuringActions, s.showHeadDuringActions, old.showHeadDuringActions, "show head during action cameras");
     flag(g_aimWalkCommit, s.aimWalkCommit, old.aimWalkCommit, "aim-walk step commit (co-op test)");
+
+    g_vrCullMarginPct.store(s.vrCullMarginPct, std::memory_order_relaxed);
+    if (s.vrCullMarginPct != old.vrCullMarginPct)
+        Log_Printf("CameraRigHook: VR culling margin now %.0f%%", s.vrCullMarginPct);
+    g_vrCullTurnLookaheadMs.store(s.vrCullTurnLookaheadMs, std::memory_order_relaxed);
+    if (s.vrCullTurnLookaheadMs != old.vrCullTurnLookaheadMs)
+        Log_Printf("CameraRigHook: VR culling turn lookahead now %.0f ms", s.vrCullTurnLookaheadMs);
 
     g_flatFovDeg = s.flatFovDeg;
     g_flatEye.up = s.flatEyeUp;
@@ -2530,7 +3167,11 @@ void CameraRigHook_GetStatus(CameraRigStatus& out)
     }
     const unsigned long long last = g_lastPlayerHeadMs;
     out.cameraHookAgeMs = last ? GetTickCount64() - last : ~0ull;
-    out.headFollowDriving = g_headFollowDriving.load(std::memory_order_relaxed);
+    // Under the view split nothing steers the game camera any more; "driving"
+    // means the drawn view is following the head right now.
+    out.headFollowDriving = g_headFollowDriving.load(std::memory_order_relaxed) ||
+        (g_aimViewTest.load(std::memory_order_relaxed) &&
+            GetTickCount64() - g_hfTargetsMs.load(std::memory_order_relaxed) < 250);
     out.headCutaways = g_headShownEvents.load(std::memory_order_relaxed);
     out.watchdogRestores = g_watchdogRestores.load(std::memory_order_relaxed);
     out.flickerLockouts = g_headLockouts.load(std::memory_order_relaxed);

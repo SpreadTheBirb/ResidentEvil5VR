@@ -77,3 +77,14 @@ void D3D12AddonBridge_Shutdown();
 // leave the window alone. Cheap; call every frame at Present. Does nothing if
 // the addon is absent or too old to support it.
 void D3D12AddonBridge_SetDesktopView(bool enabled, int x, int y, int w, int h);
+
+// Around IDirect3DDevice9::Reset: tells the addon to leave dgVoodoo's
+// swapchain alone while it is rebuilt. Does nothing without the addon.
+void D3D12AddonBridge_NotifyReset(bool resetting);
+
+// Call every frame before building the VR session; false means "come back next
+// frame". The addon only copies frames while something reads them, and it
+// copies at Present, which can't happen while TryInit waits on the render
+// thread - so wake it a few frames ahead. True at once without the addon, and
+// after 3 seconds at most either way.
+bool D3D12AddonBridge_WarmUp();

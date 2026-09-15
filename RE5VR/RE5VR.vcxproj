@@ -60,7 +60,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ModuleDefinitionFile>$(ProjectDir)RE5VR.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>$(ProjectDir)thirdparty\openxr\lib\win32;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;dinput8.lib;dxguid.lib;winhttp.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -83,7 +83,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ModuleDefinitionFile>$(ProjectDir)RE5VR.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>$(ProjectDir)thirdparty\openxr\lib\win32;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;d3d11.lib;dxgi.lib;openxr_loader.lib;winmm.lib;dinput8.lib;dxguid.lib;winhttp.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -112,6 +112,7 @@
     <ClCompile Include="src\render\stereo_test.cpp" />
     <ClCompile Include="src\render\hud_shaders.cpp" />
     <ClCompile Include="src\render\render_size.cpp" />
+    <ClCompile Include="src\util\update_check.cpp" />
     <ClCompile Include="src\vr\openxr_bridge.cpp" />
     <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
     <ClCompile Include="src\ui\menu.cpp" />
@@ -153,6 +154,8 @@
     <ClInclude Include="src\render\stereo_test.h" />
     <ClInclude Include="src\render\hud_shaders.h" />
     <ClInclude Include="src\render\render_size.h" />
+    <ClInclude Include="src\util\update_check.h" />
+    <ClInclude Include="src\util\version.h" />
     <ClInclude Include="src\vr\openxr_bridge.h" />
     <ClInclude Include="src\vr\d3d12_addon_bridge.h" />
     <ClInclude Include="src\ui\menu.h" />

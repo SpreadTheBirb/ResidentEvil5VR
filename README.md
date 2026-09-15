@@ -4,7 +4,7 @@ A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
 DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
-> **Status:** v0.4.1, working and playable, still under active development.
+> **Status:** v0.4.2, working and playable, still under active development.
 > There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
@@ -19,6 +19,12 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 > **Update (v0.4.1):** full resolution per eye. VR is now crisp: each eye
 > renders at the resolution your VR runtime asks for, so SteamVR's resolution
 > setting and Virtual Desktop's quality presets finally do something.
+
+> **Update (v0.4.2):** no more things vanishing or popping in when you look
+> over your shoulder in VR, aiming included. Look around freely while you aim;
+> the gun, laser and walking stay with the mouse or stick. Changing resolution
+> in exclusive fullscreen no longer crashes. The menu now shows the mod's
+> version and tells you when a newer one is on Nexus.
 
 ---
 
@@ -45,8 +51,8 @@ to clone this repository to play.
 
 | Download | For | Files |
 |---|---|---|
-| `RE5VR-v0.4.1-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
-| `RE5VR-v0.4.1-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
+| `TrueFP-v0.4.2-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
+| `TrueFP-v0.4.2-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
 
 ### Do this first: the 4GB patch
 
@@ -127,7 +133,7 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 | **Left Eye / Right Eye Desktop View** | Which eye the game window shows while in VR (right by default), so streaming and recording look normal. It fills the window at any size or shape. The headset is not affected. |
 | **Full resolution per eye** | On by default. Each eye renders at your VR runtime's own resolution (see [Resolution](#resolution)). Shows the size each eye gets, in orange if it had to be scaled down to fit the game's memory. Off gives each eye half of the game's resolution, like older versions. |
 | **Reset view** | Makes wherever you're facing "forward" again (yaw only). Same as holding both sticks. |
-| **Head turns the game camera** | While the gun is down, the game's camera follows your head so the world isn't culled away wherever your body faces. Raising the gun hands aim straight back to the mouse or stick. |
+| **Culling follows your head** | On by default. The game draws whatever you look at, aiming included, so nothing vanishes over your shoulder. Aiming and walking stay on the mouse or stick. |
 | **Stabilise camera** | Smooths Chris's idle-animation sway out of your view. |
 | **Eye height / Eye forward** | VR camera position, separate from the flat-screen one. |
 | **World scale** | Eye separation. Higher makes the world look smaller, lower makes it bigger. 2.75 was measured to make Sheva, guns and doors feel life-size. |
@@ -148,8 +154,8 @@ The menu works in the headset too: it's drawn into each eye in front of you.
 Live values, useful for troubleshooting. **Screenshot this page when
 reporting a problem** (see [Reporting a problem](#reporting-a-problem)):
 
-- **Mod:** release or developer build, VR or flatscreen install, address
-  space used, whether the **4GB patch** is applied
+- **Mod:** version, whether a newer version is on Nexus, VR or flatscreen
+  install, address space used, whether the **4GB patch** is applied
 - **Rendering:** game frame rate, backbuffer size, stereo on/off and the
   resolution each eye actually gets, the render size in VR versus the game's
   own, HUD recognition
@@ -161,7 +167,14 @@ reporting a problem** (see [Reporting a problem](#reporting-a-problem)):
 ### Menu tab
 
 Text size, whether clicking both sticks opens the menu, whether the startup
-note shows, a reminder of the controls, and **Reset everything to defaults**.
+note shows, **Check Nexus for updates at startup**, a reminder of the controls,
+and **Reset everything to defaults**.
+
+**Update check:** a few seconds after launch the mod asks nexusmods.com for this
+mod's latest version number. Nothing about you or your game is sent. If a newer
+version is out, a note appears in the corner for a few seconds and at the top of
+the menu, with a button that opens the Nexus page. Untick the option on the Menu
+tab to turn it off.
 
 ---
 
@@ -198,12 +211,15 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
   the headset back to SteamVR or Virtual Desktop.
 - **HUD in VR:** ammo, health, the inventory, the pause screen and most menus
   on a panel in front of you, at a distance you choose.
-- **Head tracking turns the game camera:** nothing disappears over your
-  shoulder, and it steps aside the moment you aim.
+- **Look around freely, aiming included:** the game draws whatever you look
+  at, while the gun, laser and walking direction stay with the mouse or stick.
+  Press aim while looking somewhere else and the gun just comes up; your view
+  doesn't move.
 - **Calibrated world scale:** measured from first person, adjustable in the
   menu.
 - **VR culling fixes:** the game draws everything the headset can see,
-  including the ground at your feet and your partner's legs.
+  including the ground at your feet, your partner's legs, and whatever is over
+  your shoulder.
 - **Reset view:** from the menu, or hold both sticks in for a second.
 - **No light leaks:** post-processing is drawn once rather than split per eye.
 
@@ -212,6 +228,8 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
 - **In-game menu** with saved settings, working with mouse, keyboard or
   controller, on the monitor or in the headset.
 - **Live Status page**, including a 4GB-patch check.
+- **Version display and update check:** the menu shows the mod's version and
+  lets you know when a newer one is on Nexus.
 - **Drop-in install:** no game files are modified; delete the files to
   uninstall.
 
@@ -233,9 +251,9 @@ note shows, a reminder of the controls, and **Reset everything to defaults**.
    tick **Start in VR automatically** once and never think about it again).
 4. Turn on **First person camera** on the Camera tab.
 
-**Play in windowed mode.** Set RE5 to windowed in its display options. In
-exclusive fullscreen, changing resolution (or turning VR on) can crash inside
-dgVoodoo2 on some PCs.
+**Windowed mode is still the safe choice.** Changing resolution in exclusive
+fullscreen no longer crashes as of v0.4.2, but turning VR on while in exclusive
+fullscreen hasn't been confirmed fixed on every PC.
 
 ### Resolution
 
@@ -278,9 +296,12 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 
 ## Known issues
 
-- **Exclusive fullscreen can crash.** Changing resolution in RE5's options
-  while fullscreen, or turning VR on while fullscreen, can crash inside
-  dgVoodoo2 on some PCs. **Play windowed.**
+- **Turning VR on in exclusive fullscreen** can still crash inside dgVoodoo2 on
+  some PCs. Play windowed if it happens to you. (Changing resolution while
+  fullscreen is fixed in v0.4.2.)
+- **Pressing aim repeatedly can pull your view back toward level** after you've
+  aimed up or down with the mouse or stick. The game rescales pitch every time
+  you enter aim.
 - **VR motion controllers are not supported yet.** Use a gamepad (Xbox,
   PlayStation or similar) or mouse and keyboard.
 - RE5's own mouse cursor can point at the wrong menu item while VR is on (the
@@ -353,7 +374,8 @@ RE5VR/
                   input_block.cpp - keeps the game's input away while it is open
     vr/           openxr_bridge.cpp   - OpenXR session, swapchain, submit
                   d3d12_addon_bridge.cpp - consumer side of the addon handoff
-    util/         logging, build switches
+    util/         logging, build switches, version.h (the mod's version),
+                  update_check.cpp - asks Nexus for the latest version
   addon/          dgVoodoo2 addon plugin - builds to SampleAddon.dll, the
                   producer side that captures the D3D12 backbuffer
   thirdparty/     minhook, Dear ImGui, OpenXR SDK, dgVoodoo2 addon API headers

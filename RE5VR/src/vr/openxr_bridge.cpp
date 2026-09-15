@@ -2524,6 +2524,9 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
     if (g_sessionTeardownRequest.load(std::memory_order_acquire))
         return;
 
+    if (!g_xrSessionReady && !D3D12AddonBridge_WarmUp())
+        return;
+
     if (!g_xrSessionReady) {
         IDirect3DSurface9* backbuffer = nullptr;
         UINT w = 1280, h = 720;

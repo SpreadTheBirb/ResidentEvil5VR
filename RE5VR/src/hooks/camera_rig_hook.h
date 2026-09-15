@@ -62,11 +62,45 @@ void* CameraRigHook_GetPlayerController();
 // render thread every 100 ms). Safe to call from any thread.
 bool CameraRigHook_IsVrActive();
 
+// The vertical culling angle VR last used (headset FOV plus the margin), and
+// whether it hit the ceiling. 0 before VR has run.
+float CameraRigHook_GetVrCullFovDeg(bool* atCap);
+
 // True while head tracking is actually steering the game's camera this frame
 // (VR on, F9 on, gun down). When it is, the game camera ALREADY contains your
 // head rotation, so stereo_test must not rotate the eye bases by the head
 // delta a second time - see the head-follow compensation there.
 bool CameraRigHook_HeadFollowDrivingCamera();
+
+// What head-follow wrote this frame, for stereo_test's direct picture turning
+// (2026-09-15): the world direction of each of the player's rigs (3 normal,
+// then 3 aim - the game renders from one of them) and the head forward those
+// were built from. False when head-follow isn't driving or nothing recent.
+struct HeadFollowTargets {
+    float worldDir[7][3];      // [6]: the one view direction, blended by the game's pitch factor
+    float headForward[3];
+    unsigned long long poseId; // the XR pose headForward came from
+    float cameraForward[3];    // what the camera was actually turned by (headForward, or doubled - mode 3)
+};
+bool CameraRigHook_GetHeadFollowTargets(HeadFollowTargets& out);
+
+// Twice the yaw and pitch of head forward f (picture turning mode 3).
+void CameraRigHook_DoubleHeadAim(const float f[3], float out[3]);
+
+// TEST (2026-09-15): while aiming, turn only the MAIN camera's copy of the
+// view toward the head (hook after exe+4421BC), leaving the camera
+// controller's own output - and anything that reads it - on the gun. Answers
+// whether the gun reads the controller (laser stays put) or the main camera
+// (laser follows the head). Not saved.
+void CameraRigHook_SetAimViewTest(bool on);
+bool CameraRigHook_GetAimViewTest();
+
+// Which recent head-follow update the camera now pointing along camForward
+// came from: the one whose written directions match it best (newest wins a
+// tie). outAge is 0 for the latest update, 1 for the one before, and so on.
+// The game can draw a frame from an older camera update than the newest one,
+// so tagging with the newest would still claim the frame is fresher than it is.
+bool CameraRigHook_MatchHeadFollowTargets(const float camForward[3], HeadFollowTargets& out, int* outAge, float* outErrDeg);
 
 // ---- In-game menu (ui/menu.cpp) -----------------------------------------
 // Every option the old F4/F9/F11/F6/'`'/','/'.' hotkeys changed. Apply clamps,
@@ -76,6 +110,8 @@ struct CameraRigSettings {
     bool headFollow = true;            // VR: head turns the game camera while the gun is down
     bool vrStabilise = true;           // VR: smooth the idle-animation shake out of the eye
     bool vrMatchCullFov = true;        // VR: cull with the headset's own FOV
+    float vrCullMarginPct = 15.0f;     // VR: extra culling angle on top of the headset's FOV
+    float vrCullTurnLookaheadMs = 0.0f; // VR: widen culling by how far the head turns in this long (developer)
     bool showHeadDuringActions = true; // head pops back in when the game's camera leaves you
     bool aimWalkCommit = false;        // developer: co-op aim-walk sync test
     float flatFovDeg = 90.0f;

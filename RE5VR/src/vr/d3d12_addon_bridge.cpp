@@ -529,3 +529,43 @@ void D3D12AddonBridge_SetDesktopView(bool enabled, int x, int y, int w, int h)
     }
     s_fn(enabled, x, y, w, h);
 }
+
+bool D3D12AddonBridge_WarmUp()
+{
+    HMODULE addon = GetModuleHandleA("SampleAddon.dll");
+    const auto getFrameInfo =
+        addon ? reinterpret_cast<PFN_GetFrameInfo>(GetProcAddress(addon, "RE5VRAddon_GetFrameInfo")) : nullptr;
+    if (!getFrameInfo)
+        return true;
+
+    static ULONGLONG s_startMs = 0, s_lastCallMs = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!s_startMs || now - s_lastCallMs > 1000)
+        s_startMs = now; // a new attempt, not the tail of an old one
+    s_lastCallMs = now;
+
+    // Any consumer call wakes the copy. Textures from an earlier session can
+    // already be there, so give the copy a moment to put a fresh frame in them.
+    const bool ready = getFrameInfo(nullptr, nullptr, nullptr, nullptr, nullptr);
+    const ULONGLONG waited = now - s_startMs;
+    if ((ready && waited >= 250) || waited >= 3000) {
+        Log_Printf("D3D12AddonBridge: addon warmed up for VR in %llu ms (%s)", waited,
+            ready ? "frame ready" : "no frame yet, going ahead");
+        s_startMs = 0;
+        return true;
+    }
+    return false;
+}
+
+void D3D12AddonBridge_NotifyReset(bool resetting)
+{
+    using PFN_SetResetting = void(__cdecl*)(bool);
+    static PFN_SetResetting s_fn = nullptr;
+    if (!s_fn) {
+        if (HMODULE addon = GetModuleHandleA("SampleAddon.dll"))
+            s_fn = reinterpret_cast<PFN_SetResetting>(GetProcAddress(addon, "RE5VRAddon_SetResetting"));
+        if (!s_fn)
+            return;
+    }
+    s_fn(resetting);
+}

@@ -1,4 +1,5 @@
 #include "log.h"
+#include "version.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -50,7 +51,7 @@ void Log_Init()
     }
     EnsureLogFileOpen("w");
     if (g_logFile) {
-        fprintf(g_logFile, "RE5VR log started\n");
+        fprintf(g_logFile, "RE5VR log started (v" RE5VR_VERSION ")\n");
         fflush(g_logFile);
     }
 }

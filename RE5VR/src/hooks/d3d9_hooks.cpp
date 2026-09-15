@@ -17,6 +17,7 @@
 #include "../render/hud_shaders.h"
 #include "../render/render_size.h"
 #include "../vr/openxr_bridge.h"
+#include "../vr/d3d12_addon_bridge.h"
 #include "../ui/input_block.h"
 #include "../ui/menu.h"
 #include "../util/log.h"
@@ -205,7 +206,9 @@ HRESULT WINAPI hkReset(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentat
         pPresentationParameters ? pPresentationParameters->Windowed : -1);
     RenderSize_OnBeforeReset(pPresentationParameters);
     Menu_OnBeforeReset(); // the menu's D3DPOOL_DEFAULT textures and buffers must go first
+    D3D12AddonBridge_NotifyReset(true);
     const HRESULT hr = oReset(This, pPresentationParameters);
+    D3D12AddonBridge_NotifyReset(false);
     Menu_OnAfterReset();
     if (SUCCEEDED(hr)) {
         LogActualBackbuffer(This, "after Reset");

@@ -59,6 +59,12 @@ float StereoTest_GetBackbufferAspect();
 // snap back as they reconverge.
 bool StereoTest_GetLatchedHeadForward(float out[3]);
 
+// The pose id of that latch (0 if none).
+unsigned long long StereoTest_GetLatchedPoseId();
+
+// Test build: 0 double (v0.4.1), 1 game camera only, 2 catch-up. See g_pictureTurnMode.
+int StereoTest_GetPictureTurnMode();
+
 // ---- In-game menu (ui/menu.cpp) -----------------------------------------
 // Everything the old F8, '/', '\', '[' ']' '-' and ';' '\'' hotkeys changed,
 // plus the HUD's distance and size. Apply clamps and logs what changed.
@@ -67,7 +73,8 @@ struct StereoSettings {
     float halfSeparation = 2.75f;      // world scale: larger = the world looks smaller
     float fovWiden = 1.0f;
     bool monoSmallTargets = true;      // the light-leak fix
-    bool compensateHeadFollow = false; // developer
+    bool compensateHeadFollow = false; // developer (superseded by pictureTurnMode)
+    int pictureTurnMode = 3;           // test: 0 double (v0.4.1), 1 game camera only, 2 catch-up, 3 double with culling fixed
     float hudDistanceMeters = 2.0f;
     float hudScale = 0.67f;
 };

@@ -9,6 +9,8 @@
 #include "../vr/d3d12_addon_bridge.h"
 #include "../util/build_config.h"
 #include "../util/log.h"
+#include "../util/update_check.h"
+#include "../util/version.h"
 
 #include <imgui.h>
 #include <imgui_impl_dx9.h>
@@ -31,7 +33,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace {
 
-constexpr const char* kTitle = "STB - TrueFP/VR Mod";
+constexpr const char* kTitle = "STB - TrueFP/VR Mod v" RE5VR_VERSION;
 
 // ---- Settings that belong to the menu itself ---------------------------
 struct MenuPrefs {
@@ -44,6 +46,7 @@ struct MenuPrefs {
     bool startupHint = true;
     bool autoStartVr = false;
     bool desktopRightEye = true; // VR: which eye the game window shows (never both side by side)
+    bool checkForUpdates = true; // ask Nexus for the latest version at startup
 };
 
 struct AllSettings {
@@ -113,7 +116,8 @@ void ApplySettings(const AllSettings& in)
     X("Menu", "Scale", menu.uiScale)                                 \
 \
     X("Menu", "OpenWithBothSticks", menu.padChord)                   \
-    X("Menu", "StartupHint", menu.startupHint)
+    X("Menu", "StartupHint", menu.startupHint)                       \
+    X("Menu", "CheckForUpdates", menu.checkForUpdates)
 
 char g_iniPath[MAX_PATH] = "";
 
@@ -727,6 +731,9 @@ int TabFlags(int index)
     return g_selectTab == index ? ImGuiTabItemFlags_SetSelected : 0;
 }
 
+const ImVec4 kGood(0.5f, 0.85f, 0.5f, 1);
+const ImVec4 kNotice(0.95f, 0.75f, 0.3f, 1);
+
 void DrawCameraTab(AllSettings& s, bool& changed)
 {
     ImGui::SeparatorText("First person");
@@ -860,9 +867,10 @@ void DrawVrTab(AllSettings& s, bool& changed)
     }
 
     ImGui::SeparatorText("View");
-    changed |= ImGui::Checkbox("Head turns the game camera", &s.cam.headFollow);
-    HelpMarker("While the gun is down the game's camera follows your head, so what's over your shoulder gets "
-               "drawn. Raising the gun hands aim straight back to the mouse or stick.");
+    changed |= ImGui::Checkbox("Culling follows your head", &s.cam.headFollow);
+    HelpMarker("The game draws whatever you look at, aiming included, so nothing vanishes over your shoulder. "
+               "Aiming and walking stay on the mouse or stick. Off, things outside the game camera's view can "
+               "disappear.");
     changed |= ImGui::Checkbox("Stabilise camera", &s.cam.vrStabilise);
     HelpMarker("Smooths Chris's idle-animation sway out of your view.");
     changed |= ImGui::SliderFloat("Eye height##vr", &s.cam.vrEyeUp, 0.0f, 3.0f, "%.2f");
@@ -916,6 +924,47 @@ void DrawVrTab(AllSettings& s, bool& changed)
     }
 }
 
+void DrawUpdateRow()
+{
+    const UpdateStatus u = UpdateCheck_GetStatus();
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextDisabled("Updates");
+    ImGui::TableSetColumnIndex(1);
+    switch (u.state) {
+    case UpdateState::Off:
+        ImGui::TextDisabled("not checked (turned off in the Menu tab)");
+        break;
+    case UpdateState::Checking:
+        ImGui::TextUnformatted("checking Nexus...");
+        break;
+    case UpdateState::UpToDate:
+        ImGui::TextColored(kGood, "up to date");
+        break;
+    case UpdateState::Available:
+        ImGui::TextColored(kNotice, "v%s is on Nexus", u.latest.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Open Nexus page##status"))
+            UpdateCheck_OpenNexusPage();
+        break;
+    case UpdateState::Failed:
+        ImGui::TextDisabled("couldn't reach Nexus");
+        break;
+    }
+}
+
+// Above the tabs, so it's seen without digging through the Status tab.
+void DrawUpdateBanner()
+{
+    const UpdateStatus u = UpdateCheck_GetStatus();
+    if (u.state != UpdateState::Available)
+        return;
+    ImGui::TextColored(kNotice, "Update available: v%s (you have v%s)", u.latest.c_str(), RE5VR_VERSION);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open Nexus page##banner"))
+        UpdateCheck_OpenNexusPage();
+}
+
 void DrawStatusTab()
 {
     VRBridgeStatus vr;
@@ -926,10 +975,11 @@ void DrawStatusTab()
     ImGui::SeparatorText("Mod");
     if (BeginStatusTable("mod")) {
 #if RE5VR_DIAGNOSTICS
-        StatusRow("Build", "developer (diagnostics on)");
+        StatusRow("Build", "Developer v%s (diagnostics on)", RE5VR_VERSION);
 #else
-        StatusRow("Build", "release");
+        StatusRow("Build", "Release v%s", RE5VR_VERSION);
 #endif
+        DrawUpdateRow();
         StatusRow("Install", vr.available ? "VR (dgVoodoo2 found)" : "flat screen (no dgVoodoo2)");
         MEMORYSTATUSEX mem = {};
         mem.dwLength = sizeof(mem);
@@ -1013,7 +1063,7 @@ void DrawStatusTab()
             StatusRow("Camera hook", "live");
         else
             StatusRow("Camera hook", "quiet for %.1f s", cam.cameraHookAgeMs / 1000.0f);
-        StatusRow("Head turns camera", cam.headFollowDriving ? "yes, right now" : "not right now");
+        StatusRow("Culling follows head", cam.headFollowDriving ? "yes, right now" : "not right now");
         StatusRow("Action cameras", "%lu cut-away(s), %lu watchdog restore(s), %lu flicker lockout(s)",
             cam.headCutaways, cam.watchdogRestores, cam.flickerLockouts);
         ImGui::EndTable();
@@ -1026,6 +1076,20 @@ void DrawMenuTab(AllSettings& s, bool& changed, bool& resetAll)
     changed |= ImGui::SliderFloat("Text size", &s.menu.uiScale, 0.75f, 2.0f, "%.2fx");
     changed |= ImGui::Checkbox("Open with a click of both sticks", &s.menu.padChord);
     changed |= ImGui::Checkbox("Show the menu hint at startup", &s.menu.startupHint);
+    if (ImGui::Checkbox("Check Nexus for updates at startup", &s.menu.checkForUpdates)) {
+        changed = true;
+        if (s.menu.checkForUpdates)
+            UpdateCheck_Start();
+        else
+            UpdateCheck_SetOff();
+    }
+    HelpMarker("Asks nexusmods.com for this mod's latest version number once per launch. Nothing about you or your "
+               "game is sent. The answer shows at the top of this menu and in the Status tab.");
+    if (s.menu.checkForUpdates) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Check now"))
+            UpdateCheck_Start();
+    }
 
     ImGui::SeparatorText("Controls");
     ImGui::BulletText("Insert, or click both sticks: open / close this menu");
@@ -1059,7 +1123,12 @@ void DrawDeveloperTab(AllSettings& s, bool& changed)
     bool stereo = StereoTest_IsEnabled();
     if (ImGui::Checkbox("Stereo without VR (was F8)", &stereo))
         StereoTest_SetEnabled(stereo);
-    changed |= ImGui::Checkbox("Don't re-rotate eyes while head steers camera (was \\)", &s.stereo.compensateHeadFollow);
+    {
+        static const char* const kTurnModes[] = { "Double (v0.4.1)", "Game camera only", "Catch-up",
+            "Double, culling fixed" };
+        changed |= ImGui::Combo("Picture turning", &s.stereo.pictureTurnMode, kTurnModes, 4);
+        HelpMarker("Double, culling fixed is the release behaviour. The others are the 2026-09-15 experiments.");
+    }
     changed |= ImGui::Checkbox("Direct submit (was Delete)", &s.vr.directSubmit);
     changed |= ImGui::Checkbox("Producer waits for consumer (was Insert)", &s.vr.waitForConsumer);
     changed |= ImGui::Checkbox("Co-op aim-walk step commit (was F6)", &s.cam.aimWalkCommit);
@@ -1085,6 +1154,7 @@ void DrawMenu(const Layout& L)
         flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
     bool keepOpen = true;
     if (ImGui::Begin(kTitle, &keepOpen, flags)) {
+        DrawUpdateBanner();
         if (ImGui::BeginTabBar("tabs")) {
             int index = 0;
             const auto tab = [&](const char* name) {
@@ -1352,6 +1422,27 @@ void DrawHint(const Layout& L, float alpha, float secondsLeft)
     ImGui::PopStyleVar();
 }
 
+// Top-right corner on the monitor; in VR, centred under where the startup
+// hint sits, since a corner of the frame is out of view in the headset.
+void DrawUpdateNotice(const Layout& L, float alpha, const std::string& latest)
+{
+    const float pad = L.fontPx;
+    if (L.stereo)
+        ImGui::SetNextWindowPos(ImVec2(L.unitsW * 0.5f, pad * 6.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    else
+        ImGui::SetNextWindowPos(ImVec2(L.unitsW - pad, pad), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.85f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::Begin("##update", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::TextColored(kNotice, "TrueFP/VR update available: v%s (you have v%s)", latest.c_str(), RE5VR_VERSION);
+    ImGui::TextDisabled(g_prefs.padChord ? "Open the menu (Insert or click both sticks) for the Nexus link"
+                                         : "Open the menu (Insert) for the Nexus link");
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 bool EnsureImGui(IDirect3DDevice9* device)
 {
     if (g_imguiReady)
@@ -1470,6 +1561,8 @@ void Menu_OnPresent(IDirect3DDevice9* device)
     // Start in VR, once the game has had a few seconds to get going.
     if (!g_autoVrDone && nowMs - g_firstPresentMs > 5000) {
         g_autoVrDone = true;
+        if (g_prefs.checkForUpdates)
+            UpdateCheck_Start();
         if (g_prefs.autoStartVr && VRBridge_IsAvailable()) {
             Log_Printf("Menu: starting VR automatically (StartInVR=1)");
             VRBridge_RequestXrMode(true);
@@ -1554,10 +1647,28 @@ void Menu_OnPresent(IDirect3DDevice9* device)
     const float hintAgeSec = s_hintStartMs ? (nowMs - s_hintStartMs) / 1000.0f : 0.0f;
     constexpr float kHintSec = 10.0f;
     const bool showHint = g_prefs.startupHint && hintAgeSec < kHintSec && !g_open;
+
+    // Update notice: once per launch, when the Nexus check finds a newer
+    // version. Same rule as the hint for when its clock starts. Opening the
+    // menu ends it; the menu shows the same news with the link.
+    const UpdateStatus update = UpdateCheck_GetStatus();
+    static ULONGLONG s_noticeStartMs = 0;
+    static bool s_noticeDone = false;
+    constexpr float kNoticeSec = 15.0f;
+    if (!s_noticeStartMs && !s_noticeDone && update.state == UpdateState::Available && deltaSec < 0.1f &&
+        GameIsForeground()) {
+        s_noticeStartMs = nowMs;
+        Log_Printf("Menu: showing the update notice (Nexus has v%s)", update.latest.c_str());
+    }
+    const float noticeAgeSec = s_noticeStartMs ? (nowMs - s_noticeStartMs) / 1000.0f : 0.0f;
+    if (s_noticeStartMs && !s_noticeDone && (g_open || noticeAgeSec >= kNoticeSec))
+        s_noticeDone = true;
+    const bool showNotice = s_noticeStartMs && !s_noticeDone;
+
     UpdateDesktopView(device);
     // Every frame until it has one - the title screen is where it shows first.
     CaptureGameCursorOnce();
-    if (!g_open && !showHint)
+    if (!g_open && !showHint && !showNotice)
         return;
     if (device->TestCooperativeLevel() != D3D_OK)
         return; // lost device: nothing can be drawn until the game resets it
@@ -1599,7 +1710,10 @@ void Menu_OnPresent(IDirect3DDevice9* device)
         DrawMenu(L);
         DrawPointer(L);
     } else {
-        DrawHint(L, (std::min)(1.0f, (kHintSec - hintAgeSec) / 1.0f), kHintSec - hintAgeSec);
+        if (showHint)
+            DrawHint(L, (std::min)(1.0f, (kHintSec - hintAgeSec) / 1.0f), kHintSec - hintAgeSec);
+        if (showNotice)
+            DrawUpdateNotice(L, (std::min)(1.0f, kNoticeSec - noticeAgeSec), update.latest);
     }
     ImGui::Render();
     RenderToBackbuffer(device, L);

@@ -109,6 +109,31 @@ std::atomic<bool> g_monoSmallTargets{ true };
 // the game camera with it - see buildEyeBasis. '\' toggles.
 std::atomic<bool> g_compensateHeadFollow{ false };
 
+// How the picture turns while head-follow steers the game camera (2026-09-15).
+// Measured on the user's PC: 0 (what v0.4.1 ships) turns the picture 1.84-2.06x
+// the head, because the eye matrices add the head rotation to a camera that
+// already has it - the source of the over-the-shoulder culling. 1 (camera
+// only) is 0.92-1.03x but feels slow: the game draws from a camera update one
+// to three steps old, varying frame to frame, so it can never be fresher than
+// the game's own pipeline (and it jittered). 2 (catch-up) keeps the camera
+// steering, so culling follows the head, and turns the picture only by the
+// difference between the pose that camera was steered with and the freshest
+// pose latched at draw time, per eye - Double's freshness and 3D, 1x.
+// (A "direct" mode that swung every draw onto the written direction was
+// tried the same night: 1.00x but "felt terrible, ton of artifacts".)
+// 3 (double, culling fixed): the user preferred v0.4.1's feel ("connected to
+// Chris's neck") over every 1x mode, so keep that PICTURE exactly and move only
+// the cone: the camera is turned by twice the head (camera_rig_hook's
+// DoubleHeadAim), which points it where v0.4.1's picture points, and each eye
+// gets its fresh delta with the extra turn taken back out:
+//   picture = N * aim(head used) * aim(camera used)^T * camera
+// which is v0.4.1's N * camera(head used), whatever the doubling did.
+std::atomic<int> g_pictureTurnMode{ 3 };
+constexpr int kPictureTurnDouble = 0;
+constexpr int kPictureTurnCameraOnly = 1;
+constexpr int kPictureTurnCatchUp = 2;
+constexpr int kPictureTurnDoubleFixed = 3;
+
 float g_fovWidenMultiplier = 1.0f;
 constexpr float kFovWidenStep = 0.1f;
 
@@ -132,6 +157,10 @@ bool g_haveFrameViews = false;
 // Which published pose g_frameViews came from, carried through to Present
 // so the submit path can tell the compositor the truth about this image.
 XRBridgePoseId g_frameViewsPoseId = 0;
+// Game camera only: the pose head-follow steered the camera of the frame now
+// being drawn with, captured at its first draw - Present tags with this
+// instead of the latch (see OnRigsReady). 0 when not in that mode.
+XRBridgePoseId g_frameCameraPoseId = 0;
 unsigned long long g_lastPresentMs = 0;
 unsigned g_presentCount = 0;
 UINT g_backBufferWidth = 0;
@@ -221,6 +250,101 @@ struct CameraBasis {
 float Length3(const float v[3])
 {
     return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+// Diagnostic (2026-09-15): how far does the headset picture turn in the world
+// for each degree the head turns? 1.0 is right; 2.0 means the head rotation is
+// applied twice - once by head tracking turning the game camera, and again on
+// the eye matrices. A tester saw culling while standing still looking over
+// his shoulder, which fits the picture running ahead of the game camera the
+// cone is built around. Once per frame; logged per 3 s window. (A first
+// version compared the picture with the game camera directly, which only
+// restated the head angle - the gap it measured is the one this code adds.)
+void NoteViewVsGameCamera(const float eyeForward[3], const float rotationDelta[9])
+{
+    const auto yawOf = [](const float v[3]) { return std::atan2(v[0], v[2]) * 57.2957795f; };
+    const auto wrap = [](float d) {
+        while (d > 180.0f)
+            d -= 360.0f;
+        while (d < -180.0f)
+            d += 360.0f;
+        return d;
+    };
+    const float pictureYaw = yawOf(eyeForward);
+    const float headYaw = yawOf(rotationDelta + 6);
+    const bool compensating = g_pictureTurnMode.load(std::memory_order_relaxed) != kPictureTurnDouble;
+
+    static bool s_havePrev = false;
+    static float s_prevPicture = 0.0f, s_prevHead = 0.0f;
+    static bool s_prevCompensating = false;
+    static double s_pictureSum = 0.0, s_headSum = 0.0;
+    static unsigned s_frames = 0;
+    static ULONGLONG s_windowStartMs = 0;
+
+    if (s_havePrev && compensating == s_prevCompensating) {
+        const float dp = std::fabs(wrap(pictureYaw - s_prevPicture));
+        const float dh = std::fabs(wrap(headYaw - s_prevHead));
+        if (dp < 45.0f && dh < 45.0f) { // skip cuts and teleports
+            s_pictureSum += dp;
+            s_headSum += dh;
+            ++s_frames;
+        }
+    }
+    if (compensating != s_prevCompensating) {
+        Log_Printf("StereoTest: picture turning now %s", compensating ? "single (camera only or direct)"
+                                                                     : "DOUBLE (eye matrices add the head rotation too)");
+        s_pictureSum = s_headSum = 0.0;
+        s_frames = 0;
+        s_windowStartMs = 0;
+    }
+    s_prevPicture = pictureYaw;
+    s_prevHead = headYaw;
+    s_prevCompensating = compensating;
+    s_havePrev = true;
+
+    const ULONGLONG now = GetTickCount64();
+    if (!s_windowStartMs)
+        s_windowStartMs = now;
+    if (now - s_windowStartMs < 3000)
+        return;
+    if (s_headSum >= 10.0) {
+        Log_Printf("StereoTest: picture turned %.0f deg in the world while the head turned %.0f deg - %.2fx (%s, %u frames)",
+            s_pictureSum, s_headSum, s_pictureSum / s_headSum,
+            g_pictureTurnMode.load(std::memory_order_relaxed) == kPictureTurnCatchUp ? "catch-up"
+                : g_pictureTurnMode.load(std::memory_order_relaxed) == kPictureTurnDoubleFixed ? "double, culling fixed"
+                : (compensating ? "camera only" : "double"),
+            s_frames);
+    }
+    s_windowStartMs = now;
+    s_pictureSum = s_headSum = 0.0;
+    s_frames = 0;
+}
+
+void ApplyHeadRotation(CameraBasis& basis, const Mat3& delta);
+
+// A head orientation with its roll taken out: forward f, right level with the
+// ground, in the same Right/Up/Forward rows as the eye deltas. False when f
+// points straight up or down (no defined yaw).
+bool NoRollAim(const float f[3], Mat3& out)
+{
+    const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (fl < 1e-4f)
+        return false;
+    const float fwd[3] = { f[0] / fl, f[1] / fl, f[2] / fl };
+    float right[3] = { fwd[2], 0.0f, -fwd[0] }; // cross((0,1,0), fwd)
+    const float rl = std::sqrt(right[0] * right[0] + right[2] * right[2]);
+    if (rl < 1e-3f)
+        return false;
+    right[0] /= rl;
+    right[2] /= rl;
+    const float up[3] = { fwd[1] * right[2] - fwd[2] * right[1], fwd[2] * right[0] - fwd[0] * right[2],
+        fwd[0] * right[1] - fwd[1] * right[0] };
+    for (int i = 0; i < 3; ++i) {
+        out.m[0 * 3 + i] = right[i];
+        out.m[1 * 3 + i] = up[i];
+        out.m[2 * 3 + i] = fwd[i];
+    }
+    return true;
 }
 
 float Dot3(const float a[3], const float b[3])
@@ -531,6 +655,86 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
     CameraBasis baseBasis;
     DecomposeCameraMatrix(baseMatrix, baseBasis);
 
+    // Once per frame, at its first stereo draw: which head pose steered the
+    // game camera this frame is drawn from (see g_pictureTurnMode).
+    static ULONGLONG s_matchFrameMs = 0;
+    static bool s_frameMatched = false;
+    static float s_frameCamHeadForward[3] = { 0.0f, 0.0f, 1.0f };
+    static float s_frameCamCameraForward[3] = { 0.0f, 0.0f, 1.0f };
+    const int frameTurnMode = g_pictureTurnMode.load(std::memory_order_relaxed);
+    if (g_lastPresentMs != s_matchFrameMs) {
+        s_matchFrameMs = g_lastPresentMs;
+        s_frameMatched = false;
+        g_frameCameraPoseId = 0;
+        HeadFollowTargets matched{};
+        int matchAge = 0;
+        float matchErr = 0.0f;
+        if (frameTurnMode != kPictureTurnDouble &&
+            CameraRigHook_MatchHeadFollowTargets(baseBasis.forward, matched, &matchAge, &matchErr) &&
+            matched.poseId != 0) {
+            s_frameMatched = true;
+            std::memcpy(s_frameCamHeadForward, matched.headForward, sizeof(s_frameCamHeadForward));
+            std::memcpy(s_frameCamCameraForward, matched.cameraForward, sizeof(s_frameCamCameraForward));
+            // Camera only: the picture IS that camera, so tag the frame with its
+            // pose. Catch-up: the picture is turned on to the latched pose, so the
+            // latch's own tag (the default at Present) is the truth.
+            if (frameTurnMode == kPictureTurnCameraOnly)
+                g_frameCameraPoseId = matched.poseId;
+
+            // Diagnostics: how old the camera's pose is against the latch, which
+            // camera update the frame was drawn from, and how big the catch-up is.
+            static long long s_sum = 0, s_min = 0, s_max = 0;
+            static unsigned s_n = 0;
+            static ULONGLONG s_windowMs = 0;
+            static unsigned s_ageHist[4] = {};
+            static float s_errMax = 0.0f;
+            static double s_catchSum = 0.0;
+            static float s_catchMax = 0.0f;
+            ++s_ageHist[matchAge < 3 ? matchAge : 3];
+            s_errMax = matchErr > s_errMax ? matchErr : s_errMax;
+            {
+                const float* a = matched.headForward;
+                const float* b = leftView.rotationDelta + 6;
+                const float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+                const float lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+                float c = la > 1e-4f && lb > 1e-4f ? (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb) : 1.0f;
+                c = c < -1.0f ? -1.0f : (c > 1.0f ? 1.0f : c);
+                const float catchDeg = std::acos(c) * 57.2957795f;
+                s_catchSum += catchDeg;
+                s_catchMax = catchDeg > s_catchMax ? catchDeg : s_catchMax;
+            }
+            const long long d = static_cast<long long>(matched.poseId) - static_cast<long long>(g_frameViewsPoseId);
+            if (!s_n)
+                s_min = s_max = d;
+            s_sum += d;
+            s_min = d < s_min ? d : s_min;
+            s_max = d > s_max ? d : s_max;
+            ++s_n;
+            const ULONGLONG nowMs = GetTickCount64();
+            if (!s_windowMs)
+                s_windowMs = nowMs;
+            if (nowMs - s_windowMs >= 3000) {
+#if RE5VR_DIAGNOSTICS
+                Log_Printf("StereoTest: %s - camera pose vs latch %+.1f headset frames on average (min %+lld, max %+lld, "
+                           "%u frames); drawn from camera update newest %u, 1 back %u, 2 back %u, older %u; worst "
+                           "direction match %.1f deg; head moved on since the camera's pose %.1f deg avg, %.1f max",
+                    frameTurnMode == kPictureTurnCatchUp ? "catch-up"
+                        : (frameTurnMode == kPictureTurnDoubleFixed ? "double, culling fixed" : "camera only"),
+                    static_cast<double>(s_sum) / s_n,
+                    s_min, s_max, s_n, s_ageHist[0], s_ageHist[1], s_ageHist[2], s_ageHist[3], s_errMax,
+                    s_catchSum / s_n, s_catchMax);
+#endif
+                s_windowMs = nowMs;
+                s_sum = s_min = s_max = 0;
+                s_n = 0;
+                s_ageHist[0] = s_ageHist[1] = s_ageHist[2] = s_ageHist[3] = 0;
+                s_errMax = 0.0f;
+                s_catchSum = 0.0;
+                s_catchMax = 0.0f;
+            }
+        }
+    }
+
     auto buildEyeBasis = [&](const XRBridgeEyeView& view, bool leftEye) {
         CameraBasis basis = baseBasis;
 
@@ -542,12 +746,48 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         // slow to get it to feel smooth". While head-follow is driving, skip
         // the delta and let the game camera carry the rotation on its own.
         // '\' toggles this off to compare.
-        const bool headFollowDriving = g_compensateHeadFollow.load(std::memory_order_relaxed) &&
-            CameraRigHook_HeadFollowDrivingCamera();
-        if (!headFollowDriving) {
-            Mat3 delta{};
-            std::memcpy(delta.m, view.rotationDelta, sizeof(delta.m));
+        // Decided once per frame from the camera this frame is actually drawn
+        // with (s_frameMatched), not the live head-follow flag: the flag flips
+        // the moment aiming starts or stops, a frame or two before the drawn
+        // camera does, and could even flip between two draws of one frame.
+        const bool headFollowDriving = s_frameMatched;
+        Mat3 delta{};
+        std::memcpy(delta.m, view.rotationDelta, sizeof(delta.m));
+        if (!headFollowDriving || frameTurnMode == kPictureTurnDouble) {
             ApplyHeadRotation(basis, delta);
+        } else if (frameTurnMode == kPictureTurnDoubleFixed) {
+            // Before the first match, fall back to the latched head and its
+            // doubled aim, which is what the camera is being turned by.
+            float headAim[3], cameraAim[3];
+            if (s_frameMatched) {
+                std::memcpy(headAim, s_frameCamHeadForward, sizeof(headAim));
+                std::memcpy(cameraAim, s_frameCamCameraForward, sizeof(cameraAim));
+            } else {
+                std::memcpy(headAim, leftView.rotationDelta + 6, sizeof(headAim));
+                CameraRigHook_DoubleHeadAim(headAim, cameraAim);
+            }
+            Mat3 aHead{}, aCamera{};
+            if (NoRollAim(headAim, aHead) && NoRollAim(cameraAim, aCamera))
+                ApplyHeadRotation(basis, Mat3Multiply(delta, Mat3Multiply(aHead, Mat3Transpose(aCamera))));
+            else
+                ApplyHeadRotation(basis, delta);
+        } else {
+            // The camera already carries a head aim. Take that aim back out of
+            // this eye's delta and apply the rest:
+            //  - catch-up: the aim the camera was steered with, so what remains
+            //    is how far the head has moved on since, plus roll and this
+            //    eye's own angle;
+            //  - camera only (or catch-up before a match): the latched aim, so
+            //    only roll and the eye's own angle remain. Without this the
+            //    frame is tagged with a rolled pose but drawn level, and the
+            //    compositor tilts the world WITH your head (user: "rolling your
+            //    head is inverted").
+            const float* aimFrom = frameTurnMode == kPictureTurnCatchUp && s_frameMatched
+                ? s_frameCamHeadForward
+                : leftView.rotationDelta + 6;
+            Mat3 aim{};
+            if (NoRollAim(aimFrom, aim))
+                ApplyHeadRotation(basis, Mat3Multiply(delta, Mat3Transpose(aim)));
         }
 
         const float offset = leftEye ? -g_halfSeparation : g_halfSeparation;
@@ -571,6 +811,15 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
 
     const CameraBasis leftBasis = buildEyeBasis(leftView, true);
     const CameraBasis rightBasis = buildEyeBasis(rightView, false);
+    {
+        static ULONGLONG s_lastFrameMs = 0;
+        if (g_lastPresentMs != s_lastFrameMs) {
+            s_lastFrameMs = g_lastPresentMs;
+#if RE5VR_DIAGNOSTICS
+            NoteViewVsGameCamera(leftBasis.forward, leftView.rotationDelta);
+#endif
+        }
+    }
 
     ComposeCameraMatrix(leftBasis, ctx.leftMatrix);
     ComposeCameraMatrix(rightBasis, ctx.rightMatrix);
@@ -1180,6 +1429,18 @@ void StereoTest_SetEnabled(bool enabled)
     g_enabled = enabled;
 }
 
+unsigned long long StereoTest_GetLatchedPoseId()
+{
+    if (!g_frameFixes || !g_haveFrameViews || GetTickCount64() - g_lastPresentMs >= kPresentStaleMs)
+        return 0;
+    return g_frameViewsPoseId;
+}
+
+int StereoTest_GetPictureTurnMode()
+{
+    return g_pictureTurnMode.load(std::memory_order_relaxed);
+}
+
 bool StereoTest_GetLatchedHeadForward(float out[3])
 {
     if (!g_frameFixes || !g_haveFrameViews || GetTickCount64() - g_lastPresentMs >= kPresentStaleMs)
@@ -1205,7 +1466,8 @@ void StereoTest_OnPresent()
     // latched at the PREVIOUS Present, so hand that id over before taking a
     // new one - the bridge tags the outgoing image with it so the compositor
     // is told the pose those pixels were really drawn from.
-    VRBridge_NoteFramePresented(g_frameViewsPoseId);
+    VRBridge_NoteFramePresented(g_frameCameraPoseId != 0 ? g_frameCameraPoseId : g_frameViewsPoseId);
+    g_frameCameraPoseId = 0;
 
     g_haveFrameViews = VRBridge_GetEyeViews(g_frameViews[0], g_frameViews[1]);
     g_frameViewsPoseId = g_haveFrameViews ? VRBridge_GetCurrentPoseId() : 0;
@@ -1222,6 +1484,7 @@ StereoSettings StereoTest_GetSettings()
     s.fovWiden = g_fovWidenMultiplier;
     s.monoSmallTargets = g_monoSmallTargets.load(std::memory_order_relaxed);
     s.compensateHeadFollow = g_compensateHeadFollow.load(std::memory_order_relaxed);
+    s.pictureTurnMode = g_pictureTurnMode.load(std::memory_order_relaxed);
     s.hudDistanceMeters = g_hudDistanceMeters;
     s.hudScale = g_hudScale;
     return s;
@@ -1245,6 +1508,13 @@ void StereoTest_ApplySettings(const StereoSettings& in)
         Log_Printf("StereoTest: post-process buffers now drawn %s",
             s.monoSmallTargets ? "MONO (default, no light leaks)" : "per eye (expect light leaks)");
     g_compensateHeadFollow.store(s.compensateHeadFollow, std::memory_order_relaxed);
+    if (s.pictureTurnMode < 0 || s.pictureTurnMode > 3)
+        s.pictureTurnMode = kPictureTurnDoubleFixed;
+    if (s.pictureTurnMode != old.pictureTurnMode) {
+        static const char* const kNames[] = { "double (v0.4.1)", "game camera only", "catch-up", "double, culling fixed" };
+        Log_Printf("StereoTest: picture turning mode now %s", kNames[s.pictureTurnMode]);
+    }
+    g_pictureTurnMode.store(s.pictureTurnMode, std::memory_order_relaxed);
     g_halfSeparation = s.halfSeparation;
     g_fovWidenMultiplier = s.fovWiden;
     g_hudDistanceMeters = s.hudDistanceMeters;

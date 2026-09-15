@@ -138,6 +138,24 @@ std::atomic<UINT64> g_slotFenceValue[kNumSlots] = {};
 // worst case is one side skipping a frame, never stalling on it.
 std::atomic<int> g_slotReaders[kNumSlots] = {};
 
+// 2026-09-14: copy only while d3d9.dll is actually reading frames. Before
+// this the copy ran on every present from the first frame on, VR or not, and
+// changing resolution in exclusive fullscreen removed the D3D12 device a few
+// milliseconds after RE5 asked for the Reset (same log on the user's PC and a
+// tester's, VR off both times). Any consumer export call counts as reading;
+// the VR bridge makes them every frame it submits.
+std::atomic<ULONGLONG> g_consumerSeenMs{ 0 };
+constexpr ULONGLONG kConsumerIdleMs = 2000;
+
+void NoteConsumer()
+{
+    g_consumerSeenMs.store(GetTickCount64(), std::memory_order_release);
+}
+
+// Set by d3d9.dll around IDirect3DDevice9::Reset: dgVoodoo is rebuilding its
+// swapchain (a display mode change in fullscreen), so leave its textures alone.
+std::atomic<bool> g_resetting{ false };
+
 UInt32 g_presentBeginCount = 0;
 constexpr UInt32 kPresentLogInterval = 300; // ~once every few seconds at typical framerates
 
@@ -554,8 +572,8 @@ public:
     // proxy texture and present that instead of the side-by-side frame.
     bool OverrideDesktopView(UInt32 adapterID, const PresentBeginContextInput& iCtx, PresentBeginContextOutput& oCtx)
     {
-        if (!g_dvEnabled.load(std::memory_order_acquire) || !g_d3d12Root || !g_d3d12Device || !iCtx.pSrcTexture ||
-            !iCtx.pSwapchain)
+        if (!g_dvEnabled.load(std::memory_order_acquire) || g_resetting.load(std::memory_order_acquire) || !g_d3d12Root ||
+            !g_d3d12Device || !iCtx.pSrcTexture || !iCtx.pSwapchain)
             return false;
 
         const LONG frameW = iCtx.srcRect.right - iCtx.srcRect.left;
@@ -660,6 +678,22 @@ public:
     {
         ++g_presentBeginCount;
         const bool verboseLog = (g_presentBeginCount <= 5 || (g_presentBeginCount % kPresentLogInterval) == 0);
+
+        if (g_resetting.load(std::memory_order_acquire)) {
+            static UInt32 s_resetSkips = 0;
+            if (++s_resetSkips <= 5)
+                AddonLog_Printf("D3D12SwapchainPresentBegin #%u: the game is resetting its device, no copy", g_presentBeginCount);
+            return;
+        }
+        const bool wanted = GetTickCount64() - g_consumerSeenMs.load(std::memory_order_acquire) < kConsumerIdleMs;
+        static bool s_wasWanted = false;
+        if (wanted != s_wasWanted) {
+            s_wasWanted = wanted;
+            AddonLog_Printf("D3D12SwapchainPresentBegin #%u: %s", g_presentBeginCount,
+                wanted ? "VR is reading frames, copies on" : "nothing has read a frame for 2s, copies off");
+        }
+        if (!wanted)
+            return;
 
         if (!g_d3d12Root || !g_d3d12Device || !iCtx.pSrcTexture) {
             if (verboseLog)
@@ -872,6 +906,7 @@ extern "C" {
 bool API_EXPORT RE5VRAddon_GetFrameInfo(UInt32* outWidth, UInt32* outHeight, Int32* outDxgiFormat,
     void** outHandleSlot0, void** outHandleSlot1)
 {
+    NoteConsumer();
     if (!g_texturesReady)
         return false;
     if (outWidth) *outWidth = g_frameWidth;
@@ -890,6 +925,7 @@ UInt32 API_EXPORT RE5VRAddon_GetSharedGeneration()
 
 Int32 API_EXPORT RE5VRAddon_GetFrontSlot()
 {
+    NoteConsumer();
     return g_frontSlot.load(std::memory_order_acquire);
 }
 
@@ -915,6 +951,7 @@ void API_EXPORT RE5VRAddon_EndReadSlot(Int32 slot)
 // "not yet, come back next frame", never "wait here".
 bool API_EXPORT RE5VRAddon_IsSlotReady(Int32 slot)
 {
+    NoteConsumer();
     if (slot < 0 || slot >= kNumSlots || !g_flushFence)
         return false;
 
@@ -935,6 +972,13 @@ void API_EXPORT RE5VRAddon_SetDesktopView(bool enabled, Int32 x, Int32 y, Int32 
     g_dvW.store(w, std::memory_order_release);
     g_dvH.store(h, std::memory_order_release);
     g_dvEnabled.store(enabled, std::memory_order_release);
+}
+
+// d3d9.dll, around IDirect3DDevice9::Reset. See g_resetting.
+void API_EXPORT RE5VRAddon_SetResetting(bool resetting)
+{
+    g_resetting.store(resetting, std::memory_order_release);
+    AddonLog_Printf("RE5VRAddon_SetResetting(%d)", resetting ? 1 : 0);
 }
 
 bool API_EXPORT AddOnInit(IAddonMainCallback* pAddonMainCB)
