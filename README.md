@@ -273,13 +273,15 @@ click both sticks to open it, the sticks move through it, A selects.
 | Right trigger | Right trigger | Fire |
 | Right stick | Right stick | Look around |
 | Right stick click | R3 | |
-| Right A / B | A / B | Action, knife |
+| Right A / B | A / B | Action |
 | **Left trigger (hold)** | nothing | **Modifier: the right stick becomes the d-pad** |
 | Left stick | Left stick | Move |
 | Left stick click | L3 | (both stick clicks open the mod menu) |
 | Left X / Y | X / Y | Reload, partner command |
 | Left grip | Left shoulder | |
 | Menu button | Start | |
+
+In game I use the Type C control scheme which puts your knife on left grip.
 
 A pad has a d-pad and a controller doesn't, so one stick stands in for it
 while you hold a modifier. The **D-pad** setting on the VR tab picks which:
