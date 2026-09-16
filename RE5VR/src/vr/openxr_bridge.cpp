@@ -16,6 +16,7 @@
 #include <timeapi.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include "xr_input.h" // after openxr.h: its OpenXR half is only declared there
 
 #include <algorithm>
 #include <atomic>
@@ -1133,6 +1134,9 @@ bool InitOpenXRInstanceAndSystem()
         Log_Printf("XRBridge: xrEnumerateViewConfigurationViews failed -> %s", XrResultName(r));
     }
 
+    // Motion controllers: actions must exist before any session does.
+    XrInput_OnInstanceCreated(g_xrInstance);
+
     return true;
 }
 
@@ -1319,6 +1323,10 @@ bool CreateXrSessionAndSwapchains(UINT eyeWidth, UINT eyeHeight, D3DFORMAT d3d9F
         Log_Printf("XRBridge: xrCreateSession failed -> %s", XrResultName(r));
         return false;
     }
+
+    // Motion controllers: the action set has to be attached before the first
+    // sync, and attaching is final (v0.4.3).
+    XrInput_AttachToSession(g_xrSession);
 
     XrReferenceSpaceCreateInfo spaceInfo{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1651,6 +1659,11 @@ void XrSubmitOneFrame()
         Log_Printf("XRBridge: xrWaitFrame failed -> %s", XrResultName(r));
         return;
     }
+        // Motion controllers, once per frame while the runtime is handing out
+        // predicted times (v0.4.3). Cheap, and the game thread only ever
+        // reads the snapshot this leaves behind.
+        XrInput_Sync(g_xrSession, g_xrLocalSpace, frameState.predictedDisplayTime);
+
         if (frameState.shouldRender)
             ++g_realContentFrameCount;
         const bool placeholderMode = kDiagnosticPlaceholderMode &&
@@ -2320,6 +2333,7 @@ void DestroySession()
         xrDestroySpace(g_xrLocalSpace);
         g_xrLocalSpace = XR_NULL_HANDLE;
     }
+    XrInput_OnSessionEnding();
     if (g_xrSession != XR_NULL_HANDLE) {
         const XrResult r = xrDestroySession(g_xrSession);
         Log_Printf("XRBridge: xrDestroySession -> %s", XrResultName(r));
@@ -2742,6 +2756,7 @@ void VRBridge_Shutdown(const char* why)
         g_d3d11Device->Release();
         g_d3d11Device = nullptr;
     }
+    XrInput_OnInstanceDestroyed();
     if (g_xrInstance != XR_NULL_HANDLE) {
         xrDestroyInstance(g_xrInstance);
         g_xrInstance = XR_NULL_HANDLE;

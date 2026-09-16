@@ -1,5 +1,6 @@
 #include "menu.h"
 #include "input_block.h"
+#include "../vr/xr_input.h"
 #include "../hooks/camera_rig_hook.h"
 #include "../hooks/filter_patch.h"
 #include "../render/stereo_test.h"
@@ -54,6 +55,7 @@ struct AllSettings {
     StereoSettings stereo;
     VRBridgeSettings vr;
     RenderSizeSettings res;
+    XrInputSettings xrInput;
     bool filterRemoved = true;
     MenuPrefs menu;
 };
@@ -68,6 +70,7 @@ AllSettings CaptureSettings()
     s.stereo = StereoTest_GetSettings();
     s.vr = VRBridge_GetSettings();
     s.res = RenderSize_GetSettings();
+    s.xrInput = XrInput_GetSettings();
     s.filterRemoved = FilterPatch_IsFilterRemoved();
     s.menu = g_prefs;
     return s;
@@ -83,10 +86,28 @@ void ApplySettings(const AllSettings& in)
     StereoTest_ApplySettings(st);
     VRBridge_ApplySettings(in.vr);
     RenderSize_ApplySettings(in.res);
+    XrInput_SetSettings(in.xrInput);
     if (FilterPatch_IsAvailable())
         FilterPatch_SetFilterRemoved(in.filterRemoved);
     g_prefs = in.menu;
 }
+
+// 3DOF aiming (pointing the gun with the controller) is unfinished: it only
+// works through a servo capped by the game's own turn rate. It has no
+// checkbox, and these keys stay out of re5vr.ini as well, so there is no way
+// for a player to switch on something that isn't ready. Set
+// RE5VR_MOTION_AIM_DEV to 1 to get them back while working on it.
+#define RE5VR_MOTION_AIM_DEV 0
+#if RE5VR_MOTION_AIM_DEV
+#define RE5VR_SETTINGS_AIM_DEV(X)                                    \
+    X("VR", "MotionSwapHands", xrInput.swapHands)                    \
+    X("VR", "MotionPointToAim", xrInput.pointToAim)                  \
+    X("VR", "MotionAimTrim", xrInput.aimPitchTrimDeg)                \
+    X("VR", "MotionAimFindWriter", xrInput.findAimWriter)            \
+    X("VR", "MotionAimWriteField", xrInput.aimWriteField)
+#else
+#define RE5VR_SETTINGS_AIM_DEV(X)
+#endif
 
 // One list drives load, save and "did anything change". Developer switches
 // are deliberately absent: a diagnostics build must never leave, say, direct
@@ -111,6 +132,10 @@ void ApplySettings(const AllSettings& in)
     X("VR", "MonoPostProcess", stereo.monoSmallTargets)              \
 \
     X("VR", "HudScale", stereo.hudScale)                             \
+    X("VR", "MotionControllers", xrInput.enabled)                    \
+    X("VR", "MotionDpadMethod", xrInput.dpadMethod)                  \
+    X("VR", "MotionDeadzone", xrInput.deadzone)                      \
+    RE5VR_SETTINGS_AIM_DEV(X)                                        \
     X("VR", "HeadPredictionMs", vr.headPredictMs)                    \
     X("VR", "HeadRotationGain", vr.headRotationGain)                 \
     X("Menu", "Scale", menu.uiScale)                                 \
@@ -128,6 +153,13 @@ void ReadValue(const char* section, const char* key, bool& v)
     if (buf[0])
         v = std::atoi(buf) != 0;
 }
+void ReadValue(const char* section, const char* key, int& v)
+{
+    char buf[32];
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), g_iniPath);
+    if (buf[0])
+        v = std::atoi(buf);
+}
 void ReadValue(const char* section, const char* key, float& v)
 {
     char buf[32];
@@ -138,6 +170,12 @@ void ReadValue(const char* section, const char* key, float& v)
 std::string FormatValue(bool v)
 {
     return v ? "1" : "0";
+}
+std::string FormatValue(int v)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", v);
+    return buf;
 }
 std::string FormatValue(float v)
 {
@@ -823,6 +861,41 @@ void DrawVrTab(AllSettings& s, bool& changed)
     ImGui::SameLine();
     ImGui::TextDisabled("or hold both sticks in for a second");
 
+    ImGui::SeparatorText("Motion controllers");
+    {
+        changed |= ImGui::Checkbox("Use motion controllers", &s.xrInput.enabled);
+        HelpMarker("Your VR controllers act as a gamepad: right grip aims, right trigger fires, the left stick "
+                   "moves and the right stick looks. The gun still points where the game points it; this is "
+                   "buttons and sticks, not motion aiming.");
+
+        char controllers[160] = "";
+        XrInput_DescribeStatus(controllers, sizeof(controllers));
+        ImGui::TextDisabled("Seen: %s", controllers);
+
+        ImGui::BeginDisabled(!s.xrInput.enabled);
+        static const char* const kDpadMethods[] = {
+            "Hold left trigger, right stick",
+            "Right thumbrest touch, left stick",
+            "Hold left stick in, right stick",
+            "Right stick is always the d-pad",
+            "No d-pad",
+        };
+        changed |= ImGui::Combo("D-pad", &s.xrInput.dpadMethod, kDpadMethods, 5);
+        HelpMarker("A pad has a d-pad and a controller doesn't, so one stick stands in for it while you hold the "
+                   "modifier. The thumbrest option only exists on Quest and Rift Touch controllers.");
+        changed |= ImGui::SliderFloat("Stick deadzone", &s.xrInput.deadzone, 0.0f, 0.5f, "%.2f");
+        HelpMarker("How much of the stick's centre to ignore. Raise it if you drift while standing still.");
+        // Left-handed (swapping which controller is the gun hand) is out for
+        // now: it belongs with 3DOF aiming, where it decides which real hand
+        // points the gun, rather than being a pad-role shuffle on its own.
+        // 3DOF aiming (pointing the gun with the controller) is deliberately
+        // absent: it works only through a servo that tops out at the game's
+        // own 86 degrees a second, which is not a feature, it's a demo. It
+        // lives behind re5vr.ini keys for development until it is genuinely
+        // one to one, and then it gets a checkbox.
+        ImGui::EndDisabled();
+    }
+
     ImGui::SeparatorText("Resolution");
     {
         RenderSizeStatus rs;
@@ -1042,6 +1115,10 @@ void DrawStatusTab()
             StatusRow("We send", "%u x %u per eye%s", vr.eyeWidth, vr.eyeHeight,
                 vr.recommendedEyeWidth > vr.eyeWidth ? " (upscaled by the runtime)" : "");
         if (vr.sessionRunning) {
+            char controllers[160] = "";
+            XrInput_DescribeStatus(controllers, sizeof(controllers));
+            XINPUT_GAMEPAD motionPad = {};
+            StatusRow("Motion controllers", "%s%s", controllers, XrInput_GetPad(&motionPad) ? " (in hand)" : "");
             StatusRow("Headset refresh", "%.0f Hz", vr.predictedDisplayPeriodMs > 0 ? 1000.0f / vr.predictedDisplayPeriodMs : 0.0f);
             StatusRow("Frames submitted", "%.0f / s", vr.submitHz);
             StatusRow("Image age at submit", "%.1f ms", vr.imageAgeMs);
@@ -1495,6 +1572,7 @@ void Menu_Install(IDirect3DDevice9* device)
             SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&MenuWndProc)));
     }
     Log_Printf("Menu: game window %p, window procedure %s", g_hwnd, g_gameWndProc ? "hooked" : "NOT hooked");
+    InputBlock_SetWindow(g_hwnd);
     InputBlock_SetMessageSink(&QueueMessage);
 
     // re5vr.ini next to the game's exe.
@@ -1581,22 +1659,31 @@ void Menu_OnPresent(IDirect3DDevice9* device)
     const bool havePad = InputBlock_ReadPad(&pad);
     const WORD buttons = havePad ? pad.Gamepad.wButtons : 0;
     {
-        // Both sticks: a quick click toggles the menu, a one-second hold resets
-        // the VR view (once per hold). Decided on release, so a hold never
-        // flashes the menu open first.
+        // Both sticks: a click toggles the menu, a one-second hold resets the
+        // VR view (once per hold). Decided on release, so a hold never flashes
+        // the menu open first. The click used to have to be under half a
+        // second, which people reported as the shortcut simply not working
+        // (2026-09-15); anything short of the recenter hold now counts.
         constexpr WORD kBoth = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+        constexpr ULONGLONG kRecenterHoldMs = 1000;
         static ULONGLONG s_chordSinceMs = 0;
         static bool s_recentered = false;
         const bool both = (buttons & kBoth) == kBoth;
         if (both) {
             if (!s_chordSinceMs)
                 s_chordSinceMs = nowMs;
-            if (!s_recentered && nowMs - s_chordSinceMs >= 1000 && CameraRigHook_IsVrActive()) {
+            if (!s_recentered && nowMs - s_chordSinceMs >= kRecenterHoldMs && CameraRigHook_IsVrActive()) {
                 s_recentered = true;
                 VRBridge_RequestRecenter("both sticks held");
             }
         } else if (s_chordSinceMs) {
-            if (!s_recentered && nowMs - s_chordSinceMs < 500 && g_prefs.padChord)
+            const ULONGLONG heldMs = nowMs - s_chordSinceMs;
+            const bool opens = !s_recentered && heldMs < kRecenterHoldMs && g_prefs.padChord;
+            Log_Printf("Menu: both sticks released after %llu ms - %s", heldMs,
+                s_recentered ? "view reset on the hold"
+                             : (!g_prefs.padChord ? "the shortcut is off in the menu"
+                                                  : (opens ? "opening/closing the menu" : "held too long, ignored")));
+            if (opens)
                 OpenMenu(!g_open);
             s_chordSinceMs = 0;
             s_recentered = false;

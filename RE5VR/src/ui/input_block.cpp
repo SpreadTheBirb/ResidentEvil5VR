@@ -1,5 +1,7 @@
 #include "input_block.h"
 #include "../util/log.h"
+#include "../vr/xr_input.h"
+#include "../hooks/camera_rig_hook.h"
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -9,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <intrin.h>
+#include <cstdlib>
 
 namespace {
 
@@ -45,6 +48,14 @@ struct DeviceKind {
 };
 DeviceKind g_kinds[16] = {};
 SRWLOCK g_kindLock = SRWLOCK_INIT;
+
+// The mod's own DirectInput pad (opened at the bottom of this file). The
+// game's devices are filtered below; ours never is, or the menu would go deaf
+// the moment it opened.
+IDirectInputDevice8A* g_diPad = nullptr;
+// A DirectInput pad's buttons, held when the menu closed, hidden until let go.
+BYTE g_diPadMask[128] = {};
+std::atomic<bool> g_captureDiPadMask{ false };
 
 typedef HRESULT(STDMETHODCALLTYPE* GetDeviceState_t)(IDirectInputDevice8A*, DWORD, LPVOID);
 typedef HRESULT(STDMETHODCALLTYPE* GetDeviceData_t)(IDirectInputDevice8A*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
@@ -117,9 +128,69 @@ void ApplyMask(BYTE* state, BYTE* mask, int n, std::atomic<bool>& capture)
 // Counted while blocking, reported at close: which devices the game read.
 std::atomic<unsigned long> g_diKeyboardReads{ 0 }, g_diMouseReads{ 0 }, g_diOtherReads{ 0 };
 
+// A DirectInput pad the game is reading, made idle while the menu is open.
+// Axes go to the centre of whatever range the game set for them, not to zero:
+// a joystick axis usually runs 0 to 65535, where zero means hard left.
+void IdleJoystickState(IDirectInputDevice8A* dev, LPVOID data, DWORD cb)
+{
+    constexpr int kAxes = 8; // lX lY lZ lRx lRy lRz slider0 slider1
+    struct Centers {
+        void* device;
+        LONG axis[kAxes];
+    };
+    static Centers s_cache[8] = {};
+    static SRWLOCK s_lock = SRWLOCK_INIT;
+
+    LONG centers[kAxes] = {};
+    bool known = false;
+    AcquireSRWLockShared(&s_lock);
+    for (const Centers& c : s_cache) {
+        if (c.device == dev) {
+            std::memcpy(centers, c.axis, sizeof(centers));
+            known = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_lock);
+
+    if (!known) {
+        typedef HRESULT(STDMETHODCALLTYPE * GetProperty_t)(IDirectInputDevice8A*, REFGUID, LPDIPROPHEADER);
+        const auto getProp = reinterpret_cast<GetProperty_t>((*reinterpret_cast<void***>(dev))[5]);
+        for (int i = 0; i < kAxes; ++i) {
+            DIPROPRANGE range = {};
+            range.diph.dwSize = sizeof(range);
+            range.diph.dwHeaderSize = sizeof(range.diph);
+            range.diph.dwHow = DIPH_BYOFFSET;
+            range.diph.dwObj = static_cast<DWORD>(i * sizeof(LONG));
+            centers[i] = SUCCEEDED(getProp(dev, DIPROP_RANGE, &range.diph))
+                ? (range.lMin + range.lMax) / 2
+                : 0;
+        }
+        AcquireSRWLockExclusive(&s_lock);
+        for (Centers& c : s_cache) {
+            if (!c.device) {
+                c.device = dev;
+                std::memcpy(c.axis, centers, sizeof(centers));
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&s_lock);
+    }
+
+    // DIJOYSTATE and DIJOYSTATE2 share this prefix: eight axes, four hats,
+    // then the buttons. Everything past the hats reads as nothing pressed.
+    auto* axes = static_cast<LONG*>(data);
+    for (int i = 0; i < kAxes; ++i)
+        axes[i] = centers[i];
+    auto* pov = reinterpret_cast<DWORD*>(static_cast<BYTE*>(data) + 32);
+    for (int i = 0; i < 4; ++i)
+        pov[i] = 0xFFFFFFFF; // centred
+    std::memset(static_cast<BYTE*>(data) + 48, 0, cb - 48);
+}
+
 HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRESULT hr)
 {
-    if (FAILED(hr) || !data)
+    if (FAILED(hr) || !data || dev == g_diPad)
         return hr;
     const BYTE kind = KindOf(dev);
     if (g_blocking.load(std::memory_order_relaxed))
@@ -137,6 +208,18 @@ HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRES
             std::memset(data, 0, cb);
         } else {
             ApplyMask(m->rgbButtons, g_mouseMask, buttons, g_captureMouseMask);
+            // 3DOF aiming rides in here (2026-09-16). The stick could never be
+            // one to one: full deflection turns the gun 86 degrees a second
+            // and a wrist flick is more than twice that. A mouse has no such
+            // ceiling - the game turns by however many counts arrive - so the
+            // aim servo hands its correction to the game's own mouse read
+            // instead. Consumed once, so a frame the game doesn't read costs
+            // nothing and one it reads twice doesn't double up.
+            long aimDx = 0, aimDy = 0;
+            if (CameraRigHook_TakeAimMouse(&aimDx, &aimDy)) {
+                m->lX += aimDx;
+                m->lY += aimDy;
+            }
         }
     } else if (kind == DI8DEVTYPE_MOUSE) {
         // A mouse read in a format we don't parse: still hide it from the game.
@@ -149,6 +232,15 @@ HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRES
             std::memset(data, 0, cb);
         else
             ApplyMask(static_cast<BYTE*>(data), g_keyMask, 256, g_captureKeyMask);
+    } else if (cb == sizeof(DIJOYSTATE) || cb == sizeof(DIJOYSTATE2)) {
+        // A pad the game reads through DirectInput (2026-09-15): a PlayStation
+        // pad without Steam Input, or a generic USB one. Until now it walked
+        // and shot straight through the open menu.
+        const int buttons = cb == sizeof(DIJOYSTATE2) ? 128 : 32;
+        if (g_blocking.load(std::memory_order_relaxed))
+            IdleJoystickState(dev, data, cb);
+        else
+            ApplyMask(static_cast<BYTE*>(data) + 48, g_diPadMask, buttons, g_captureDiPadMask);
     }
     return hr;
 }
@@ -160,8 +252,8 @@ HRESULT FilterDeviceData(IDirectInputDevice8A* dev, LPDIDEVICEOBJECTDATA items, 
     const BYTE kind = KindOf(dev);
     (kind == DI8DEVTYPE_MOUSE ? g_diMouseReads : kind == DI8DEVTYPE_KEYBOARD ? g_diKeyboardReads : g_diOtherReads)
         .fetch_add(1, std::memory_order_relaxed);
-    if (kind != DI8DEVTYPE_MOUSE && kind != DI8DEVTYPE_KEYBOARD)
-        return hr;
+    // Any device: the game gets an empty buffer while the menu is open. Pads
+    // used to be waved through here (2026-09-15).
     if (kind == DI8DEVTYPE_MOUSE) {
         // Buffered mouse: the same collection, event by event.
         long dx = 0, dy = 0, dz = 0;
@@ -307,12 +399,154 @@ typedef DWORD(WINAPI* XInputGetState_t)(DWORD, XINPUT_STATE*);
 XInputGetState_t oXInputGetState = nullptr; // the game's xinput1_3, trampoline once hooked
 XInputGetState_t g_padReader = nullptr;     // what the menu reads through (never blocked)
 
+typedef DWORD(WINAPI* XInputGetCapabilities_t)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+typedef DWORD(WINAPI* XInputSetState_t)(DWORD, XINPUT_VIBRATION*);
+XInputGetCapabilities_t oXInputGetCapabilities = nullptr;
+XInputSetState_t oXInputSetState = nullptr;
+
+// Finding a pad is two questions, not one (2026-09-16). RE5 polls
+// XInputGetState about once a second looking for a pad that has been plugged
+// in; we answered yes every time and it carried on ignoring us, because a
+// game that finds a pad then asks what it is. Only XInputGetState was hooked,
+// so XInputGetCapabilities still said nothing is there, and the game believed
+// the second answer. Now both agree: a plain wired pad on slot 0.
+DWORD WINAPI hkXInputGetCapabilities(DWORD index, DWORD flags, XINPUT_CAPABILITIES* caps)
+{
+    const DWORD r = oXInputGetCapabilities(index, flags, caps);
+    if (r == ERROR_SUCCESS || !caps || index != 0)
+        return r;
+
+    XINPUT_GAMEPAD probe = {};
+    if (!XrInput_GetPad(&probe))
+        return r;
+
+    // What a wired Xbox 360 pad reports: every standard control present, both
+    // triggers and both sticks at full range, rumble on both motors.
+    XINPUT_CAPABILITIES out = {};
+    out.Type = XINPUT_DEVTYPE_GAMEPAD;
+    out.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+    out.Flags = 0;
+    out.Gamepad.wButtons = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT
+        | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_LEFT_THUMB
+        | XINPUT_GAMEPAD_RIGHT_THUMB | XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER
+        | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y;
+    out.Gamepad.bLeftTrigger = 0xFF;
+    out.Gamepad.bRightTrigger = 0xFF;
+    out.Gamepad.sThumbLX = static_cast<SHORT>(0xFFC0);
+    out.Gamepad.sThumbLY = static_cast<SHORT>(0xFFC0);
+    out.Gamepad.sThumbRX = static_cast<SHORT>(0xFFC0);
+    out.Gamepad.sThumbRY = static_cast<SHORT>(0xFFC0);
+    out.Vibration.wLeftMotorSpeed = 0xFF;
+    out.Vibration.wRightMotorSpeed = 0xFF;
+    *caps = out;
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        Log_Printf("InputBlock: told the game slot 0 is a gamepad (motion controllers standing in for one)");
+    }
+    return ERROR_SUCCESS;
+}
+
+// Rumble sent to a pad that isn't there. Saying it worked keeps a game from
+// deciding the pad went away.
+DWORD WINAPI hkXInputSetState(DWORD index, XINPUT_VIBRATION* vibration)
+{
+    const DWORD r = oXInputSetState(index, vibration);
+    if (r == ERROR_SUCCESS || index != 0)
+        return r;
+    XINPUT_GAMEPAD probe = {};
+    return XrInput_GetPad(&probe) ? ERROR_SUCCESS : r;
+}
+
+// Motion controllers, merged into whatever the real pad said (v0.4.3). Same
+// idea as UEVR: OR the buttons in and add the sticks, so a real pad and the
+// controllers work side by side. Slot 0 only, and only when a real pad hasn't
+// already claimed that slot.
+bool MergeMotionPad(XINPUT_GAMEPAD& g)
+{
+    XINPUT_GAMEPAD vr = {};
+    if (!XrInput_GetPad(&vr))
+        return false;
+
+    g.wButtons |= vr.wButtons;
+    if (vr.bLeftTrigger > g.bLeftTrigger)
+        g.bLeftTrigger = vr.bLeftTrigger;
+    if (vr.bRightTrigger > g.bRightTrigger)
+        g.bRightTrigger = vr.bRightTrigger;
+    const auto add = [](SHORT a, SHORT b) {
+        const long sum = static_cast<long>(a) + static_cast<long>(b);
+        return static_cast<SHORT>(sum < -32767 ? -32767 : (sum > 32767 ? 32767 : sum));
+    };
+    g.sThumbLX = add(g.sThumbLX, vr.sThumbLX);
+    g.sThumbLY = add(g.sThumbLY, vr.sThumbLY);
+    g.sThumbRX = add(g.sThumbRX, vr.sThumbRX);
+    g.sThumbRY = add(g.sThumbRY, vr.sThumbRY);
+
+    // 3DOF aiming: the servo's push, so the gun's pitch catches up with where
+    // the controller points. It replaces the stick rather than adding to it,
+    // and only while it has something to ask for, so your own stick still
+    // wins the moment the gun is where you want it.
+    float aimY = 0.0f;
+    if (CameraRigHook_GetAimStickY(&aimY)) {
+        const SHORT servo = static_cast<SHORT>(aimY * 32767.0f);
+        if (std::abs(static_cast<int>(servo)) > std::abs(static_cast<int>(g.sThumbRY)))
+            g.sThumbRY = servo;
+    }
+    return true;
+}
+
 DWORD WINAPI hkXInputGetState(DWORD index, XINPUT_STATE* state)
 {
     const DWORD r = oXInputGetState(index, state);
+
+    // Does RE5 even ask for a pad, and does it get ours? Once every 5 s while
+    // motion controllers are in hand, and silent otherwise (2026-09-16).
+    {
+        static unsigned long s_calls = 0, s_merged = 0, s_synth = 0;
+        static ULONGLONG s_lastMs = 0;
+        ++s_calls;
+        const ULONGLONG nowMs = GetTickCount64();
+        XINPUT_GAMEPAD probe = {};
+        const bool motionLive = XrInput_GetPad(&probe);
+        if (motionLive && nowMs - s_lastMs > 5000) {
+            s_lastMs = nowMs;
+            Log_Printf("InputBlock: the game read XInput %lu times in the last stretch (slot %lu last), "
+                       "%lu merged with the motion pad, %lu answered as a pad that isn't plugged in",
+                s_calls, index, s_merged, s_synth);
+            s_calls = s_merged = s_synth = 0;
+        }
+        if (motionLive && index == 0) {
+            if (r == ERROR_SUCCESS)
+                ++s_merged;
+            else
+                ++s_synth;
+        }
+    }
+
+    // No pad plugged in, but motion controllers in hand: the game is told
+    // slot 0 has a pad, which is how RE5 comes to believe in them at all.
+    if (r != ERROR_SUCCESS && state && index == 0) {
+        // Through MergeMotionPad, not XrInput_GetPad (2026-09-16): the merge
+        // is also where the aim servo's stick goes in, and this path used to
+        // skip it. With no pad plugged in this is the only path, so aiming by
+        // pointing asked for full stick and the game never saw a thing.
+        XINPUT_STATE vr = {};
+        if (MergeMotionPad(vr.Gamepad)) {
+            static DWORD s_packet = 0;
+            vr.dwPacketNumber = ++s_packet;
+            *state = vr;
+            if (g_blocking.load(std::memory_order_relaxed))
+                std::memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+            return ERROR_SUCCESS;
+        }
+    }
+
     if (r != ERROR_SUCCESS || !state || index >= XUSER_MAX_COUNT)
         return r;
     XINPUT_GAMEPAD& g = state->Gamepad;
+    if (index == 0)
+        MergeMotionPad(g);
     if (g_blocking.load(std::memory_order_relaxed)) {
         std::memset(&g, 0, sizeof(g));
         return r;
@@ -380,6 +614,8 @@ void InstallDirectInput()
     probe(IID_IDirectInput8W, "W", hkCreateDeviceW, &oCreateDeviceW);
 }
 
+void HookExport(HMODULE module, const char* name, void* detour, void** original);
+
 void InstallXInput()
 {
     // The game's own XInput. Hooking the export patches the function itself,
@@ -399,6 +635,14 @@ void InstallXInput()
     } else {
         Log_Printf("InputBlock: xinput1_3.dll not found - the pad will reach the game while the menu is open");
     }
+    // The other half of "is there a pad": see hkXInputGetCapabilities.
+    if (game) {
+        HookExport(game, "XInputGetCapabilities", reinterpret_cast<void*>(&hkXInputGetCapabilities),
+            reinterpret_cast<void**>(&oXInputGetCapabilities));
+        HookExport(game, "XInputSetState", reinterpret_cast<void*>(&hkXInputSetState),
+            reinterpret_cast<void**>(&oXInputSetState));
+    }
+
     if (!g_padReader) {
         static const char* const kDlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
         for (const char* name : kDlls) {
@@ -638,7 +882,210 @@ void InstallWin32()
     HookExport(user32, "SetCursor", reinterpret_cast<void*>(&hkSetCursor), reinterpret_cast<void**>(&oSetCursor));
 }
 
+// ---- The mod's own DirectInput pad (2026-09-15) ------------------------
+// XInput only sees XInput pads. A DualShock or DualSense without Steam Input,
+// and most generic USB pads, speak DirectInput instead: they play the game
+// fine, but the menu never saw them, so the both-sticks shortcut did nothing
+// and the pad could not drive the menu. When no XInput pad answers we open our
+// own DirectInput device and translate it into the XINPUT_STATE the rest of
+// the menu already speaks. Ours is a separate, non-exclusive, background
+// device, so the game keeps its own.
+//
+// Sony's DirectInput layout (DualShock 4 and DualSense, USB or Bluetooth):
+//   buttons  0 square, 1 cross, 2 circle, 3 triangle, 4 L1, 5 R1, 6 L2, 7 R2,
+//            8 Share/Create, 9 Options, 10 L3, 11 R3, 12 PS, 13 touchpad
+//   axes     lX/lY left stick, lZ right stick X, lRz right stick Y
+// Most other HID pads follow the same order, so it is the fallback too. The
+// product name and VID/PID go in the log to sort out any that don't.
+HWND g_padWindow = nullptr;
+IDirectInput8A* g_di = nullptr;
+
+DWORD g_diPacket = 0;
+
+struct PadPick {
+    GUID guid = {};
+    char name[MAX_PATH] = {};
+    DWORD vid = 0, pid = 0;
+    bool sony = false;
+    bool found = false;
+};
+
+BOOL CALLBACK EnumPadCallback(LPCDIDEVICEINSTANCEA inst, LPVOID context)
+{
+    auto* pick = static_cast<PadPick*>(context);
+    const DWORD vid = inst->guidProduct.Data1 & 0xFFFF;
+    const DWORD pid = (inst->guidProduct.Data1 >> 16) & 0xFFFF;
+    const bool sony = vid == 0x054C;
+    if (pick->found && !sony)
+        return DIENUM_CONTINUE; // keep the first, unless a Sony pad turns up
+    pick->guid = inst->guidInstance;
+    lstrcpynA(pick->name, inst->tszProductName, MAX_PATH);
+    pick->vid = vid;
+    pick->pid = pid;
+    pick->sony = sony;
+    pick->found = true;
+    return sony ? DIENUM_STOP : DIENUM_CONTINUE;
+}
+
+bool OpenDiPad()
+{
+    if (g_diPad)
+        return true;
+    if (!g_padWindow)
+        return false;
+
+    // Enumeration is not free, so try at most every 2 s.
+    static ULONGLONG s_lastTryMs = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (s_lastTryMs && nowMs - s_lastTryMs < 2000)
+        return false;
+    s_lastTryMs = nowMs;
+
+    if (!g_di) {
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&OpenDiPad), &self);
+        if (FAILED(DirectInput8Create(self, DIRECTINPUT_VERSION, IID_IDirectInput8A,
+                reinterpret_cast<void**>(&g_di), nullptr))) {
+            g_di = nullptr;
+            return false;
+        }
+    }
+
+    PadPick pick;
+    g_di->EnumDevices(DI8DEVCLASS_GAMECTRL, EnumPadCallback, &pick, DIEDFL_ATTACHEDONLY);
+    if (!pick.found)
+        return false;
+
+    IDirectInputDevice8A* dev = nullptr;
+    if (FAILED(g_di->CreateDevice(pick.guid, &dev, nullptr)) || !dev)
+        return false;
+    if (FAILED(dev->SetDataFormat(&c_dfDIJoystick2))) {
+        dev->Release();
+        return false;
+    }
+    dev->SetCooperativeLevel(g_padWindow, DISCL_BACKGROUND | DISCL_NONEXCLUSIVE);
+
+    // Every axis on the same scale, so the translation below is one formula.
+    DIPROPRANGE range = {};
+    range.diph.dwSize = sizeof(range);
+    range.diph.dwHeaderSize = sizeof(range.diph);
+    range.diph.dwHow = DIPH_DEVICE;
+    range.lMin = -1000;
+    range.lMax = 1000;
+    dev->SetProperty(DIPROP_RANGE, &range.diph);
+    dev->Acquire();
+
+    g_diPad = dev;
+    Log_Printf("InputBlock: no XInput pad, using the DirectInput pad \"%s\" (VID %04lX PID %04lX)%s", pick.name,
+        pick.vid, pick.pid, pick.sony ? " - PlayStation layout" : " - assuming the usual layout");
+    return true;
+}
+
+bool ReadDiPad(XINPUT_STATE* out)
+{
+    if (!OpenDiPad())
+        return false;
+
+    DIJOYSTATE2 js = {};
+    HRESULT hr = g_diPad->Poll();
+    if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+        g_diPad->Acquire();
+        g_diPad->Poll();
+    }
+    hr = g_diPad->GetDeviceState(sizeof(js), &js);
+    if (FAILED(hr)) {
+        if (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED) {
+            g_diPad->Acquire();
+        } else {
+            // Unplugged: let the next call look again.
+            Log_Printf("InputBlock: the DirectInput pad stopped answering (hr=0x%08lX) - looking again", hr);
+            g_diPad->Release();
+            g_diPad = nullptr;
+        }
+        return false;
+    }
+
+    const auto down = [&js](int i) { return (js.rgbButtons[i] & 0x80) != 0; };
+
+    // Which button is which, for pads that don't follow the usual order: the
+    // first twenty presses go in the log with the index we read them at.
+    {
+        static BYTE s_prev[32] = {};
+        static int s_left = 20;
+        for (int i = 0; i < 32 && s_left > 0; ++i) {
+            const BYTE now = js.rgbButtons[i] & 0x80;
+            if (now && !s_prev[i]) {
+                --s_left;
+                Log_Printf("InputBlock: DirectInput pad button %d pressed%s", i,
+                    i == 10 ? " (L3 on a PlayStation pad)" : i == 11 ? " (R3 on a PlayStation pad)" : "");
+            }
+            s_prev[i] = now;
+        }
+    }
+
+    WORD b = 0;
+    if (down(1))
+        b |= XINPUT_GAMEPAD_A; // cross
+    if (down(2))
+        b |= XINPUT_GAMEPAD_B; // circle
+    if (down(0))
+        b |= XINPUT_GAMEPAD_X; // square
+    if (down(3))
+        b |= XINPUT_GAMEPAD_Y; // triangle
+    if (down(4))
+        b |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    if (down(5))
+        b |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+    if (down(8))
+        b |= XINPUT_GAMEPAD_BACK; // Share / Create
+    if (down(9))
+        b |= XINPUT_GAMEPAD_START; // Options
+    if (down(10))
+        b |= XINPUT_GAMEPAD_LEFT_THUMB; // L3
+    if (down(11))
+        b |= XINPUT_GAMEPAD_RIGHT_THUMB; // R3
+
+    // The hat, in hundredths of a degree clockwise from up. Centred is -1,
+    // and some drivers only fill the low word.
+    const DWORD pov = js.rgdwPOV[0];
+    if ((pov & 0xFFFF) != 0xFFFF) {
+        const int deg = static_cast<int>((pov / 100) % 360);
+        if (deg >= 315 || deg <= 45)
+            b |= XINPUT_GAMEPAD_DPAD_UP;
+        if (deg >= 45 && deg <= 135)
+            b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+        if (deg >= 135 && deg <= 225)
+            b |= XINPUT_GAMEPAD_DPAD_DOWN;
+        if (deg >= 225 && deg <= 315)
+            b |= XINPUT_GAMEPAD_DPAD_LEFT;
+    }
+
+    const auto axis = [](LONG v) {
+        const long scaled = v * 32767 / 1000;
+        return static_cast<SHORT>(scaled < -32768 ? -32768 : (scaled > 32767 ? 32767 : scaled));
+    };
+
+    *out = XINPUT_STATE{};
+    out->dwPacketNumber = ++g_diPacket;
+    out->Gamepad.wButtons = b;
+    // The triggers as buttons: the menu only needs them pressed or not, and
+    // a pad without analogue trigger axes would otherwise read half-pulled.
+    out->Gamepad.bLeftTrigger = down(6) ? 255 : 0;
+    out->Gamepad.bRightTrigger = down(7) ? 255 : 0;
+    out->Gamepad.sThumbLX = axis(js.lX);
+    out->Gamepad.sThumbLY = axis(-js.lY); // DirectInput Y grows downward
+    out->Gamepad.sThumbRX = axis(js.lZ);
+    out->Gamepad.sThumbRY = axis(-js.lRz);
+    return true;
+}
+
 } // namespace
+
+void InputBlock_SetWindow(HWND hwnd)
+{
+    g_padWindow = hwnd;
+}
 
 void InputBlock_Install()
 {
@@ -672,6 +1119,7 @@ void InputBlock_SetBlocking(bool blocking)
         g_captureMouseMask.store(true, std::memory_order_release);
         for (auto& c : g_capturePadMask)
             c.store(true, std::memory_order_release);
+        g_captureDiPadMask.store(true, std::memory_order_release);
     } else {
         // The game keeps reading the cursor where it was when the menu opened.
         if (!(oGetCursorPos ? oGetCursorPos(&g_frozenCursor) : GetCursorPos(&g_frozenCursor)))
@@ -687,18 +1135,24 @@ bool InputBlock_IsBlocking()
     return g_blocking.load(std::memory_order_relaxed);
 }
 
-bool InputBlock_ReadPad(XINPUT_STATE* out)
+namespace {
+
+bool ReadXInputPad(XINPUT_STATE* out)
 {
     if (!g_padReader)
         return false;
     static int s_pad = -1;
     static ULONGLONG s_lastScanMs = 0;
+    static ULONGLONG s_firstScanMs = 0;
+    static bool s_loggedNone = false;
     XINPUT_STATE st = {};
     if (s_pad >= 0 && g_padReader(static_cast<DWORD>(s_pad), &st) != ERROR_SUCCESS)
         s_pad = -1;
     if (s_pad < 0) {
         // Empty slots are slow to poll, so only rescan every 2 s.
         const ULONGLONG nowMs = GetTickCount64();
+        if (!s_firstScanMs)
+            s_firstScanMs = nowMs;
         if (nowMs - s_lastScanMs < 2000)
             return false;
         s_lastScanMs = nowMs;
@@ -708,9 +1162,43 @@ bool InputBlock_ReadPad(XINPUT_STATE* out)
         }
         if (s_pad < 0)
             return false;
+        Log_Printf("InputBlock: pad found on XInput slot %d", s_pad);
     }
     *out = st;
     return true;
+}
+
+} // namespace
+
+bool InputBlock_ReadPad(XINPUT_STATE* out)
+{
+    // The menu reads past the block, so it sees motion controllers whether or
+    // not a pad is plugged in: both stick clicks open it, the sticks move
+    // through it, A selects.
+    bool have = ReadXInputPad(out) || ReadDiPad(out);
+    XINPUT_GAMEPAD motion = {};
+    if (XrInput_GetPad(&motion)) {
+        if (!have)
+            *out = XINPUT_STATE{};
+        MergeMotionPad(out->Gamepad);
+        have = true;
+    }
+    if (have)
+        return true;
+
+    // Neither kind answered. Say so once, so a log explains a pad shortcut
+    // that does nothing.
+    static ULONGLONG s_firstMissMs = 0;
+    static bool s_logged = false;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (!s_firstMissMs)
+        s_firstMissMs = nowMs;
+    if (!s_logged && nowMs - s_firstMissMs > 15000) {
+        s_logged = true;
+        Log_Printf("InputBlock: no pad on XInput or DirectInput after 15 s - the both-sticks shortcut has nothing "
+                   "to read; Insert still opens the menu");
+    }
+    return false;
 }
 
 void InputBlock_TakeMouse(InputBlockMouse& out)

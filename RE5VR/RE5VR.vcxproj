@@ -99,6 +99,7 @@
     <ClCompile Include="src\hooks\pixel_constant_probe.cpp" />
     <ClCompile Include="src\hooks\head_hide_probe.cpp" />
     <ClCompile Include="src\hooks\camera_rig_hook.cpp" />
+    <ClCompile Include="src\hooks\aim_finder.cpp" />
     <ClCompile Include="src\hooks\boom_finder.cpp" />
     <ClCompile Include="src\hooks\fade_probe.cpp" />
     <ClCompile Include="src\hooks\fade_patch.cpp" />
@@ -114,6 +115,7 @@
     <ClCompile Include="src\render\render_size.cpp" />
     <ClCompile Include="src\util\update_check.cpp" />
     <ClCompile Include="src\vr\openxr_bridge.cpp" />
+    <ClCompile Include="src\vr\xr_input.cpp" />
     <ClCompile Include="src\vr\d3d12_addon_bridge.cpp" />
     <ClCompile Include="src\ui\menu.cpp" />
     <ClCompile Include="src\ui\input_block.cpp" />
@@ -141,6 +143,7 @@
     <ClInclude Include="src\hooks\pixel_constant_probe.h" />
     <ClInclude Include="src\hooks\head_hide_probe.h" />
     <ClInclude Include="src\hooks\camera_rig_hook.h" />
+    <ClInclude Include="src\hooks\aim_finder.h" />
     <ClInclude Include="src\hooks\boom_finder.h" />
     <ClInclude Include="src\hooks\fade_probe.h" />
     <ClInclude Include="src\hooks\fade_patch.h" />
@@ -157,6 +160,7 @@
     <ClInclude Include="src\util\update_check.h" />
     <ClInclude Include="src\util\version.h" />
     <ClInclude Include="src\vr\openxr_bridge.h" />
+    <ClInclude Include="src\vr\xr_input.h" />
     <ClInclude Include="src\vr\d3d12_addon_bridge.h" />
     <ClInclude Include="src\ui\menu.h" />
     <ClInclude Include="src\ui\input_block.h" />

@@ -3,6 +3,7 @@
 #include "pixel_constant_probe.h"
 #include "head_hide_probe.h"
 #include "camera_rig_hook.h"
+#include "aim_finder.h"
 #include "boom_finder.h"
 #include "fade_probe.h"
 #include "fade_patch.h"
@@ -254,6 +255,7 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     // Poll the F8 stereo-test toggle first.
     StereoTest_OnEndScene(This);
     CameraRigHook_OnEndScene();
+    AimFinder_OnEndScene(); // reports if a watch window has finished
 #if RE5VR_DIAGNOSTICS
     BoomFinder_OnEndScene();   // F5: hardware-watchpoint finder
     StateProbe_OnEndScene();   // "=": game-state capture

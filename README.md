@@ -4,7 +4,7 @@ A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
 DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
-> **Status:** v0.4.2, working and playable, still under active development.
+> **Status:** v0.4.2a, working and playable, still under active development.
 > There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
@@ -19,6 +19,12 @@ Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steerin
 > **Update (v0.4.1):** full resolution per eye. VR is now crisp: each eye
 > renders at the resolution your VR runtime asks for, so SteamVR's resolution
 > setting and Virtual Desktop's quality presets finally do something.
+
+> **Update (v0.4.2a):** VR motion controllers now work as a gamepad, so you
+> can play without a pad in your hands (see [Motion
+> controllers](#motion-controllers)). PlayStation pads and other
+> non-XInput controllers can open and drive the mod menu. Fixes a crash at
+> launch on PCs running another program that hooks Direct3D 9.
 
 > **Update (v0.4.2):** no more things vanishing or popping in when you look
 > over your shoulder in VR, aiming included. Look around freely while you aim;
@@ -51,8 +57,8 @@ to clone this repository to play.
 
 | Download | For | Files |
 |---|---|---|
-| `TrueFP-v0.4.2-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
-| `TrueFP-v0.4.2-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
+| `TrueFP-v0.4.2a-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
+| `TrueFP-v0.4.2a-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
 
 ### Do this first: the 4GB patch
 
@@ -255,6 +261,35 @@ tab to turn it off.
 fullscreen no longer crashes as of v0.4.2, but turning VR on while in exclusive
 fullscreen hasn't been confirmed fixed on every PC.
 
+### Motion controllers
+
+Your VR controllers work as a gamepad, so RE5 sees an ordinary pad and shows
+pad prompts. Nothing needs to be plugged in. They also drive the mod menu:
+click both sticks to open it, the sticks move through it, A selects.
+
+| Motion control | Acts as | In RE5 |
+| --- | --- | --- |
+| Right grip | Left trigger | Aim |
+| Right trigger | Right trigger | Fire |
+| Right stick | Right stick | Look around |
+| Right stick click | R3 | |
+| Right A / B | A / B | Action, knife |
+| **Left trigger (hold)** | nothing | **Modifier: the right stick becomes the d-pad** |
+| Left stick | Left stick | Move |
+| Left stick click | L3 | (both stick clicks open the mod menu) |
+| Left X / Y | X / Y | Reload, partner command |
+| Left grip | Left shoulder | |
+| Menu button | Start | |
+
+A pad has a d-pad and a controller doesn't, so one stick stands in for it
+while you hold a modifier. The **D-pad** setting on the VR tab picks which:
+hold the left trigger (default, works on every headset), rest your thumb on
+the right thumbrest (Quest and Rift Touch only), hold the left stick in, or
+give up the right stick to the d-pad entirely. There is also a **Stick
+deadzone** slider if you drift while standing still.
+
+Turn the lot off with **Use motion controllers** on the VR tab.
+
 ### Resolution
 
 Each eye renders at the resolution your VR runtime recommends, so the
@@ -302,6 +337,9 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 - **Pressing aim repeatedly can pull your view back toward level** after you've
   aimed up or down with the mouse or stick. The game rescales pitch every time
   you enter aim.
+- **Motion controllers act as a gamepad, not as hands.** The gun points where
+  the game points it, not where you point the controller. Aiming by pointing
+  is being worked on for a later version.
 - **VR motion controllers are not supported yet.** Use a gamepad (Xbox,
   PlayStation or similar) or mouse and keyboard.
 - RE5's own mouse cursor can point at the wrong menu item while VR is on (the

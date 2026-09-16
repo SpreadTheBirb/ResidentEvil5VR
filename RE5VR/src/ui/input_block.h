@@ -24,7 +24,15 @@ void InputBlock_Install();
 void InputBlock_SetBlocking(bool blocking);
 bool InputBlock_IsBlocking();
 
+// The game's window, for the mod's own DirectInput pad. Call once it is known.
+void InputBlock_SetWindow(HWND hwnd);
+
 // The first connected pad, read past the block. False if no pad.
+//
+// XInput first. Failing that, a DirectInput pad opened by the mod itself and
+// translated into the same XINPUT_STATE (2026-09-15): a DualShock or DualSense
+// without Steam Input, and most generic USB pads, speak only DirectInput, so
+// until now they played the game but could not open or drive this menu.
 bool InputBlock_ReadPad(XINPUT_STATE* out);
 
 // Mouse movement the game polled while blocking, since the last call.

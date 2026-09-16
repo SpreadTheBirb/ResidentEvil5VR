@@ -1,8 +1,11 @@
 #include "camera_rig_hook.h"
+#include "aim_finder.h"
 #include "constant_probe.h"
 #include "fade_patch.h"
 #include "../render/stereo_test.h"
 #include "../vr/openxr_bridge.h"
+#include "../vr/xr_input.h"
+#include "../ui/input_block.h"
 #include "../util/log.h"
 #include "../util/build_config.h"
 
@@ -1060,6 +1063,19 @@ bool TryRead(void* dst, const void* src, size_t n)
     }
 }
 
+// The other direction, for the few places the mod sets one of the game's own
+// values rather than reading it. In-process only, and guarded the same way:
+// a character can be freed between the read that found it and the write.
+bool TryWrite(void* dst, const void* src, size_t n)
+{
+    __try {
+        std::memcpy(dst, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 float Length3(const float* v)
 {
     return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -2023,10 +2039,44 @@ bool ReadPadState(XINPUT_STATE* out)
     return true;
 }
 
+// The pad, motion controllers included (v0.4.3). Walking while aiming is the
+// mod's own doing - RE5 roots you the moment the gun comes up - so it reads
+// the stick here rather than through the game, and this reader knew only
+// about real pads. Hidden while the mod menu is open, exactly like the game's
+// own pad reads, so steering the menu doesn't walk Chris around.
+bool ReadPadStateWithMotion(XINPUT_STATE* out)
+{
+    const bool real = ReadPadState(out);
+    if (InputBlock_IsBlocking())
+        return real;
+
+    XINPUT_GAMEPAD motion = {};
+    if (!XrInput_GetPad(&motion))
+        return real;
+    if (!real)
+        *out = XINPUT_STATE{};
+
+    XINPUT_GAMEPAD& g = out->Gamepad;
+    g.wButtons |= motion.wButtons;
+    if (motion.bLeftTrigger > g.bLeftTrigger)
+        g.bLeftTrigger = motion.bLeftTrigger;
+    if (motion.bRightTrigger > g.bRightTrigger)
+        g.bRightTrigger = motion.bRightTrigger;
+    const auto add = [](SHORT a, SHORT b) {
+        const long sum = static_cast<long>(a) + static_cast<long>(b);
+        return static_cast<SHORT>(sum < -32767 ? -32767 : (sum > 32767 ? 32767 : sum));
+    };
+    g.sThumbLX = add(g.sThumbLX, motion.sThumbLX);
+    g.sThumbLY = add(g.sThumbLY, motion.sThumbLY);
+    g.sThumbRX = add(g.sThumbRX, motion.sThumbRX);
+    g.sThumbRY = add(g.sThumbRY, motion.sThumbRY);
+    return true;
+}
+
 bool ReadLeftStick(float* forward, float* strafe)
 {
     XINPUT_STATE st = {};
-    if (!ReadPadState(&st))
+    if (!ReadPadStateWithMotion(&st))
         return false;
 
     const float x = st.Gamepad.sThumbLX, y = st.Gamepad.sThumbLY;
@@ -2040,6 +2090,445 @@ bool ReadLeftStick(float* forward, float* strafe)
     *strafe = x / len * mag;
     *forward = y / len * mag;
     return true;
+}
+
+// ---- 3DOF aiming: the gun's pitch follows the controller ----------------
+// See the call site in OnRigsReady for what the probe run established. The
+// ends of the game's own range, from that log: about 85 degrees up and 74
+// down, which is further than a person usually points.
+// 3DOF aiming is unfinished and switched off for release: no checkbox, no
+// ini keys, and no game code patched for it. Set to true to resume the work.
+constexpr bool kInstallAimHooks = false;
+
+constexpr float kAimPitchUpDeg = 85.0f;
+constexpr float kAimPitchDownDeg = -74.0f;
+// A field step this big is the most one frame may ask for, so a lost target
+// or a weapon change can't snap the gun.
+constexpr float kAimFieldMaxStep = 0.35f;
+
+// The pitch the rig actually came out at, from eye (+0x170) to target
+// (+0x190). This is the feedback the loop closes on.
+bool RigPitchDegrees(unsigned char* controller, float* outDeg)
+{
+    float eye[3] = {}, target[3] = {};
+    if (!TryRead(eye, controller + 0x170, sizeof(eye)) || !TryRead(target, controller + 0x190, sizeof(target)))
+        return false;
+    const float dx = target[0] - eye[0], dy = target[1] - eye[1], dz = target[2] - eye[2];
+    const float flat = std::sqrt(dx * dx + dz * dz);
+    if (flat < 1e-3f)
+        return false;
+    *outDeg = std::atan2(dy, flat) * 180.0f / 3.14159265358979f;
+    return true;
+}
+
+// The stick the aim servo wants, -1..1, published for the pad the game reads.
+// Only used when the direct write below isn't available: the stick is capped
+// by the game's own aim rate (86 deg/sec measured, sensitivity at maximum),
+// which is less than half a wrist flick.
+std::atomic<float> g_aimStickY{ 0.0f };
+std::atomic<unsigned long long> g_aimStickMs{ 0 };
+
+// ---- Setting the aim pitch at its source -------------------------------
+// The watchpoint run found one instruction writing the character's pitch,
+// exe+7607B5, 240 times in 4 seconds, with the character in both ecx and esi.
+// Writing the field anywhere else in the frame is pointless - that
+// instruction runs every frame and overwrites it before anything reads it -
+// so the hook sits immediately after it and puts our value in instead. The
+// camera blend, the weapon and the laser all come off this one number, so
+// they stay in agreement, and nothing is rate limited.
+bool g_aimWriteHooked = false;
+void* g_aimWriteTrampoline = nullptr;
+std::atomic<unsigned char*> g_aimWriteCharacter{ nullptr };
+std::atomic<float> g_aimWriteValue{ 0.0f };
+std::atomic<unsigned long> g_aimWriteOffset{ 0 };
+// Point to aim is on and VR is running: the view stops following the gun.
+std::atomic<bool> g_pointToAimActive{ false };
+
+// ---- The aim point, set where the game writes it -----------------------
+// The gun aims along a ray ending at a world point on the character, about
+// 5000 units out (+0x2980). The game writes that point every frame from
+// exe+776AA0 - found by watchpoint, 211 writes in 4 seconds, character in esi
+// - so anything we put there earlier is gone before it is used. The hook
+// below sits immediately after that write.
+//
+// It is handed the eye the ray starts from and the tangent of the pitch we
+// want, rather than a finished height: the bearing and range are the game's
+// own and it has just written them, so the height is worked out from what is
+// in memory at that instant instead of from last frame's numbers.
+bool g_aimPointHooked = false;
+void* g_aimPointTrampoline = nullptr;
+std::atomic<unsigned char*> g_aimPointCharacter{ nullptr };
+std::atomic<float> g_aimPointEyeX{ 0.0f }, g_aimPointEyeY{ 0.0f }, g_aimPointEyeZ{ 0.0f };
+std::atomic<float> g_aimPointTan{ 0.0f };
+std::atomic<unsigned long long> g_aimPointMs{ 0 };
+// Test (VR.MotionAimWriteField=4): force the ray upward, to see what reads it.
+std::atomic<bool> g_aimPointForceUp{ false };
+// 3DOF through the game.s own mouse: counts waiting to be handed over.
+std::atomic<long> g_aimMouseDy{ 0 };
+std::atomic<unsigned long long> g_aimMouseMs{ 0 };
+std::atomic<unsigned long long> g_aimWriteMs{ 0 };
+
+void AimFromController(unsigned char* controller)
+{
+    // Says why nothing happened, once a second. A run where the gun didn't
+    // move and the log had no aim line at all (2026-09-16) could have been
+    // any of these three, and guessing cost a test run.
+    const auto bail = [](const char* why) {
+        static ULONGLONG s_ms = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_ms > 1000) {
+            s_ms = now;
+            Log_Printf("AimStop: %s", why);
+        }
+    };
+
+    const XrInputSettings settings = XrInput_GetSettings();
+    if (!settings.enabled || !settings.pointToAim) {
+        bail(!settings.enabled ? "motion controllers are switched off" : "Point to aim is switched off");
+        return;
+    }
+
+    float gunYawDeg = 0.0f, gunPitchDeg = 0.0f;
+    if (!XrInput_GetGunAim(&gunYawDeg, &gunPitchDeg)) {
+        bail("the gun hand isn't being tracked");
+        return;
+    }
+
+    float rigPitch = 0.0f;
+    if (!RigPitchDegrees(controller, &rigPitch)) {
+        bail("the camera rig has no direction to compare against");
+        return;
+    }
+    if (settings.aimWriteField == 0)
+        bail("no aim method is selected (VR.MotionAimWriteField is 0)");
+
+    // Developer: find the value the GUN aims by (2026-09-16). +0x2DC8 turned
+    // out to drive only the camera rig - the servo tracks it to within half a
+    // degree and the gun never moves, while the stick moves the gun - so the
+    // weapon's own angle is some other float on the character. This prints a
+    // block of them once a second next to the rig pitch; sweeping the stick
+    // and reading the log says which offsets follow the gun.
+    if (settings.findAimWriter) {
+        static ULONGLONG s_scanMs = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_scanMs > 1000) {
+            s_scanMs = now;
+            unsigned char* character = nullptr;
+            if (TryRead(&character, controller + kOffControllerCharacter, sizeof(character)) && character) {
+                // The candidate found by correlating the first scan: three
+                // floats at +0x2980 that look like a world point, whose
+                // height tracks the gun's pitch at r = 0.99 while the other
+                // two don't. If it is the point the gun aims at, its
+                // direction from the character matches the rig's pitch - and
+                // a point carries yaw as well, which a blend factor cannot.
+                float aimPoint[3] = {}, selfPos[3] = {};
+                if (TryRead(aimPoint, character + 0x2980, sizeof(aimPoint))
+                    && TryRead(selfPos, character + kOffCharacterPos, sizeof(selfPos))) {
+                    const float dx = aimPoint[0] - selfPos[0], dy = aimPoint[1] - selfPos[1],
+                                dz = aimPoint[2] - selfPos[2];
+                    const float flat = std::sqrt(dx * dx + dz * dz);
+                    const float pointPitch = flat > 1e-3f ? std::atan2(dy, flat) * 180.0f / kPi : 0.0f;
+                    const float pointYaw = std::atan2(-dx, -dz) * 180.0f / kPi;
+                    Log_Printf("AimPoint: +0x2980 is (%.1f %.1f %.1f), character at (%.1f %.1f %.1f) -> pitch %.1f "
+                               "yaw %.1f, distance %.0f (rig pitch %.1f)",
+                        aimPoint[0], aimPoint[1], aimPoint[2], selfPos[0], selfPos[1], selfPos[2], pointPitch,
+                        pointYaw, std::sqrt(flat * flat + dy * dy), rigPitch);
+                }
+                // And who writes the aim point's height, so that if the game
+                // overwrites our value before using it we already know where
+                // to sit instead. Once per run.
+                static bool s_watching = false;
+                if (!s_watching) {
+                    s_watching = true;
+                    AimFinder_Start(character + 0x2984, "the aim point height (+0x2984)");
+                }
+
+                Log_Printf("AimScan: rig pitch %.1f, character %p", rigPitch, character);
+                for (DWORD base = 0x28C0; base < 0x2E40; base += 0x20) {
+                    float v[8] = {};
+                    if (!TryRead(v, character + base, sizeof(v)))
+                        continue;
+                    // Only lines with something plausibly angular in them, to
+                    // keep the log readable.
+                    bool interesting = false;
+                    for (float f : v) {
+                        if (f > -4.0f && f < 4.0f && f != 0.0f)
+                            interesting = true;
+                    }
+                    if (!interesting)
+                        continue;
+                    Log_Printf("AimScan: +0x%04lX  %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f", base, v[0],
+                        v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+                }
+            }
+        }
+    }
+
+    float wanted = gunPitchDeg + settings.aimPitchTrimDeg;
+    if (wanted > kAimPitchUpDeg)
+        wanted = kAimPitchUpDeg;
+    if (wanted < kAimPitchDownDeg)
+        wanted = kAimPitchDownDeg;
+    const float error = wanted - rigPitch;
+
+    // With the writer hooked, set the number itself: work out the field value
+    // that lands the gun where the controller points, and let the hook put it
+    // in right after the game writes its own. Degrees per unit is not a
+    // constant - measured between 13 and 51 across the range - so it is
+    // learned from what the last frame's change actually did rather than
+    // assumed. Converging takes a frame or two, and nothing caps how far one
+    // frame may move.
+    // The aim point (2026-09-16). Three floats at +0x2980 hold a world point
+    // about 5000 units out whose height follows the gun and whose bearing
+    // holds still: an aim ray projected to a fixed range. Setting its height
+    // aims the gun in one frame, with no ladder, no learned gain and no
+    // servo, and the same point carries yaw when we come to it.
+    //
+    // Only the height is touched here. The bearing is left exactly as the
+    // game has it, because our controller's yaw is measured in the play space
+    // and the game's is world space, and lining those two frames up is the
+    // yaw milestone, not this one.
+    g_aimPointForceUp.store(settings.aimWriteField == 4, std::memory_order_relaxed);
+    if (settings.aimWriteField == 3 || settings.aimWriteField == 4) {
+        unsigned char* character = nullptr;
+        if (TryRead(&character, controller + kOffControllerCharacter, sizeof(character)) && character) {
+            float point[3] = {}, eye[3] = {};
+            if (TryRead(point, character + 0x2980, sizeof(point)) && TryRead(eye, controller + 0x170, sizeof(eye))) {
+                const float dx = point[0] - eye[0], dz = point[2] - eye[2];
+                const float flat = std::sqrt(dx * dx + dz * dz);
+                if (flat > 1.0f) {
+                    float wanted = gunPitchDeg + settings.aimPitchTrimDeg;
+                    if (wanted > kAimPitchUpDeg)
+                        wanted = kAimPitchUpDeg;
+                    if (wanted < kAimPitchDownDeg)
+                        wanted = kAimPitchDownDeg;
+                    const float tanWanted = std::tan(wanted * kPi / 180.0f);
+                    g_aimPointEyeX.store(eye[0], std::memory_order_relaxed);
+                    g_aimPointEyeY.store(eye[1], std::memory_order_relaxed);
+                    g_aimPointEyeZ.store(eye[2], std::memory_order_relaxed);
+                    g_aimPointTan.store(tanWanted, std::memory_order_relaxed);
+                    g_aimPointCharacter.store(character, std::memory_order_relaxed);
+                    g_aimPointMs.store(GetTickCount64(), std::memory_order_relaxed);
+
+                    static ULONGLONG s_logMs = 0;
+                    const ULONGLONG now = GetTickCount64();
+                    if (now - s_logMs > 1000) {
+                        s_logMs = now;
+                        Log_Printf("AimPoint: controller %.1f -> height %.1f (game had %.1f), ray from the eye is "
+                                   "%.0f long, rig pitch %.1f%s",
+                            wanted, eye[1] + flat * tanWanted, point[1], flat, rigPitch,
+                            g_aimPointHooked ? "" : " - NOT HOOKED, the game will overwrite it");
+                    }
+                }
+            }
+        }
+        g_aimStickY.store(0.0f, std::memory_order_relaxed);
+        return;
+    }
+
+    // Which field, if any. +0x2DC8 was the first one found and it turned out
+    // to be the CAMERA's pitch: writing it tilted the view and never moved
+    // the gun, which is backwards for 3DOF (2026-09-16, user: "should only
+    // move the gun, never the camera"). Off until the gun's own angle is
+    // found; the laser code's neighbouring field at +0x2918 says to look
+    // around +0x2900.
+    const DWORD aimField = settings.aimWriteField == 1 ? 0x2DC8 : settings.aimWriteField == 2 ? 0x2908 : 0;
+    if (g_aimWriteHooked && aimField) {
+        unsigned char* character = nullptr;
+        if (TryRead(&character, controller + kOffControllerCharacter, sizeof(character)) && character) {
+            float field = 0.0f;
+            if (TryRead(&field, character + aimField, sizeof(field))) {
+                static float s_degPerUnit = 45.0f;
+                static float s_lastField = 0.0f, s_lastPitch = 0.0f;
+                static unsigned char* s_lastCharacter = nullptr;
+                if (s_lastCharacter == character) {
+                    const float dField = field - s_lastField;
+                    const float dPitch = rigPitch - s_lastPitch;
+                    if (std::fabs(dField) > 0.02f) {
+                        // The blend is minus the field, so a positive step
+                        // lowers the gun.
+                        const float measured = -dPitch / dField;
+                        if (measured > 8.0f && measured < 120.0f)
+                            s_degPerUnit += (measured - s_degPerUnit) * 0.3f;
+                    }
+                }
+
+                // Damped, and capped per frame. Asking for the whole error at
+                // once threw the gun corner to corner (2026-09-16: controller
+                // level, rig pitch swinging +77 to -77 every second), because
+                // the feedback is a frame behind and a unit is worth up to 50
+                // degrees near the centre. A third of the error per frame,
+                // never more than this much of the ladder, still crosses the
+                // full range in a few frames - far quicker than the stick's
+                // 86 degrees a second.
+                constexpr float kAimDamping = 0.35f;
+                constexpr float kAimMaxStep = 0.2f;
+                float step = -(error / s_degPerUnit) * kAimDamping;
+                if (step > kAimMaxStep)
+                    step = kAimMaxStep;
+                if (step < -kAimMaxStep)
+                    step = -kAimMaxStep;
+                if (std::fabs(error) < 0.5f)
+                    step = 0.0f; // settled: leave the game's own value alone
+
+                float next = field + step;
+                if (next > 2.5f)
+                    next = 2.5f;
+                if (next < -2.5f)
+                    next = -2.5f;
+
+                s_lastField = field;
+                s_lastPitch = rigPitch;
+                s_lastCharacter = character;
+
+                g_aimWriteOffset.store(aimField, std::memory_order_relaxed);
+                g_aimWriteValue.store(next, std::memory_order_relaxed);
+                g_aimWriteCharacter.store(character, std::memory_order_relaxed);
+                g_aimWriteMs.store(GetTickCount64(), std::memory_order_relaxed);
+
+                static ULONGLONG s_logMs = 0;
+                const ULONGLONG now = GetTickCount64();
+                if (now - s_logMs > 1000) {
+                    s_logMs = now;
+                    Log_Printf("AimPitch: controller %.1f (trim %.1f) vs rig %.1f -> error %.1f, field %.3f to "
+                               "%.3f, %.1f deg per unit (written at the source)",
+                        gunPitchDeg, settings.aimPitchTrimDeg, rigPitch, error, field, next, s_degPerUnit);
+                }
+            }
+        }
+        g_aimStickY.store(0.0f, std::memory_order_relaxed);
+        return;
+    }
+
+    // Through the game's own mouse (2026-09-16). Every value we found and
+    // wrote turned out to be downstream - +0x2DC8 is one line of a block copy
+    // of camera floats, and the aim ray at +0x2980 is written at the tail of
+    // its routine and read by nothing, proven by forcing it skyward and
+    // watching nothing move. The stick works but tops out at 86 degrees a
+    // second. A mouse doesn't: the game turns by however many counts arrive,
+    // so the same error becomes mouse movement and the gun can keep up with a
+    // wrist. Counts per degree is learned from what the last batch actually
+    // did, since it depends on the player's own sensitivity setting.
+    if (settings.aimWriteField == 5) {
+        static float s_countsPerDeg = 6.0f;
+        static float s_lastPitch = 0.0f;
+        static long s_lastSent = 0;
+        static bool s_have = false;
+        if (s_have && s_lastSent != 0) {
+            const float moved = rigPitch - s_lastPitch;
+            if (std::fabs(moved) > 0.3f) {
+                const float measured = static_cast<float>(s_lastSent) / moved;
+                // Sign included: which way the game reads mouse Y is its own
+                // business, and this learns it rather than assuming.
+                if (std::fabs(measured) > 0.5f && std::fabs(measured) < 200.0f)
+                    s_countsPerDeg += (measured - s_countsPerDeg) * 0.3f;
+            }
+        }
+
+        long dy = 0;
+        if (std::fabs(error) > 0.4f) {
+            float counts = error * s_countsPerDeg;
+            // A cap only so a lost controller can't fling the gun across the
+            // room in one frame; it is far above a normal correction.
+            if (counts > 400.0f)
+                counts = 400.0f;
+            if (counts < -400.0f)
+                counts = -400.0f;
+            dy = static_cast<long>(counts);
+        }
+        s_lastPitch = rigPitch;
+        s_lastSent = dy;
+        s_have = true;
+        g_aimMouseDy.store(dy, std::memory_order_relaxed);
+        g_aimMouseMs.store(GetTickCount64(), std::memory_order_relaxed);
+        g_aimStickY.store(0.0f, std::memory_order_relaxed);
+
+        static ULONGLONG s_logMs = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_logMs > 1000) {
+            s_logMs = now;
+            Log_Printf("AimMouse: controller %.1f vs rig %.1f -> error %.1f, sending %ld counts, %.1f counts per "
+                       "degree",
+                gunPitchDeg, rigPitch, error, dy, s_countsPerDeg);
+        }
+        return;
+    }
+
+    // Fallback: drive the stick instead. The virtual pad is ours already, so
+    // the servo asks for a deflection and the game does the rest, at its own
+    // pace.
+    static float s_appliedY = 0.0f;
+    static float s_lastPitch = 0.0f;
+    static bool s_haveLast = false;
+    static int s_stickSign = 1; // +1 if pushing up raises the gun
+    if (s_haveLast && std::fabs(s_appliedY) > 0.25f) {
+        const float dPitch = rigPitch - s_lastPitch;
+        if (std::fabs(dPitch) > 0.4f) {
+            // Which way the game reads its own stick, learned rather than
+            // assumed. One disagreeing frame proves nothing (recoil, a step,
+            // a scripted nudge all move pitch on their own), so it takes
+            // three in a row to flip.
+            static int s_wrongInARow = 0;
+            const bool agreed = (dPitch > 0.0f) == (s_appliedY > 0.0f);
+            s_wrongInARow = agreed ? 0 : s_wrongInARow + 1;
+            if (s_wrongInARow >= 3) {
+                s_wrongInARow = 0;
+                s_stickSign = -s_stickSign;
+                Log_Printf("AimPitch: the stick reads the other way round, flipping to %s",
+                    s_stickSign > 0 ? "positive up" : "negative up");
+            }
+        }
+    }
+
+    // Full deflection while more than this far off, easing in as it arrives.
+    constexpr float kFullTiltErrorDeg = 12.0f;
+    constexpr float kDeadbandDeg = 1.0f;
+    float stickY = 0.0f;
+    if (std::fabs(error) > kDeadbandDeg) {
+        stickY = error / kFullTiltErrorDeg;
+        if (stickY > 1.0f)
+            stickY = 1.0f;
+        if (stickY < -1.0f)
+            stickY = -1.0f;
+        stickY *= static_cast<float>(s_stickSign);
+    }
+
+    s_appliedY = stickY;
+    s_lastPitch = rigPitch;
+    s_haveLast = true;
+    g_aimStickY.store(stickY, std::memory_order_relaxed);
+    g_aimStickMs.store(GetTickCount64(), std::memory_order_relaxed);
+
+    // How fast the game will actually turn the gun. This is the number that
+    // decides whether pointing can ever feel one to one: the servo can ask
+    // for full stick and no more, so the game's own aim rate is the ceiling.
+    static ULONGLONG s_rateStartMs = 0;
+    static float s_ratePitch = 0.0f;
+    static float s_bestRate = 0.0f;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (std::fabs(stickY) > 0.95f) {
+        if (!s_rateStartMs) {
+            s_rateStartMs = nowMs;
+            s_ratePitch = rigPitch;
+        } else if (nowMs - s_rateStartMs >= 250) {
+            const float rate = std::fabs(rigPitch - s_ratePitch) * 1000.0f / static_cast<float>(nowMs - s_rateStartMs);
+            if (rate > s_bestRate)
+                s_bestRate = rate;
+            s_rateStartMs = nowMs;
+            s_ratePitch = rigPitch;
+        }
+    } else {
+        s_rateStartMs = 0;
+    }
+
+    static ULONGLONG s_lastLogMs = 0;
+    if (nowMs - s_lastLogMs > 1000) {
+        s_lastLogMs = nowMs;
+        Log_Printf("AimPitch: controller %.1f (trim %.1f) vs rig %.1f -> error %.1f, asking the stick for %.2f "
+                   "(up is %s), fastest the game has turned the gun %.0f deg/sec",
+            gunPitchDeg, settings.aimPitchTrimDeg, rigPitch, error, stickY, s_stickSign > 0 ? "positive" : "negative",
+            s_bestRate);
+    }
 }
 
 void AimWalk(unsigned char* controller)
@@ -2329,6 +2818,48 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
     // g_headFollowDriving was overwritten by whichever controller ran last.
     // Not yet proven to be the jitter; wrong regardless.
     const bool isPlayer = IsPlayerController(controller);
+    if (isPlayer) {
+        // Separating the gun from the view only makes sense when something
+        // other than the stick is aiming (user, 2026-09-16). With a pad the
+        // stick is the only aim there is, so the view should follow it, the
+        // way it always has. So: VR, pointing turned on, and a controller
+        // actually in hand.
+        const XrInputSettings motion = XrInput_GetSettings();
+        float gunYaw = 0.0f, gunPitch = 0.0f;
+        g_pointToAimActive.store(
+            vrActive && motion.enabled && motion.pointToAim && XrInput_GetGunAim(&gunYaw, &gunPitch),
+            std::memory_order_relaxed);
+    }
+
+    // 3DOF aiming (2026-09-16): the gun's pitch follows where the controller
+    // points. What the probe run established:
+    //  * the camera's pitch blend at [controller+0x1D0] is exactly minus one
+    //    of two fields on the character, +0x2DC8 or +0x2908, and which one it
+    //    mirrors changes with the weapon state - so pick whichever matches;
+    //  * +0x2DC8 saturates at +-0.997 while +0x2908 runs to +-2.5, and the
+    //    blend reaches +-2.5, so the fields are a ladder across rig presets,
+    //    not an angle. Degrees per unit is not constant: measured between 13
+    //    and 51 depending on where in the range you are.
+    // That rules out a formula. Instead this closes the loop on the game's
+    // own number: read the pitch the rig came out at, compare it with the
+    // controller's, and nudge the field. It converges in a few frames, and
+    // the gain re-learns itself from what the last nudge actually did, so a
+    // different weapon or character needs no new constant.
+    if (isPlayer && vrActive) {
+        if (aiming) {
+            AimFromController(controller);
+        } else {
+            // The gun being down is itself a reason for nothing happening,
+            // and it is the one the log could never show before.
+            static ULONGLONG s_ms = 0;
+            const ULONGLONG now = GetTickCount64();
+            const XrInputSettings motion = XrInput_GetSettings();
+            if (motion.enabled && motion.pointToAim && now - s_ms > 3000) {
+                s_ms = now;
+                Log_Printf("AimStop: the game doesn't think the gun is up (its aim flag is off)");
+            }
+        }
+    }
 
     // View split (2026-09-15): the head never touches the game's rigs.
     // The renderer and culling get the head view at GetViewMatrix instead, so
@@ -2443,6 +2974,19 @@ extern "C" void CameraRigHook_OnRigsReady(unsigned char* controller)
         float blend = 0.0f;
         TryRead(&blend, controller + 0x1D0, sizeof(blend));
         blend = blend < -1.0f ? -1.0f : (blend > 1.0f ? 1.0f : blend);
+        // 3DOF aiming must move the gun and nothing else (2026-09-16). This
+        // blend is the same pitch factor the gun's pitch drives, so leaving it
+        // in tilts the picture every time the gun goes up or down, which reads
+        // as the head moving rather than the gun.
+        //
+        // It does not matter what moved the gun. The first version only let go
+        // of the blend while our own aim write was live, so aiming with a pad
+        // pitched the view again (user, 2026-09-16: "this time I used an xbox
+        // controller and the gun was no longer separate"). Independence is the
+        // point, so while Point to aim is on the view never follows the gun,
+        // whether the pitch came from a wrist, a stick or a mouse.
+        if (g_pointToAimActive.load(std::memory_order_relaxed))
+            blend = 0.0f;
         // Always the NORMAL set: switching to the aim set at aim start moved
         // the view a little (their bases need not agree) - the small snap.
         const float (*const set)[3] = hf.worldDir;
@@ -2686,6 +3230,103 @@ void LogViewCallers()
     }
 }
 
+// Right after the game has written the character's aim pitch. See the notes
+// by g_aimWriteHooked. Runs every frame while the player exists, so it does
+// as little as possible and leaves the value alone unless 3DOF aiming has one
+// waiting for this exact character.
+void AimPitchWritten(unsigned char* character)
+{
+    if (!character || character != g_aimWriteCharacter.load(std::memory_order_relaxed))
+        return;
+    const unsigned long long when = g_aimWriteMs.load(std::memory_order_relaxed);
+    if (!when || GetTickCount64() - when > 200)
+        return;
+    const unsigned long offset = g_aimWriteOffset.load(std::memory_order_relaxed);
+    if (!offset)
+        return;
+    const float value = g_aimWriteValue.load(std::memory_order_relaxed);
+    TryWrite(character + offset, &value, sizeof(value));
+}
+
+// Right after the game has written the aim point. The bearing and range it
+// just wrote are kept; only the height changes, so the gun swings up and down
+// to where the controller points without touching where it points across.
+void AimPointWritten(unsigned char* character)
+{
+    if (!character || character != g_aimPointCharacter.load(std::memory_order_relaxed))
+        return;
+    const unsigned long long when = g_aimPointMs.load(std::memory_order_relaxed);
+    if (!when || GetTickCount64() - when > 200)
+        return;
+
+    float point[3] = {};
+    if (!TryRead(point, character + 0x2980, sizeof(point)))
+        return;
+
+    // Test mode: slam the ray a long way up whatever the controller says. If
+    // nothing visible moves, nothing reads this ray and the search moves on;
+    // if the laser swings to the ceiling, we own aiming and only the sign and
+    // scale are left to sort out (2026-09-16).
+    if (g_aimPointForceUp.load(std::memory_order_relaxed)) {
+        const float dx = point[0] - g_aimPointEyeX.load(std::memory_order_relaxed);
+        const float dz = point[2] - g_aimPointEyeZ.load(std::memory_order_relaxed);
+        const float flatTest = std::sqrt(dx * dx + dz * dz);
+        const float up = g_aimPointEyeY.load(std::memory_order_relaxed) + flatTest;
+        TryWrite(character + 0x2984, &up, sizeof(up));
+        // And the origin vector just above it, in case the ray is read as a
+        // pair rather than a point.
+        float origin[3] = {};
+        if (TryRead(origin, character + 0x2970, sizeof(origin))) {
+            static ULONGLONG s_logMs = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (now - s_logMs > 1000) {
+                s_logMs = now;
+                Log_Printf("AimRay: origin +0x2970 (%.1f %.1f %.1f), ray +0x2980 (%.1f %.1f %.1f), forcing height "
+                           "to %.1f",
+                    origin[0], origin[1], origin[2], point[0], point[1], point[2], up);
+            }
+        }
+        return;
+    }
+    const float eyeX = g_aimPointEyeX.load(std::memory_order_relaxed);
+    const float eyeY = g_aimPointEyeY.load(std::memory_order_relaxed);
+    const float eyeZ = g_aimPointEyeZ.load(std::memory_order_relaxed);
+    const float dx = point[0] - eyeX, dz = point[2] - eyeZ;
+    const float flat = std::sqrt(dx * dx + dz * dz);
+    if (flat < 1.0f)
+        return;
+    const float newY = eyeY + flat * g_aimPointTan.load(std::memory_order_relaxed);
+    TryWrite(character + 0x2984, &newY, sizeof(newY));
+}
+
+__declspec(naked) void AimPointHook_Stub()
+{
+    __asm {
+        pushad
+        pushfd
+        push esi
+        call AimPointWritten
+        add esp, 4
+        popfd
+        popad
+        jmp g_aimPointTrampoline
+    }
+}
+
+__declspec(naked) void AimPitchHook_Stub()
+{
+    __asm {
+        pushad
+        pushfd
+        push esi
+        call AimPitchWritten
+        add esp, 4
+        popfd
+        popad
+        jmp g_aimWriteTrampoline
+    }
+}
+
 __declspec(naked) void RigsReadyHook_Stub()
 {
     __asm {
@@ -2802,6 +3443,39 @@ void CameraRigHook_Install()
     }
     rrSt = MH_EnableHook(rigsReadyTarget);
     Log_Printf("CameraRigHook_Install: rigs-ready hook enabled -> %d (target=%p)", static_cast<int>(rrSt), rigsReadyTarget);
+
+    {
+        // 3DOF aiming patches the game in two places, and 3DOF aiming is not
+        // finished (see ui/menu.cpp: no checkbox, no ini keys). A release has
+        // no business patching game code for something nobody can switch on,
+        // so these go in only when that work resumes.
+        //
+        // What the two sites are, for when it does: exe+7607B5 is right after
+        // the game writes the character's pitch at +0x2DC8, and exe+776AA0 is
+        // right after it writes the aim ray at +0x2980. Both were found by
+        // watchpoint, both hold the character in esi, and both turned out to
+        // be downstream of the real aim: +0x2DC8 is one line of a block copy
+        // of camera floats (fld [edx+4B8] / fstp [ecx+2DC8]) and the ray is
+        // written at the tail of its routine and read by nothing, proven by
+        // forcing it skyward and watching nothing move.
+        if (kInstallAimHooks) {
+            void* pointWrite = reinterpret_cast<void*>(moduleBase + 0x776AA0);
+            MH_STATUS ppSt
+                = MH_CreateHook(pointWrite, reinterpret_cast<void*>(&AimPointHook_Stub), &g_aimPointTrampoline);
+            if (ppSt == MH_OK || ppSt == MH_ERROR_ALREADY_CREATED)
+                ppSt = MH_EnableHook(pointWrite);
+            g_aimPointHooked = ppSt == MH_OK;
+
+            void* aimWrite = reinterpret_cast<void*>(moduleBase + 0x7607B5);
+            MH_STATUS apSt
+                = MH_CreateHook(aimWrite, reinterpret_cast<void*>(&AimPitchHook_Stub), &g_aimWriteTrampoline);
+            if (apSt == MH_OK || apSt == MH_ERROR_ALREADY_CREATED)
+                apSt = MH_EnableHook(aimWrite);
+            g_aimWriteHooked = apSt == MH_OK;
+            Log_Printf("CameraRigHook_Install: aim hooks -> point %d, pitch %d", static_cast<int>(ppSt),
+                static_cast<int>(apSt));
+        }
+    }
 
     {
         // GetViewMatrix: the view split. First bytes: push ebp / mov ebp,esp /
@@ -2946,6 +3620,35 @@ void* CameraRigHook_GetPlayerController()
 bool CameraRigHook_IsVrActive()
 {
     return g_vrActive.load(std::memory_order_relaxed);
+}
+
+bool CameraRigHook_TakeAimMouse(long* dx, long* dy)
+{
+    const unsigned long long when = g_aimMouseMs.load(std::memory_order_relaxed);
+    if (!when || GetTickCount64() - when > 200)
+        return false;
+    const long pending = g_aimMouseDy.exchange(0, std::memory_order_relaxed);
+    if (!pending)
+        return false;
+    if (dx)
+        *dx = 0;
+    if (dy)
+        *dy = pending;
+    return true;
+}
+
+bool CameraRigHook_GetAimStickY(float* value)
+{
+    // Stale the moment the gun comes down or the aim loop stops running.
+    const unsigned long long when = g_aimStickMs.load(std::memory_order_relaxed);
+    if (!when || GetTickCount64() - when > 200)
+        return false;
+    const float y = g_aimStickY.load(std::memory_order_relaxed);
+    if (y == 0.0f)
+        return false;
+    if (value)
+        *value = y;
+    return true;
 }
 
 float CameraRigHook_GetVrCullFovDeg(bool* atCap)

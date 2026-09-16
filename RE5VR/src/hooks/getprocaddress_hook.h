@@ -1,9 +1,17 @@
 #pragma once
 
-// Hooks kernel32!GetProcAddress so that any caller resolving
+// Hooks kernel32!GetProcAddress so that the game resolving
 // "Direct3DCreate9" or "Direct3DCreate9Ex" - against *any* module handle,
 // not just this proxy DLL - gets our intercepting implementation instead of
 // the genuine one.
+//
+// Only lookups made from inside re5dx9.exe are redirected (2026-09-15).
+// Handing our exports to anything else was an instant crash on one tester's
+// PC: something else in their process (an overlay or another d3d9 wrapper)
+// looked up Direct3DCreate9Ex while the game's own Direct3DCreate9 call was
+// still inside dgVoodoo2 starting D3D12 up, and the second entry into
+// dgVoodoo2's creation read a null pointer (d3d9_dgvoodoo.dll+B211A). Other
+// callers now get the genuine function, which is what they asked for anyway.
 //
 // Why this exists: re5dx9.exe reaches its (Direct3D9-rendered) main menu
 // without ever calling this proxy's own Direct3DCreate9 export. Its static

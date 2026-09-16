@@ -62,6 +62,18 @@ void* CameraRigHook_GetPlayerController();
 // render thread every 100 ms). Safe to call from any thread.
 bool CameraRigHook_IsVrActive();
 
+// 3DOF aiming: the right-stick push the aim servo wants this frame, -1..1, so
+// the gun's pitch catches up with where the controller points. False when it
+// has nothing to ask for. Applied to the virtual pad the game reads, because
+// the game re-derives its own aim pitch from stick input every frame and
+// ignores anything written straight into it.
+bool CameraRigHook_GetAimStickY(float* value);
+
+// 3DOF aiming through the game's own mouse: the movement the aim servo wants,
+// in mouse counts, taken once and cleared. A mouse has no turn-rate ceiling,
+// unlike the stick, so this is what makes pointing keep up with a wrist.
+bool CameraRigHook_TakeAimMouse(long* dx, long* dy);
+
 // The vertical culling angle VR last used (headset FOV plus the margin), and
 // whether it hit the ceiling. 0 before VR has run.
 float CameraRigHook_GetVrCullFovDeg(bool* atCap);

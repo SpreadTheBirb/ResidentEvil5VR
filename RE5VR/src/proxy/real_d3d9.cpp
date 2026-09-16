@@ -5,6 +5,7 @@
 
 #include <MinHook.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <cstring>
 
@@ -21,6 +22,38 @@ bool g_usingDgVoodoo = false;
 // see RealD3D9_Init.
 IDirect3D9Ex* g_bootstrapProbe = nullptr;
 
+// One creation at a time (2026-09-15). dgVoodoo2 crashed on a tester's PC when
+// something else in the process entered its Direct3DCreate9Ex while the game's
+// own call was still inside it starting D3D12 up. The GetProcAddress hook no
+// longer hands our exports to anything but the game, and this is the belt to
+// that pair of braces: a DLL bound to this proxy by its import table reaches
+// these exports without asking GetProcAddress at all.
+SRWLOCK g_createLock = SRWLOCK_INIT;
+volatile LONG g_createOwner = 0; // thread already inside, so we don't self-deadlock
+
+class CreateGuard {
+public:
+    CreateGuard()
+    {
+        const LONG self = static_cast<LONG>(GetCurrentThreadId());
+        held_ = InterlockedCompareExchange(&g_createOwner, 0, 0) != self;
+        if (held_) {
+            AcquireSRWLockExclusive(&g_createLock);
+            InterlockedExchange(&g_createOwner, self);
+        }
+    }
+    ~CreateGuard()
+    {
+        if (held_) {
+            InterlockedExchange(&g_createOwner, 0);
+            ReleaseSRWLockExclusive(&g_createLock);
+        }
+    }
+
+private:
+    bool held_ = false;
+};
+
 // System-d3d9 route (DXVK under Proton): the game never called our
 // Direct3DCreate9 export there (2026-09-11 Linux log: no call, so no device
 // hooks and a dead F4), so hook the system DLL's own entry points instead.
@@ -29,6 +62,46 @@ IDirect3D9Ex* g_bootstrapProbe = nullptr;
 typedef IDirect3D9*(WINAPI* PFN_Direct3DCreate9)(UINT SDKVersion);
 PFN_Direct3DCreate9 g_origSystemCreate9 = nullptr;
 PFN_Direct3DCreate9Ex g_origSystemCreate9Ex = nullptr;
+
+// What else is in the process when D3D is created (2026-09-15). Overlays and
+// other d3d9 wrappers are the usual suspects when a launch crashes inside
+// dgVoodoo2 on one PC and nowhere else, and their names are the only way to
+// tell from a log. Names only, no paths, and only once.
+void LogLoadedModulesOnce()
+{
+    static bool logged = false;
+    if (logged)
+        return;
+    logged = true;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        Log_Printf("LoadedModules: snapshot failed (err=%lu)", GetLastError());
+        return;
+    }
+
+    char line[1024] = {};
+    size_t used = 0;
+    MODULEENTRY32 me = {};
+    me.dwSize = sizeof(me);
+    for (BOOL ok = Module32First(snap, &me); ok; ok = Module32Next(snap, &me)) {
+        const size_t len = strlen(me.szModule);
+        if (used + len + 2 >= sizeof(line)) {
+            Log_Printf("LoadedModules: %s ...", line);
+            used = 0;
+            line[0] = '\0';
+        }
+        if (used) {
+            line[used++] = ' ';
+            line[used] = '\0';
+        }
+        memcpy(line + used, me.szModule, len + 1);
+        used += len;
+    }
+    CloseHandle(snap);
+    if (used)
+        Log_Printf("LoadedModules: %s", line);
+}
 
 IDirect3D9* WINAPI hkSystemDirect3DCreate9(UINT SDKVersion)
 {
@@ -183,6 +256,10 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
 {
     Log_Printf("Direct3DCreate9(SDKVersion=%u) called", SDKVersion);
 
+    CreateGuard guard;
+
+    LogLoadedModulesOnce();
+
     if (!RealD3D9_Init())
         return nullptr;
 
@@ -203,6 +280,10 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
 extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3D)
 {
     Log_Printf("Direct3DCreate9Ex(SDKVersion=%u) called", SDKVersion);
+
+    CreateGuard guard;
+
+    LogLoadedModulesOnce();
 
     if (!RealD3D9_Init())
         return E_FAIL;
