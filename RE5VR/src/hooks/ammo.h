@@ -57,8 +57,27 @@ void Ammo_OnEndScene();
 // Every magazine the hook has seen this session, busiest first.
 int Ammo_Slots(AmmoSlot* out, int max);
 
-// The one the game is working on: the most recently written of them, which
-// while you are shooting is the gun in your hand.
+// WHOSE GUN, NOT WHICH GUN MOVED LAST (2026-09-29, user: "when I press
+// reload, chris current ammo drops to 0. instead of shevas").
+//
+// Ammo_Held picks the busiest live magazine with spare rounds. That is the
+// right answer when there is one shooter and the wrong one the moment there
+// is an AI partner, because Chris fires constantly and his magazine is
+// written far more often than yours. Reloading as Sheva emptied his gun.
+//
+// The weapon object and its magazine carry the same number at +14h, so the
+// weapon in YOUR hand names its own magazine. Arm IK knows which weapon that
+// is - it picks the one nearest your gun hand - so it pins the id here and
+// everything downstream follows it.
+//
+// Pass have=false when no weapon is in hand, and the old behaviour comes
+// back. An id that matches nothing falls back too rather than failing: a
+// weapon with no id-shaped field must still be reloadable.
+void Ammo_PreferWeaponId(unsigned id, bool have);
+
+// The one the game is working on: the pinned weapon if there is one, and
+// otherwise the most recently written, which while you are shooting alone is
+// the gun in your hand.
 bool Ammo_Held(AmmoSlot& out);
 
 // Both structures, word by word, into the log. The way to see what else lives

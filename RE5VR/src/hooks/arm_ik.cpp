@@ -7949,6 +7949,19 @@ void FinishLearning()
         g_learnKey, n, mag, with);
 }
 
+constexpr DWORD kOffControllerCharacterHere = 0x140;
+
+bool ThisIsOurs(const void* character)
+{
+    unsigned char* controller = static_cast<unsigned char*>(CameraRigHook_GetPlayerController());
+    if (!controller || !character)
+        return false;
+    unsigned char* ours = nullptr;
+    if (!TryRead(&ours, controller + kOffControllerCharacterHere, sizeof(ours)) || !ours)
+        return false;
+    return static_cast<const void*>(ours) == character;
+}
+
 void MoveTheMagazine(const XrInputSettings& settings)
 {
     const int state = XrInput_MagazineHeld();
@@ -7962,6 +7975,32 @@ void MoveTheMagazine(const XrInputSettings& settings)
     }
     if (g_gunSkCount == 0 || !g_haveBody || !g_body.joints)
         return;
+    // WHOSE MAGAZINE (2026-09-29, user: "sheva cant manually reload, because
+    // pressing the reload button drops chris magazine out of his hand").
+    //
+    // g_body is whichever body the finder last adopted, and this routine had
+    // no ownership check of any kind - so with an AI partner on screen it
+    // would happily pick the weapon nearest THEIR gun hand and drop THEIR
+    // magazine on the floor. HideTheBody learned this same lesson when Sheva
+    // was being cut in half; the magazine never did.
+    //
+    // Refuse unless the body we are about to reach into is the character the
+    // player controller says we are playing, and say so once in a while,
+    // because "nothing happened" and "it happened to the wrong person" look
+    // identical from inside the headset.
+    if (!ThisIsOurs(g_body.character)) {
+        static unsigned long long s_toldWhose = 0;
+        const unsigned long long nowWhose = GetTickCount64();
+        if (nowWhose - s_toldWhose > 5000) {
+            s_toldWhose = nowWhose;
+            Log_Printf("Magazine: the body in hand is %p, which is not the character you are playing - "
+                       "leaving the reload alone",
+                g_body.character);
+        }
+        g_magFalling = false;
+        g_magWasInHand = false;
+        return;
+    }
     const ArmIkArm& gunArm = settings.characterLeftHanded ? g_body.left : g_body.right;
     if (!gunArm.valid)
         return;
@@ -8066,6 +8105,21 @@ void MoveTheMagazine(const XrInputSettings& settings)
             sk = &g_gunSk[s];
             best = cm;
         }
+    }
+    // THE MAGAZINE BELONGS TO THIS WEAPON (2026-09-29, user: "when I press
+    // reload, chris current ammo drops to 0. instead of shevas").
+    //
+    // sk is the weapon nearest YOUR gun hand, so it is the one to reload. The
+    // ammunition module was picking the busiest magazine instead, and with an
+    // AI partner firing constantly that is always theirs, in both directions:
+    // "I have never once had it eject sheva mag while playing as chris".
+    //
+    // The weapon object and its magazine share a number at +14h, so handing
+    // that over pins every read and write below to this gun.
+    {
+        unsigned weaponId = 0;
+        const bool haveId = sk && sk->object && TryRead(&weaponId, sk->object + 0x14, sizeof(weaponId));
+        Ammo_PreferWeaponId(weaponId, haveId);
     }
     if (!sk) {
         // Nothing was close enough to be in your hand. Says how close the
@@ -9256,7 +9310,12 @@ void SteadyGunNow()
     }
 
 
-    if (s_lagHaveWrote && nowMs - s_lagSaidMs >= 1000) {
+    // ONLY WHEN IT IS ACTUALLY DRIFTING (2026-09-29). This went out in
+    // v0.5.0 printing once a second into every player's log while saying
+    // 0.00 cm every time, which is our debugging left switched on. It is
+    // worth keeping for the weapon whose transform really does get rewritten
+    // under us, so it speaks when there is something to say.
+    if (s_lagHaveWrote && s_lagMaxDriftCm > 1.0f && nowMs - s_lagSaidMs >= 1000) {
         s_lagSaidMs = nowMs;
         Log_Printf("ArmIk: laser lag - watching weapon+%X; your hand moved up to %.2f cm in one frame, and "
                    "what we wrote there had moved %.2f cm back by the next",
@@ -9423,18 +9482,7 @@ void PutItAllBack()
 //
 // The player controller knows which character is ours. Nothing is written
 // unless the body in hand is that one.
-constexpr DWORD kOffControllerCharacterHere = 0x140;
 
-bool ThisIsOurs(const void* character)
-{
-    unsigned char* controller = static_cast<unsigned char*>(CameraRigHook_GetPlayerController());
-    if (!controller || !character)
-        return false;
-    unsigned char* ours = nullptr;
-    if (!TryRead(&ours, controller + kOffControllerCharacterHere, sizeof(ours)) || !ours)
-        return false;
-    return static_cast<const void*>(ours) == character;
-}
 
 struct BodyHideSnap {
     int count;

@@ -260,13 +260,29 @@ int Ammo_Slots(AmmoSlot* out, int max)
     return n;
 }
 
+unsigned g_preferId = 0;
+bool g_havePreferId = false;
+
+void Ammo_PreferWeaponId(unsigned id, bool have)
+{
+    g_preferId = id;
+    g_havePreferId = have && id != 0;
+}
+
 bool Ammo_Held(AmmoSlot& out)
 {
     AmmoSlot all[kMaxSlots];
     const int n = Ammo_Slots(all, kMaxSlots);
     const AmmoSlot* best = nullptr;
+    // Two passes when a weapon is pinned: its own magazine first, and only if
+    // nothing carries that id does the old "busiest with spare rounds" rule
+    // get a say. See Ammo_PreferWeaponId.
+    for (int pass = 0; pass < (g_havePreferId ? 2 : 1) && !best; ++pass) {
+        const bool mineOnly = g_havePreferId && pass == 0;
     for (int i = 0; i < n; ++i) {
         const AmmoSlot& s = all[i];
+        if (mineOnly && s.id != g_preferId)
+            continue;
         // A magazine, rather than whatever else shares this code path: it has
         // to hold something, it cannot hold more than it holds, and nothing in
         // this game carries four figures of any one round.
@@ -304,6 +320,7 @@ bool Ammo_Held(AmmoSlot& out)
             better = s.lastMs > best->lastMs;
         if (better)
             best = &s;
+    }
     }
     if (!best)
         return false;
