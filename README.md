@@ -324,7 +324,7 @@ click both sticks to open it, the sticks move through it, A selects.
 | Left grip | Left shoulder | |
 | Menu button | Start | |
 
-In game I still recommend the Type C control scheme. Your knife lives over
+In game I still recommend the Type D control scheme. Your knife lives over
 your left shoulder: reach up and grab it with the grip on whichever hand you
 hold it in, so right grip normally, left grip if you are set up left handed.
 
