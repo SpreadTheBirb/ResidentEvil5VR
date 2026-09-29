@@ -84,7 +84,22 @@ struct XRBridgeEyeView {
 // valid frame has been located yet (XR mode off, or no frames since it was
 // turned on), in which case callers should fall back to their own
 // non-head-tracked behavior.
-bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight);
+// Identifies one located head pose, so a drawn frame can say which pose it
+// belongs to. See VRBridge_NoteFramePresented.
+using XRBridgePoseId = unsigned long long;
+
+// The pose id is the one these views were located with, read under the same
+// lock: tagging the drawn frame with anything else is a head-speed-sized
+// error in the compositor.
+bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight, XRBridgePoseId* outPoseId = nullptr);
+
+// The yaw-only reference the head deltas are measured against: rows 0, 1 and
+// 2 are the right, up and forward axes of "straight ahead", in the runtime's
+// raw tracking space. A controller position comes out of xrLocateSpace in that
+// raw space, so to put a hand where the player is holding it, take the offset
+// from the head and read it off against these three rows. False before the
+// reference has been captured, or while XR output is off.
+bool VRBridge_GetTrackingFrame(float outRows[9]);
 
 // ---- Rendered-pose tracking (2026-09-12) -------------------------------
 // A tester reported VR being janky and twitchy while the desktop split view
@@ -101,7 +116,6 @@ bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight);
 //   * the submit thread looks the id back up and submits that pose.
 //
 // Ids are opaque and monotonic; 0 means "none".
-using XRBridgePoseId = unsigned long long;
 
 // The id of the eye views most recently published by the submit thread.
 // Latch this in the same breath as VRBridge_GetEyeViews.
@@ -148,5 +162,7 @@ struct VRBridgeStatus {
     float predictedDisplayPeriodMs = 0.0f;
     float submitHz = 0.0f;
     float imageAgeMs = 0.0f;
+    float requestedRefreshHz = 0.0f; // what the headset agreed to
+    bool runtimeHalvingUs = false;   // it is pacing us well under that and inventing the rest
 };
 void VRBridge_GetStatus(VRBridgeStatus& out);

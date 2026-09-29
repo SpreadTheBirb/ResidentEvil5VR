@@ -36,7 +36,28 @@ constexpr Patch kPatches[] = {
 constexpr int kJumpOpcode = 2;
 constexpr BYTE kJmpShort = 0xEB;
 
-bool g_applied = false;
+bool g_applied = false;  // the three jumps are currently ours
+bool g_available = false; // and the site matched, so they can be
+bool g_wanted = true;
+
+// Writes the jump opcode, or puts the original one back. One byte each, three
+// places, and the bytes were checked before any of this ran.
+void SetJumps(bool on)
+{
+    BYTE* exe = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
+    for (const Patch& p : kPatches) {
+        BYTE* jump = exe + p.rva + kJumpOpcode;
+        const BYTE want = on ? kJmpShort : p.original[kJumpOpcode];
+        if (*jump == want)
+            continue;
+        DWORD oldProtect = 0;
+        VirtualProtect(jump, 1, PAGE_EXECUTE_READWRITE, &oldProtect);
+        *jump = want;
+        VirtualProtect(jump, 1, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), jump, 1);
+    }
+    g_applied = on;
+}
 
 // Original bytes, or already patched (the trainer's toggle is on).
 bool LooksRight(const BYTE* at, const Patch& p)
@@ -53,7 +74,7 @@ bool LooksRight(const BYTE* at, const Patch& p)
 
 void LaserPatch_Install()
 {
-    if (g_applied)
+    if (g_available)
         return;
     BYTE* exe = reinterpret_cast<BYTE*>(GetModuleHandleA(nullptr));
 
@@ -66,14 +87,29 @@ void LaserPatch_Install()
             return;
         }
     }
-    for (const Patch& p : kPatches) {
-        BYTE* jump = exe + p.rva + kJumpOpcode;
-        DWORD oldProtect = 0;
-        VirtualProtect(jump, 1, PAGE_EXECUTE_READWRITE, &oldProtect);
-        *jump = kJmpShort;
-        VirtualProtect(jump, 1, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), jump, 1);
-    }
-    g_applied = true;
-    Log_Printf("LaserPatch: laser sight forced on (exe+769A91, +776DC1, +777151: je -> jmp, same as the trainer's toggle)");
+    g_available = true;
+    SetJumps(g_wanted);
+    Log_Printf("LaserPatch: laser sight %s (exe+769A91, +776DC1, +777151: je -> jmp, same as the trainer's toggle)",
+        g_wanted ? "forced on" : "left to the game and to any other mod");
+}
+
+bool LaserPatch_IsAvailable()
+{
+    return g_available;
+}
+
+bool LaserPatch_IsForcedOn()
+{
+    return g_wanted;
+}
+
+void LaserPatch_SetForcedOn(bool on)
+{
+    if (g_wanted == on && g_applied == (on && g_available))
+        return;
+    g_wanted = on;
+    if (!g_available)
+        return;
+    SetJumps(on);
+    Log_Printf("LaserPatch: laser sight %s", on ? "forced on" : "left to the game and to any other mod");
 }

@@ -4,11 +4,18 @@ A native stereoscopic VR mod for **Resident Evil 5** (`re5dx9.exe`, the 32-bit
 DirectX 9 build), driven through OpenXR, plus a true first-person mode that
 works just as well on a normal monitor.
 
-> **Status:** v0.4.2a, working and playable, still under active development.
+> **Status:** v0.5.0, working and playable, still under active development.
 > There are no hotkeys: everything is in the in-game menu. Press **Insert**,
 > or click both sticks in on a controller.
 
 Quick note, yes, this is a vibecoded VR mod. Just a lot of debugging and steering Claude on my end. This was one of my favorite games to play growing up and I want to experience it in VR. I've tried to make sure that all of the first person features translate to flat screen as well, so it's totally playable in first person, with no weird camera pop out as others have done in the past. My plan is to get 6dof working, or at a minimum 3dof. This hasn't been tested online. For everyone to also be aware out the gate, my solution of using dgVoodoo2 to convert RE5 from d3d9 to d3d12 has some potential risks. I discovered that it existed through the recent DLSS5 modders, and it can flag as potential malware/trojan through your antivirus. Per the author, and various other users as I've read around, this is a false positive..but I'm throwing this out there so that it's clear from the gate. 
+
+> **Update (v0.5.0):** **6DOF arms.** Your real arms drive your character's
+> arms, your wrists roll, the gun goes where your hand goes, and you reload
+> by reaching to your belt. **And the game stops taking your camera:** melee,
+> door kicks, jumping down, vaulting and partner locate all leave your view
+> where you put it. SteamVR works. Scoped weapons can stay in third person
+> so they are usable in a headset.
 
 > **Update (v0.4.0):** the HUD now works in VR. Ammo, health, the inventory
 > and the pause screen all show on a panel in front of you.
@@ -57,8 +64,8 @@ to clone this repository to play.
 
 | Download | For | Files |
 |---|---|---|
-| `TrueFP-v0.4.2a-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
-| `TrueFP-v0.4.2a-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
+| `TrueFP-v0.5.0-VR.zip` | Windows with a headset. Plays flat-screen too, so take this one if you have VR at all. | `d3d9.dll`, `d3d9_dgvoodoo.dll`, `dgVoodoo.conf`, `openxr_loader.dll`, `SampleAddon.dll` |
+| `TrueFP-v0.5.0-flatscreen.zip` | No headset, or **Linux / Steam Deck via Proton** (the only version that works there). No dgVoodoo2, so the antivirus note doesn't apply. | `d3d9.dll`, `openxr_loader.dll` |
 
 ### Do this first: the 4GB patch
 
@@ -103,6 +110,7 @@ folder, so they come back next time you play.
 | **Insert** | Open / close (keyboard) |
 | **Click both sticks in** | Open / close (controller) |
 | **Hold both sticks in for 1 second** | Reset the VR view (without opening the menu) |
+| **Left grip + both sticks in (chord)** | Watch a cutscene on the theatre screen (WIP) |
 
 While the menu is open the game doesn't see any of your input (no stray
 shots, no camera spinning, no pausing), and a button still held as you close
@@ -203,8 +211,40 @@ tab to turn it off.
 - **Laser sight always on**, including with mouse aiming.
 - **Colour filter removed** by default.
 
+### 6DOF arms
+
+Enable **6DOF arms** on the VR tab, hold both sticks in and T-pose as
+instructed, palms down. The sliders in that section change how the T-pose
+lands; the defaults are solid, but recalibrate freely.
+
+**Playing as Sheva?** Tick **Playing a left-handed character (Sheva)** on the
+VR tab first. She carries her weapon in the other hand, so without it the
+solve drives the wrong arm and the gun will not come to your hand.
+
+- **Your arms are your arms:** shoulders, elbows and wrists solved from where
+  your controllers really are, every frame, instead of playing an animation.
+- **Wrist roll:** turn your hand and the gun turns with it.
+- **The weapon lives in your hand** rather than in the animation.
+- **Two hands on the gun:** bring your support hand up and it takes the
+  weapon, with its own steering and roll.
+- **Holsters:** reach to a spot on your body and take what is there.
+- **Reload by hand** (on by default): reach to your belt on your support side
+  and squeeze the grip. Pistols are the best supported for now.
+- **Your hands stop at people:** reach at Sheva or at yourself and your hands
+  hold instead of passing through.
+- **Your body leans with you.**
+- **Send my arms to my partner** (on by default): IK sync over co-op, so your
+  VR buddies can wave at you and a modded flat screen player sees them too.
+
 ### VR
 
+- **The game does not take your camera:** melee, door kicks, jumping down,
+  vaulting and partner locate all leave your view where you put it.
+- **Scoped weapons can stay in third person**, so rifles that zoom are usable
+  in a headset instead of filling one eye.
+- **Steady the hands:** RE5 shakes the character's hands while the gun is up.
+  In a headset that is noise fighting your real hand, and it can be turned
+  off.
 - **Native stereoscopic VR through OpenXR:** each eye rendered with its own
   camera, real head tracking and the headset's actual per-eye lens FOV,
   delivered at the headset's full refresh rate.
@@ -227,6 +267,9 @@ tab to turn it off.
   including the ground at your feet, your partner's legs, and whatever is over
   your shoulder.
 - **Reset view:** from the menu, or hold both sticks in for a second.
+- **Theatre screen for cutscenes:** hold left grip and click both sticks in
+  together, and the cutscene plays on a screen in front of you instead of
+  across your face. Still WIP.
 - **No light leaks:** post-processing is drawn once rather than split per eye.
 
 ### Quality of life
@@ -281,7 +324,9 @@ click both sticks to open it, the sticks move through it, A selects.
 | Left grip | Left shoulder | |
 | Menu button | Start | |
 
-In game I use the Type C control scheme which puts your knife on left grip.
+In game I still recommend the Type C control scheme. Your knife lives over
+your left shoulder: reach up and grab it with the grip on whichever hand you
+hold it in, so right grip normally, left grip if you are set up left handed.
 
 A pad has a d-pad and a controller doesn't, so one stick stands in for it
 while you hold a modifier. The **D-pad** setting on the VR tab picks which:
@@ -333,6 +378,15 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 
 ## Known issues
 
+- The laser can sit slightly off the muzzle on some weapons. QOL Fixes can
+  remove the laser entirely, but starting with it on is worth getting used
+  to. Being fine tuned.
+- Manual reloading is built around pistols for now, and switching weapons
+  does not drop mags for everything. The gesture always works.
+- Arms only body mode leaves some skeleton visible. Not the permanent
+  implementation.
+- **Lean and peek is WIP. Do not use.** Off by default.
+
 - **Turning VR on in exclusive fullscreen** can still crash inside dgVoodoo2 on
   some PCs. Play windowed if it happens to you. (Changing resolution while
   fullscreen is fixed in v0.4.2.)
@@ -349,8 +403,6 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 - Some menus (the title screen, parts of the Organize screen) still don't
   draw correctly in VR.
 - Look straight down and you're inside your own torso.
-- When the head comes back for an action camera, it can shrink away rather
-  than vanish instantly as the camera returns.
 - Split-screen co-op: Chris's head stays hidden. **Online co-op is untested.**
 
 ### Reporting a problem

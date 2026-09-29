@@ -7,6 +7,7 @@
 #include "../hooks/hud_probe.h"
 #include "hud_shaders.h"
 #include "../vr/openxr_bridge.h"
+#include "../vr/xr_input.h"
 #include "../util/log.h"
 #include "../util/build_config.h"
 #include "mat3.h"
@@ -128,17 +129,121 @@ std::atomic<bool> g_compensateHeadFollow{ false };
 // gets its fresh delta with the extra turn taken back out:
 //   picture = N * aim(head used) * aim(camera used)^T * camera
 // which is v0.4.1's N * camera(head used), whatever the doubling did.
+// 4 (compositor only) is the head-turn jitter test (2026-09-16). Every mode
+// above has TWO things turning with the head - the game camera and the eye
+// matrices - on two different delays, and the runtime's reprojection assumes
+// the picture carries exactly the pose we submit with it. Any disagreement is
+// an error that scales with how fast the head moves, which is invisible while
+// still, invisible on the stick (that rotation is painted into the pixels) and
+// shakes only when the wearer physically turns: the reported symptom. This
+// mode leaves the game camera entirely alone and turns the picture with the
+// freshest latched pose only, so there is one rotation source, a gain of
+// exactly 1, and nothing for the compositor to fight. The cost is culling: the
+// game's cone no longer follows the head, so camera_rig_hook opens it to the
+// widest angle the rig accepts and things can still vanish at a hard look
+// behind. That is the trade being tested, not a regression.
 std::atomic<int> g_pictureTurnMode{ 3 };
 constexpr int kPictureTurnDouble = 0;
 constexpr int kPictureTurnCameraOnly = 1;
 constexpr int kPictureTurnCatchUp = 2;
 constexpr int kPictureTurnDoubleFixed = 3;
+constexpr int kPictureTurnCompositorOnly = 4;
+constexpr int kPictureTurnModeCount = 5;
+
+const char* PictureTurnModeName(int mode)
+{
+    switch (mode) {
+    case kPictureTurnDouble: return "double (v0.4.1)";
+    case kPictureTurnCameraOnly: return "game camera only";
+    case kPictureTurnCatchUp: return "catch-up";
+    case kPictureTurnDoubleFixed: return "double, culling fixed";
+    case kPictureTurnCompositorOnly: return "compositor only";
+    default: return "unknown";
+    }
+}
+
+// Leaning and peeking: see the lean block in buildEyeBasis. The reference is
+// where your head was when it was last taken, and it is retaken whenever the
+// feature is switched on or the view is recentred.
+// How close something can get to the eye before it is clipped away, in game
+// units. 0 keeps the game's own value. See ComposeCameraMatrix.
+float g_nearPlaneUnits = 0.0f;
+bool g_headPositionTracking = false;
+float g_leanScale = 1.0f;
+float g_leanReference[3] = {};
+bool g_leanReferenceSet = false;
+// The same movement in the game's units and axes, for the spine.
+float g_leanWorld[3] = {};
+bool g_haveLeanWorld = false;
+// What is left for his legs to do, in metres along the view's right and
+// forward.
+float g_roomStep[2] = {};
+// What the pad last asked his legs for, along the view's right and forward.
+float g_roomAsk[2] = {};
+// The furthest either eye has been moved from the game's camera this frame.
+std::atomic<float> g_eyeOffUnits{ 0.0f };
+float g_eyeOffThisFrame = 0.0f;
+// And WHICH WAY, not just how far. The culling needs to move the frustum to
+// where the eye actually is, and a distance cannot say that.
+std::atomic<float> g_eyeOffX{ 0.0f }, g_eyeOffY{ 0.0f }, g_eyeOffZ{ 0.0f };
+float g_eyeOffSum[3] = {};
+bool g_haveRoomStep = false;
 
 float g_fovWidenMultiplier = 1.0f;
 constexpr float kFovWidenStep = 0.1f;
 
 bool g_enabled = false;
 bool g_suppressed = false;
+
+bool g_theatre = true;
+float g_theatreDistanceMeters = 2.2f;
+float g_theatreScale = 0.95f;
+bool g_inTheatre = false;
+// Held on by hand, whatever the tests think (2026-09-25, user: "while not a
+// permanent fix, it'd be nice to have a bind to go into theatre mode").
+//
+// Worth more than another guess at the detection. Nothing distinguishes an
+// action camera from an in-engine cutscene reliably - five tests tried, and the
+// one that should have worked made the action camera worse - so the person
+// wearing the headset, who can see which it is, gets a switch.
+bool g_theatreForced = false;
+bool g_theatreFollowsHead = false;
+float g_screenFwd[3] = {};
+float g_screenRight[3] = {};
+bool g_haveScreenAnchor = false;
+// When the rendered eye and the skeleton's eye last parted company, or 0.
+unsigned long long g_cameraAwaySince = 0;
+// HUD draws seen since the last Present, and when the HUD last went away.
+unsigned g_hudDrawsThisFrame = 0;
+unsigned g_hudDrawsLastFrame = 0;
+unsigned long long g_hudGoneSince = 0;
+// Hard cuts since the camera last left your body. A film is cut together; a
+// chest opening, a vault and a melee are each one continuous move.
+int g_cameraCuts = 0;
+// The finished frame, as something a quad can be textured with.
+IDirect3DTexture9* g_theatreTex = nullptr;
+IDirect3DSurface9* g_theatreSurf = nullptr;
+UINT g_theatreCopyW = 0, g_theatreCopyH = 0;
+D3DFORMAT g_theatreCopyFmt = D3DFMT_UNKNOWN;
+// Pre-transformed, with one over the depth as w so the picture stays
+// perspective-correct across the quad instead of being stretched onto it.
+struct TheatreVertex {
+    float x, y, z, rhw;
+    float u, v;
+};
+void ReleaseTheatreCopy()
+{
+    if (g_theatreSurf) {
+        g_theatreSurf->Release();
+        g_theatreSurf = nullptr;
+    }
+    if (g_theatreTex) {
+        g_theatreTex->Release();
+        g_theatreTex = nullptr;
+    }
+    g_theatreCopyW = 0;
+    g_theatreCopyH = 0;
+}
 // Which branch BeginStereoDraw took for the draw in progress - read by the HUD
 // recorder (hud_probe.cpp) right after the decision, so it can say exactly
 // what VR did to each HUD draw. Game thread only.
@@ -310,10 +415,7 @@ void NoteViewVsGameCamera(const float eyeForward[3], const float rotationDelta[9
     if (s_headSum >= 10.0) {
         Log_Printf("StereoTest: picture turned %.0f deg in the world while the head turned %.0f deg - %.2fx (%s, %u frames)",
             s_pictureSum, s_headSum, s_pictureSum / s_headSum,
-            g_pictureTurnMode.load(std::memory_order_relaxed) == kPictureTurnCatchUp ? "catch-up"
-                : g_pictureTurnMode.load(std::memory_order_relaxed) == kPictureTurnDoubleFixed ? "double, culling fixed"
-                : (compensating ? "camera only" : "double"),
-            s_frames);
+            PictureTurnModeName(g_pictureTurnMode.load(std::memory_order_relaxed)), s_frames);
     }
     s_windowStartMs = now;
     s_pictureSum = s_headSum = 0.0;
@@ -408,7 +510,13 @@ void ComposeCameraMatrix(const CameraBasis& basis, float outMatrix[16])
     }
     outMatrix[3] = -Dot3(basis.right, basis.camPos) * basis.scaleX;
     outMatrix[7] = -Dot3(basis.up, basis.camPos) * basis.scaleY;
-    outMatrix[11] = w3 + basis.depthBiasK;
+    // The near plane, and where you stop seeing the inside of your own chest
+    // (2026-09-17). z/w works out as 1 + K/d for a point d ahead of the eye, so
+    // it crosses zero at d = -K: that term IS the near distance, negated. The
+    // game's own value is tuned for a camera hanging behind a shoulder, and in
+    // first person it lets you look down into Chris. A larger near distance
+    // clips the body away before it reaches your eye.
+    outMatrix[11] = w3 + (g_nearPlaneUnits > 0.0f ? -g_nearPlaneUnits : basis.depthBiasK);
     outMatrix[15] = w3;
 }
 
@@ -604,7 +712,8 @@ bool GetEyeViewsForDraw(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
 
 bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
 {
-    if (!g_enabled || g_suppressed) {
+    // Flat while the film is on: one camera, one picture, no eye offset.
+    if (!g_enabled || g_suppressed || g_inTheatre) {
         g_stereoPath = kStereoPathOff;
         return false;
     }
@@ -655,6 +764,7 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
     CameraBasis baseBasis;
     DecomposeCameraMatrix(baseMatrix, baseBasis);
 
+
     // Once per frame, at its first stereo draw: which head pose steered the
     // game camera this frame is drawn from (see g_pictureTurnMode).
     static ULONGLONG s_matchFrameMs = 0;
@@ -669,7 +779,9 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         HeadFollowTargets matched{};
         int matchAge = 0;
         float matchErr = 0.0f;
-        if (frameTurnMode != kPictureTurnDouble &&
+        // Compositor only has nothing to match: the camera is never steered by
+        // the head, so there is no camera pose to take back out of the eyes.
+        if (frameTurnMode != kPictureTurnDouble && frameTurnMode != kPictureTurnCompositorOnly &&
             CameraRigHook_MatchHeadFollowTargets(baseBasis.forward, matched, &matchAge, &matchErr) &&
             matched.poseId != 0) {
             s_frameMatched = true;
@@ -735,8 +847,430 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         }
     }
 
+    // Staying in the body during an action (2026-09-23, user: "we still get
+    // pulled out during actions, like kicks"). Second pass: the test used to be
+    // "the camera rig hook has gone quiet", and the user still reported being
+    // "definitely popped out of my camera during actions, but was actually held
+    // in place during one of the cutscenes" - which is exactly what that test
+    // does. A cutscene takes the camera away for seconds and trips it; a kick
+    // does not stop the rig at all, so nothing ever fired.
+    //
+    // There is a better test right here. The eye below is decoded from the
+    // matrices the renderer was handed, and the skeleton says where the eye
+    // belongs. While the view is on the character those two are the same place,
+    // so putting the eye "back" changes nothing; the moment anything swings the
+    // camera out for a shot they part company, on the very first frame, and it
+    // does not matter which camera the game used to do it.
+    bool haveBodyEye = false;
+    float bodyEye[3] = {};
+    float awayUnits = 0.0f;
+    if (CameraRigHook_GetBodyEye(baseBasis.forward, baseBasis.camPos, bodyEye)
+        && bodyEye[0] == bodyEye[0] && bodyEye[1] == bodyEye[1] && bodyEye[2] == bodyEye[2]) {
+        // The finite test is the belt to the braces above. Whatever else goes
+        // wrong in the skeleton, a NaN place for your eye is never believed -
+        // last time one reached the frustum planes and culled the world.
+        haveBodyEye = true;
+        // WITHOUT THE LEAD (2026-09-26, user: "but why is this pitch an issue
+        // to begin with, if our camera is locked on the body - its not
+        // entirely, we have to add the running lead to account for it").
+        //
+        // Exactly that. The eye is the neck plus a running lead of four ticks
+        // of the character own travel, which exists so the view does not land
+        // in Chris neck when the skeleton we read is a tick behind. It is part
+        // of where the eye is DRAWN and no part of where the body IS.
+        //
+        // Measuring the camera against the led-forward point means a sprint
+        // manufactures the gap the test is hunting for: the faster you run the
+        // further ahead we put the target, and at four ticks that is most of
+        // the 99 units the stairs produced. The camera had not gone anywhere.
+        // We moved the thing it was being compared to.
+        float lead[3];
+        CameraRigHook_GetRunLead(lead);
+        const float d[3] = { bodyEye[0] - lead[0] - baseBasis.camPos[0], bodyEye[1] - lead[1] - baseBasis.camPos[1],
+            bodyEye[2] - lead[2] - baseBasis.camPos[2] };
+        awayUnits = Length3(d);
+    }
+    // With hysteresis, so one frame the rig missed cannot flicker the hold on
+    // and off. Sixty units is about seven tenths of a metre: further apart than
+    // the two placements ever drift, nearer than any camera that has pulled out
+    // to watch.
+    // AND SIXTY IS SEVENTY CENTIMETRES OF YOUR HEAD (2026-09-26, user: "just
+    // want to confirm, you aren't allowing the action camera to move us at
+    // all, right?").
+    //
+    // It was. Making the hold instant fixed the ramp but not the trigger, and
+    // the trigger was the bigger half: departure is NOTICED by the camera
+    // having already travelled sixty units from your eye, which is about seven
+    // tenths of a metre of unrequested head movement before anything engages.
+    //
+    // Two ways in now. The game says so directly whenever it has taken the
+    // camera for something scripted, and that costs nothing to believe. And
+    // the distance trigger comes down to just above ordinary play: HeadLock
+    // measures the camera sitting 18 to 19 units off the eye while nothing is
+    // happening, so thirty is clear of the noise and a fifth of what it was.
+    // AND THIRTY WAS FAR TOO TIGHT (2026-09-26, user: "our game camera is so
+    // bad with the checkerboard now that even sprinting causes it").
+    //
+    // My doing. Dropping the trigger from sixty units to thirty made ordinary
+    // sprinting count as the camera departing, so the eye held on the body
+    // while the game camera ran ahead - and the culling frustum is still built
+    // for the game camera, so everything between the two got cut. That is the
+    // checkerboard, now firing constantly instead of occasionally.
+    //
+    // Back to sixty. The game's own scripted-camera signal stays, because that
+    // one is free of false positives and is what actually stops an action
+    // camera moving your head - but it is worth being honest that it has the
+    // same cost while it is engaged, and the real fix is for the culling to
+    // follow the eye rather than the camera.
+    // AND A SPIKE IS NOT A DEPARTURE (2026-09-26, user: "the camera doesn't
+    // want to stay within my body, sprinting while turning doesn't spin with
+    // my body anymore - although what did work was keeping the camera in place
+    // during stomps").
+    //
+    // Both halves of that are one fault. The scripted signal is right and is
+    // what holds the camera through a stomp; the DISTANCE test is what misread
+    // a sprinting turn. The eye is placed on the neck with a running lead and
+    // the game camera swings behind on a hard turn, so the two part company for
+    // a few frames at speed - and with the take now instant, a few frames is
+    // enough to snap the view into a world-locked hold and leave it there,
+    // which reads exactly as the body turning without you.
+    //
+    // A real departure lasts seconds; this lasts frames. So the distance
+    // trigger has to persist before it counts. The scripted signal keeps its
+    // instant take, because that one has no false positives and is the one
+    // that matters for comfort.
+    //
+    // A non-finite distance is never a departure either. It meant a NaN had
+    // got into the eye placement, and believing it held the camera on a
+    // position that was itself NaN.
+    static bool s_departed = false;
+    static unsigned long long s_farSince = 0;
+    // And even then it has to have MOVED the camera. A scripted camera that
+    // has not gone anywhere costs nothing to ignore, and ignoring it is what
+    // keeps a slow frame from stealing the view.
+    const bool sane = haveBodyEye && awayUnits == awayUnits && awayUnits < 1e6f;
+    const bool gameSaysSo = CameraRigHook_InScriptedCamera() && (!sane || awayUnits > 40.0f);
+    // NINETY, BECAUSE STAIRS ARE SEVENTY (2026-09-26, user: "the camera still
+    // pops out when sprinting up stairs").
+    //
+    // The false takes are gone - the log used to show them at 4 units and now
+    // shows nothing under 60 - but a stair sprint genuinely does put the game
+    // camera 66 to 75 units from a neck mounted eye, because the camera pitches
+    // and lags on the climb. Melee, which is the case worth holding for, comes
+    // in at 102 and above. There is clear air between the two, so the line goes
+    // in it.
+    // IS IT FOLLOWING YOU (2026-09-26, the log: stairs at 99 units, melee at
+    // 102).
+    //
+    // There is no threshold between those, and I said there was. Distance is
+    // simply the wrong question: a camera trailing you up a staircase and a
+    // camera swinging out for a stomp both end up about a metre away, and only
+    // one of them has stopped being your camera.
+    //
+    // What separates them is whether it is TRACKING. On the stairs you are
+    // running and the camera is running with you - the gap opens because it
+    // lags, so the two are moving together and their velocities nearly match.
+    // In a stomp you are planted and the camera leaves on its own, so its
+    // velocity has nothing to do with yours. That difference is large, obvious,
+    // and does not care how far apart they happen to be.
+    //
+    // The distance test stays as the gate, because a camera that has not gone
+    // anywhere is not worth thinking about either way.
+    static float s_wasCam[3] = {}, s_wasMan[3] = {};
+    static bool s_haveWas = false;
+    static float s_mismatch = 0.0f;
+    static unsigned long long s_lastVelMs = 0;
+    float manPos[3] = {};
+    const bool haveMan = CameraRigHook_GetPlayerWorldPos(manPos);
+    {
+        const unsigned long long msNow = GetTickCount64();
+        const float dtv = s_lastVelMs ? (msNow - s_lastVelMs) * 0.001f : 0.0f;
+        if (haveMan && dtv > 0.008f) {
+            if (s_haveWas) {
+                float diff = 0.0f;
+                for (int k = 0; k < 3; ++k) {
+                    const float vCam = (baseBasis.camPos[k] - s_wasCam[k]) / dtv;
+                    const float vMan = (manPos[k] - s_wasMan[k]) / dtv;
+                    const float d = vCam - vMan;
+                    diff += d * d;
+                }
+                diff = std::sqrt(diff);
+                // Smoothed, because one frame of either can be noisy at 16 fps.
+                s_mismatch = s_mismatch * 0.6f + diff * 0.4f;
+            }
+            for (int k = 0; k < 3; ++k) {
+                s_wasCam[k] = baseBasis.camPos[k];
+                s_wasMan[k] = manPos[k];
+            }
+            s_haveWas = true;
+            s_lastVelMs = msNow;
+        } else if (!s_lastVelMs) {
+            s_lastVelMs = msNow;
+        }
+    }
+    // Units a second of disagreement. A sprint carries both along together and
+    // leaves very little; a camera going somewhere by itself leaves a lot.
+    constexpr float kNotFollowing = 200.0f;
+    const bool onItsOwn = !(s_mismatch == s_mismatch) || s_mismatch > kNotFollowing;
+    const bool farNow
+        = sane && (s_departed ? awayUnits > 40.0f : (awayUnits > 90.0f && onItsOwn));
+    const unsigned long long nowDepart = GetTickCount64();
+    if (!farNow)
+        s_farSince = 0;
+    else if (!s_farSince)
+        s_farSince = nowDepart;
+    // Already held: leave at once when it comes back, as before. Not yet held:
+    // the camera has to stay away for a fifth of a second first.
+    const bool farForLong = farNow && (s_departed || nowDepart - s_farSince >= 200);
+    bool departed = gameSaysSo || farForLong;
+
+    // SINCE WHEN (2026-09-25, user: "any way we can also have theatre mode for
+    // in game cutscenes? Not just the pre-rendered stuff").
+    //
+    // The theatre already catches the cutscenes where the game TAKES the camera
+    // and stops calling the rig - the log has it doing so. The ones it misses
+    // are the scenes the engine plays with the rig still ticking: the camera
+    // cuts about and frames two people talking, and as far as the rig is
+    // concerned nothing has happened at all.
+    //
+    // But the measurement right here sees it plainly. The eye the renderer was
+    // handed and the eye the skeleton says you have are in the same place while
+    // the view is on you, and part company the instant anything swings the
+    // camera out for a shot. How LONG they have been apart is the whole
+    // difference between a vault and a scene, so keep it and let the theatre
+    // ask.
+    // Measured in ONE place, and not this one (2026-09-25, user: "when I got to
+    // my body, it was still in theater mode").
+    //
+    // Because it was measured here. This function returns at the top while the
+    // theatre is on - that is what makes the frame render flat - so the clock
+    // that let the theatre IN stopped the instant it got in, and could never
+    // say the camera had come back. A one-way door with no handle on the
+    // inside. It lives in UpdateCameraAwayClock now, which runs from Present
+    // whatever else is happening.
+
+    // A real cutscene is left alone (2026-09-23, user: "when an actual
+    // cutscene happens, it's also still locking me in a spot vs playing the
+    // cutscene"). A kick or a stomp takes the camera for well under a second
+    // and never stops the camera rig; a cutscene takes it away and keeps it,
+    // which the rig notices by simply not being called. Held past a second and
+    // a half of that, it is not an action worth refusing - it is the film, and
+    // the film should play.
+    {
+        static unsigned long long s_quietSince = 0;
+        const unsigned long long nowCut = GetTickCount64();
+        if (!CameraRigHook_InScriptedCamera()) {
+            s_quietSince = 0;
+        } else {
+            if (!s_quietSince)
+                s_quietSince = nowCut;
+            if (nowCut - s_quietSince > 1500)
+                departed = false;
+            // A CUT WAS NOT ENOUGH, TESTED (2026-09-25). Releasing the hold on
+            // two camera cuts made the action camera markedly WORSE at keeping
+            // you in first person, so something in ordinary play is jumping the
+            // camera more than a metre and a half between frames and being
+            // counted as a change of shot. The counter stays - the theatre still
+            // uses it, where a false positive costs a screen rather than your
+            // viewpoint - but it does not get to hand your eye back.
+        }
+    }
+
+    // And the view is held still while the game has it. Putting the eye back in
+    // the body is only half of what makes an action jarring: the game also
+    // swings the camera round for the shot, and a world that turns while your
+    // head does not is the part that turns stomachs. So the heading the camera
+    // had when it was taken is kept and the game's turning is refused - your
+    // own head still moves the view exactly as it always does, because that is
+    // applied per eye below. Yaw only: leaning the horizon in a headset is
+    // worse than any camera move.
+    // The heading is held for as long as the EASE lasts, not just as long as
+    // the game has the camera (2026-09-23, user: "still snaps when regaining
+    // control of the action camera"). The position was easing back over a fifth
+    // of a second while the heading was let go in a single frame, so the whole
+    // handover still landed as a snap - the eased half was simply the half
+    // nobody notices. Both now come back on the same ramp, and the remembered
+    // heading is only forgotten once that ramp has reached the bottom.
+    static float s_heldYaw = 0.0f;
+    static float s_heldForward[3] = { 0.0f, 0.0f, 1.0f };
+    static bool s_holdingYaw = false;
+    const float yawNow = std::atan2(baseBasis.forward[0], baseBasis.forward[2]);
+    float holdYawCos = 1.0f, holdYawSin = 0.0f;
+    if (departed) {
+        s_holdingYaw = true;
+        // The eye sits where the body was facing, not where the shot looks.
+        CameraRigHook_GetBodyEye(s_heldForward, baseBasis.camPos, bodyEye);
+    } else if (!s_holdingYaw) {
+        // Following the game while it is behaving, and remembering where the
+        // view was pointing in case it stops.
+        s_heldYaw = yawNow;
+        std::memcpy(s_heldForward, baseBasis.forward, sizeof(s_heldForward));
+    }
+    if (s_holdingYaw) {
+        float back = s_heldYaw - yawNow;
+        while (back > 3.14159265f)
+            back -= 6.28318531f;
+        while (back < -3.14159265f)
+            back += 6.28318531f;
+        holdYawCos = std::cos(back);
+        holdYawSin = std::sin(back);
+    }
+#if RE5VR_DIAGNOSTICS
+    if (departed != s_departed) {
+        Log_Printf("StereoTest: the game %s the camera - it was %.0f units from where the body puts the eye, moving %.0f units a second differently from you",
+            departed ? "took" : "gave back", awayUnits, s_mismatch);
+        // WHICH OF THE TWO ACTUALLY MOVED (2026-09-26, from the pipeline read).
+        //
+        // Reading the camera's own position through every stage of its pipeline
+        // during sprints, steps, ladders and jumps showed it sitting a steady
+        // 165 to 175 units from the character the whole time - about two metres,
+        // which is head height above his feet. It never went anywhere.
+        //
+        // But the departure detector was reporting 180 units at the same kind of
+        // moment, and it measures the camera against the BODY EYE. Two things
+        // can produce that, and they want opposite fixes: either the camera
+        // moved, which the pipeline says it did not, or the body eye did. So
+        // print both against the one reference neither of them derives from,
+        // the character's own world position. A camera that stays near 170
+        // while the gap is large means the eye is the thing that ran off.
+        {
+            float manAt[3];
+            float leadNow[3];
+            CameraRigHook_GetRunLead(leadNow);
+            if (CameraRigHook_GetPlayerWorldPos(manAt)) {
+                const float cm[3] = { baseBasis.camPos[0] - manAt[0], baseBasis.camPos[1] - manAt[1],
+                    baseBasis.camPos[2] - manAt[2] };
+                const float em[3] = { bodyEye[0] - manAt[0], bodyEye[1] - manAt[1], bodyEye[2] - manAt[2] };
+                Log_Printf("StereoTest:   the camera is %.0f from the man, the body eye is %.0f from him, and the "
+                           "lead is %.0f",
+                    Length3(cm), Length3(em), Length3(leadNow));
+            }
+        }
+    }
+#endif
+    s_departed = departed;
+
+    // Handed over rather than snapped (2026-09-23, user: "it does 'snap' when
+    // you regain control rather than a smooth takeover"). Taking the view is
+    // quick, because whatever is happening has already started; giving it back
+    // is slower, because nothing is happening any more and there is time to be
+    // gentle about it. About a twentieth of a second in, a fifth of a second
+    // out.
+    // THE HANDOVER (2026-09-25, user: "it's not really a smooth transition back
+    // to my control. It's disorienting").
+    //
+    // Two things wrong with what was here. It moved a share of the REMAINING
+    // distance each frame, which is an exponential: it starts at full speed and
+    // crawls at the end, so the eye leaves fast enough to feel like a shove and
+    // then takes an age over the last centimetre. And the share was per FRAME,
+    // so the whole thing ran twice as fast at 120 as at 60 - the disorientation
+    // literally depended on the frame rate.
+    //
+    // A fixed duration with a smoothstep over it instead. Smoothstep leaves and
+    // arrives at zero speed, so there is no jerk at either end, and seconds are
+    // seconds whatever the machine is doing. Out is slower than in, because
+    // being taken somewhere is expected and being handed back is not.
+    static float s_holdT = 0.0f;
+    {
+        static LARGE_INTEGER s_qpf = {};
+        static LARGE_INTEGER s_last = {};
+        if (!s_qpf.QuadPart)
+            QueryPerformanceFrequency(&s_qpf);
+        LARGE_INTEGER nowQ;
+        QueryPerformanceCounter(&nowQ);
+        float dt = 1.0f / 90.0f;
+        if (s_last.QuadPart && s_qpf.QuadPart)
+            dt = static_cast<float>(nowQ.QuadPart - s_last.QuadPart) / static_cast<float>(s_qpf.QuadPart);
+        s_last = nowQ;
+        // A hitch must not teleport the eye across the room.
+        if (!(dt > 0.0f))
+            dt = 0.0f;
+        if (dt > 0.05f)
+            dt = 0.05f;
+        // AND I HAD THE OLD CODE BACKWARDS (2026-09-25, user: "the action camera
+        // was worse because I'm no longer staying in first person, I think that
+        // fix was due to the one that was dealing with the camera leaving the
+        // body" - correct on both counts).
+        //
+        // I called the old line a slow exponential. It was not. This runs once
+        // per DRAW CALL, thousands of times a frame, so moving a quarter of the
+        // remaining distance each time reached 1.0 inside a single frame. It was
+        // effectively instant, and being instant is exactly why the camera never
+        // appeared to leave your body.
+        //
+        // Making it honestly time-based was right; the third of a second was
+        // not. That is a third of a second of the camera visibly pulling out on
+        // every kick, which never used to happen. Taking the view is as close to
+        // instant as a smoothstep can be, and only the handing back is gentle,
+        // which was the actual complaint.
+        // AND THE TAKE IS NOT A RAMP AT ALL (2026-09-26, user: "we've got to
+        // stop action camera from moving your head at all - that's what causes
+        // a number of issues and discomfort, I'm almost sure of it").
+        //
+        // Eighty milliseconds sounded instant when I wrote it and is not: at
+        // 90 Hz it is seven frames during which your eye is still following a
+        // camera that has started swinging away, because the hold has not
+        // finished coming up yet. Seven frames of unrequested head movement is
+        // exactly the thing that makes people ill, and it happens on every
+        // kick, every stomp and every vault.
+        //
+        // There is also no reason for it to be gradual. Ramping IN means
+        // easing your head part of the way somewhere it should never go; the
+        // smoothness only ever mattered on the way back, which is where the
+        // original complaint was. So the hold snaps on and eases off.
+        constexpr float kGiveBackSec = 0.60f;
+        if (departed)
+            s_holdT = 1.0f;
+        else
+            s_holdT -= dt / kGiveBackSec;
+        if (s_holdT > 1.0f)
+            s_holdT = 1.0f;
+        if (s_holdT < 0.0f)
+            s_holdT = 0.0f;
+    }
+    const float s_hold = s_holdT * s_holdT * (3.0f - 2.0f * s_holdT);
+    const bool inBody = s_hold > 0.0f && haveBodyEye;
+    if (inBody) {
+        for (int k = 0; k < 3; ++k)
+            bodyEye[k] = baseBasis.camPos[k] + (bodyEye[k] - baseBasis.camPos[k]) * s_hold;
+    }
+    // The heading comes back on the same ramp as the position, and only when it
+    // has run out is the held heading forgotten.
+    {
+        const float back = std::atan2(holdYawSin, holdYawCos) * s_hold;
+        holdYawCos = std::cos(back);
+        holdYawSin = std::sin(back);
+    }
+    if (s_hold <= 0.0f)
+        s_holdingYaw = false;
+
+    // Where your HEAD is, once, for the lean below (2026-09-23, user: "any idea
+    // why lean and peek changes the world scale? It's unusable in its current
+    // state"). The lean was being worked out per eye, from THAT eye's position,
+    // against one shared reference - so the two eyes came out an IPD apart on
+    // top of the IPD already applied, which is an eye separation of double and
+    // a world of half the size. The stronger the lean, the smaller the world.
+    // Both eyes lean by the same amount now, because a head is one thing.
+    float headMeters[3] = { (leftView.positionMeters[0] + rightView.positionMeters[0]) * 0.5f,
+        (leftView.positionMeters[1] + rightView.positionMeters[1]) * 0.5f,
+        (leftView.positionMeters[2] + rightView.positionMeters[2]) * 0.5f };
+
     auto buildEyeBasis = [&](const XRBridgeEyeView& view, bool leftEye) {
         CameraBasis basis = baseBasis;
+        if (inBody) {
+            std::memcpy(basis.camPos, bodyEye, sizeof(bodyEye));
+            // Turn the basis back about the world's up axis by whatever the
+            // game has swung it since it took the camera.
+            const auto unturn = [&](float v[3]) {
+                const float x = v[0] * holdYawCos + v[2] * holdYawSin;
+                const float z = -v[0] * holdYawSin + v[2] * holdYawCos;
+                v[0] = x;
+                v[2] = z;
+            };
+            unturn(basis.right);
+            unturn(basis.up);
+            unturn(basis.forward);
+        }
 
         // Head-follow compensation (2026-09-12). When F9 is steering the
         // game's camera, that camera ALREADY contains this rotation - the
@@ -753,7 +1287,8 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         const bool headFollowDriving = s_frameMatched;
         Mat3 delta{};
         std::memcpy(delta.m, view.rotationDelta, sizeof(delta.m));
-        if (!headFollowDriving || frameTurnMode == kPictureTurnDouble) {
+        if (!headFollowDriving || frameTurnMode == kPictureTurnDouble ||
+            frameTurnMode == kPictureTurnCompositorOnly) {
             ApplyHeadRotation(basis, delta);
         } else if (frameTurnMode == kPictureTurnDoubleFixed) {
             // Before the first match, fall back to the latched head and its
@@ -782,8 +1317,16 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
             //    frame is tagged with a rolled pose but drawn level, and the
             //    compositor tilts the world WITH your head (user: "rolling your
             //    head is inverted").
+            // What the camera was ACTUALLY steered with, which is not the same
+            // as the head pose it was built from once head steadying is on
+            // (2026-09-18). Taking the raw head out of a camera that was
+            // turned by a steadied one would leave the difference in the
+            // picture; taking the steadied one out puts that difference back
+            // on the eyes, so catch-up stays 1:1 with your neck while the game
+            // camera underneath it stays still. With steadying off the two are
+            // identical and this changes nothing.
             const float* aimFrom = frameTurnMode == kPictureTurnCatchUp && s_frameMatched
-                ? s_frameCamHeadForward
+                ? s_frameCamCameraForward
                 : leftView.rotationDelta + 6;
             Mat3 aim{};
             if (NoRollAim(aimFrom, aim))
@@ -793,6 +1336,207 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         const float offset = leftEye ? -g_halfSeparation : g_halfSeparation;
         for (int i = 0; i < 3; ++i)
             basis.camPos[i] += basis.right[i] * offset;
+
+        // Leaning (2026-09-17). The headset's position has been published in
+        // metres all along and nothing has ever used it: the eye sat wherever
+        // the character's head joint was, so leaning out from behind a corner
+        // moved your real head and nothing else. Only the DELTA from where you
+        // were when the reference was taken is applied, so sitting differently
+        // in a chair doesn't shove the camera through a wall.
+        //
+        // Metres become game units through the same constant the world scale
+        // implies: half an IPD is 0.0318 m, and g_halfSeparation is that same
+        // half IPD expressed in the game's units, so their ratio is the game's
+        // units per metre. Tying it to world scale means leaning stays honest
+        // when the world is made bigger or smaller.
+        //
+        // Applied along the BASE camera's axes, not the head-rotated eye's:
+        // your head's movement is measured in the room, so lean left and you
+        // go left relative to the character, whichever way you happen to be
+        // looking at the time. OpenXR is +X right, +Y up, -Z forward.
+        if (g_headPositionTracking) {
+            // The reference has to come from a pose that means something
+            // (2026-09-17, user: "lean and peek has my camera way high in the
+            // air"). It was taken on the very first call, which can land before
+            // tracking has produced anything, so the reference was zero and
+            // every frame after it read as having stood up 1.7 metres - about
+            // 150 game units straight upward. A position of exactly zero on all
+            // three axes is not somebody sitting at the origin, it is no data.
+            const bool poseMeansSomething = headMeters[0] != 0.0f || headMeters[1] != 0.0f
+                || headMeters[2] != 0.0f;
+            // And is anybody WEARING it? (2026-09-24, user: "if that setting is
+            // enabled when first entering VR, the camera starts way too high and
+            // you have to toggle the setting after you get into VR".)
+            //
+            // The space is XR_REFERENCE_SPACE_TYPE_LOCAL, whose origin is
+            // wherever the headset was when the session started. If the session
+            // starts while it is sitting on a desk, the reference is taken down
+            // there, and putting it on reads as having stood up the best part of
+            // a metre - about eighty units straight upward. Toggling the setting
+            // retakes the reference while it is on your head, which is why that
+            // works and why it has to be done every time.
+            //
+            // Rejecting a pose of exactly zero was not enough: a headset on a
+            // desk reports a perfectly good position, it is just not yours. A
+            // headset ON somebody moves - breathing is enough - and one lying on
+            // a surface does not. So wait for a centimetre of accumulated
+            // movement before believing the pose is a person.
+            static float s_lastHead[3] = {};
+            static bool s_haveLastHead = false;
+            static float s_stirred = 0.0f;
+            if (poseMeansSomething) {
+                if (s_haveLastHead) {
+                    const float mx = headMeters[0] - s_lastHead[0];
+                    const float my = headMeters[1] - s_lastHead[1];
+                    const float mz = headMeters[2] - s_lastHead[2];
+                    s_stirred += std::sqrt(mx * mx + my * my + mz * mz);
+                }
+                std::memcpy(s_lastHead, headMeters, sizeof(s_lastHead));
+                s_haveLastHead = true;
+            }
+            if (!g_leanReferenceSet && poseMeansSomething && s_stirred > 0.01f) {
+                std::memcpy(g_leanReference, headMeters, sizeof(g_leanReference));
+                g_leanReferenceSet = true;
+                Log_Printf("Lean: taking your standing height from here - the headset has moved, so somebody "
+                           "is wearing it");
+            }
+            if (!g_leanReferenceSet)
+                return basis;
+            float ref[3];
+            std::memcpy(ref, g_leanReference, sizeof(ref));
+            // And if the gap is bigger than a person, the reference is stale
+            // rather than the player athletic - a runtime recentre or a new
+            // session moves the origin under us. Take it again.
+            const float gapX = headMeters[0] - ref[0], gapY = headMeters[1] - ref[1],
+                        gapZ = headMeters[2] - ref[2];
+            if (gapX * gapX + gapY * gapY + gapZ * gapZ > 2.25f) { // 1.5 m
+                std::memcpy(g_leanReference, headMeters, sizeof(g_leanReference));
+                std::memcpy(ref, g_leanReference, sizeof(ref));
+            }
+            // Height finds its own level. Belt and braces for the above, and
+            // worth having on its own: nobody plays a whole session held twenty
+            // centimetres off their own neutral, so a vertical offset that
+            // PERSISTS is a reference that is wrong, not a player who is
+            // crouching. Standing up out of a chair is the same thing and wants
+            // the same answer.
+            //
+            // Only the vertical, and only after three quarters of a second.
+            // Leaning out from behind a corner and holding it is a real thing to
+            // do and must not drift out from under you; ducking for a second
+            // still ducks, because the delay outlasts it.
+            {
+                static unsigned long long s_offSince = 0;
+                static unsigned long long s_lastMs = 0;
+                const unsigned long long nowY = GetTickCount64();
+                const float dead = 0.18f;
+                const float off = headMeters[1] - g_leanReference[1];
+                if (std::fabs(off) <= dead) {
+                    s_offSince = 0;
+                } else {
+                    if (!s_offSince) {
+                        s_offSince = nowY;
+                        s_lastMs = nowY;
+                    }
+                    if (nowY - s_offSince > 750) {
+                        const float secs = (nowY - s_lastMs) / 1000.0f;
+                        const float step = secs * 1.2f; // metres a second
+                        const float want = off > 0.0f ? off - dead : off + dead;
+                        const float move = std::fabs(want) < step ? want : (want > 0.0f ? step : -step);
+                        g_leanReference[1] += move;
+                        ref[1] = g_leanReference[1];
+                        static unsigned long long s_toldY = 0;
+                        if (nowY - s_toldY >= 2000) {
+                            s_toldY = nowY;
+                            Log_Printf("Lean: you have been %.0f cm off your own height for a while, so that is "
+                                       "your height now",
+                                off * 100.0f);
+                        }
+                    }
+                    s_lastMs = nowY;
+                }
+            }
+            const float unitsPerMetre = g_halfSeparation > 0.01f ? g_halfSeparation / 0.0318f : 86.0f;
+            const float scale = unitsPerMetre * g_leanScale;
+            const float dx = (headMeters[0] - ref[0]) * scale;
+            const float dy = (headMeters[1] - ref[1]) * scale;
+            const float dz = (headMeters[2] - ref[2]) * scale;
+            for (int i = 0; i < 3; ++i)
+                basis.camPos[i] += baseBasis.right[i] * dx + baseBasis.up[i] * dy - baseBasis.forward[i] * dz;
+            if (leftEye) {
+                for (int i = 0; i < 3; ++i)
+                    g_leanWorld[i] = baseBasis.right[i] * dx + baseBasis.up[i] * dy - baseBasis.forward[i] * dz;
+                g_haveLeanWorld = true;
+
+                // Roomscale (2026-09-23). Second pass, and the first one was
+                // wrong in two ways that the user felt immediately: "roomscale
+                // completely disabled my ability to walk anymore with the left
+                // stick", and "lean and peek has a huge swivel to it".
+                //
+                // The swivel was the worse of the two, because it happened even
+                // with roomscale switched off: this whole block ran whenever
+                // leaning was on, quietly moving the reference your lean is
+                // measured from every time the character took a step. Walk
+                // anywhere and your lean offset grew without you having moved
+                // at all. It only runs when roomscale is on now.
+                //
+                // The stick fight was a servo that could not tell the two apart.
+                // It credited the character with ALL of his movement, so pushing
+                // the stick forward made him walk away from the reference, which
+                // opened a gap behind him, which asked him to walk back. You
+                // were fighting your own feet. He is only credited with movement
+                // in the direction WE asked him to go, so a step you commanded
+                // with your thumb leaves the reference exactly where it was and
+                // costs nothing.
+                if (XrInput_GetSettings().roomStep) {
+                    static float s_hisPos[3] = {};
+                    static bool s_hadHisPos = false;
+                    float hisPos[3];
+                    if (CameraRigHook_GetPlayerWorldPos(hisPos)) {
+                        if (s_hadHisPos && unitsPerMetre > 1.0f) {
+                            const float moved[3] = { hisPos[0] - s_hisPos[0], hisPos[1] - s_hisPos[1],
+                                hisPos[2] - s_hisPos[2] };
+                            // A cut, a load or a teleport is not a step.
+                            if (Length3(moved) < 60.0f) {
+                                const float alongRight = moved[0] * baseBasis.right[0]
+                                    + moved[1] * baseBasis.right[1] + moved[2] * baseBasis.right[2];
+                                const float alongFwd = moved[0] * baseBasis.forward[0]
+                                    + moved[1] * baseBasis.forward[1] + moved[2] * baseBasis.forward[2];
+                                // Only the part of it that went the way we asked.
+                                const float askLen
+                                    = std::sqrt(g_roomAsk[0] * g_roomAsk[0] + g_roomAsk[1] * g_roomAsk[1]);
+                                if (askLen > 0.01f) {
+                                    const float ux = g_roomAsk[0] / askLen, uf = g_roomAsk[1] / askLen;
+                                    float ours = alongRight * ux + alongFwd * uf;
+                                    if (ours > 0.0f) {
+                                        g_leanReference[0] += (ux * ours) / unitsPerMetre;
+                                        g_leanReference[2] -= (uf * ours) / unitsPerMetre;
+                                    }
+                                }
+                            }
+                        }
+                        std::memcpy(s_hisPos, hisPos, sizeof(hisPos));
+                        s_hadHisPos = true;
+                    }
+                }
+                g_roomStep[0] = (headMeters[0] - ref[0]);
+                g_roomStep[1] = -(headMeters[2] - ref[2]);
+                g_haveRoomStep = true;
+            }
+
+            // Still in the air after the reference fix, so the numbers
+            // themselves have to be looked at rather than reasoned about.
+            if (leftEye) {
+                static ULONGLONG s_ms = 0;
+                const ULONGLONG now = GetTickCount64();
+                if (now - s_ms > 1000) {
+                    s_ms = now;
+                    Log_Printf("Lean: head at (%.3f, %.3f, %.3f) m, reference (%.3f, %.3f, %.3f), so the view moves "
+                               "(%.1f, %.1f, %.1f) units at %.1f units per metre",
+                        headMeters[0], headMeters[1], headMeters[2], ref[0], ref[1],
+                        ref[2], dx, dy, dz, unitsPerMetre);
+                }
+            }
+        }
 
         // OpenXR's per-eye frustum is ASYMMETRIC (|angleLeft| != |angleRight|
         // - each eye sees further toward its own temple than toward the
@@ -806,18 +1550,134 @@ bool BeginStereoDraw(IDirect3DDevice9* pDevice, StereoDrawContext& ctx)
         basis.scaleX = (2.0f / (tanR - tanL)) / g_fovWidenMultiplier;
         basis.scaleY = (2.0f / (tanU - tanD)) / g_fovWidenMultiplier;
 
+        // How far this eye ended up from the camera the game thinks it is
+        // drawing from, for the culling.
+        {
+            const float off[3] = { basis.camPos[0] - baseBasis.camPos[0], basis.camPos[1] - baseBasis.camPos[1],
+                basis.camPos[2] - baseBasis.camPos[2] };
+            const float far3 = Length3(off);
+            if (far3 > g_eyeOffThisFrame)
+                g_eyeOffThisFrame = far3;
+            for (int k = 0; k < 3; ++k)
+                g_eyeOffSum[k] += off[k];
+        }
         return basis;
     };
 
+    g_eyeOffThisFrame = 0.0f;
+    g_eyeOffSum[0] = g_eyeOffSum[1] = g_eyeOffSum[2] = 0.0f;
     const CameraBasis leftBasis = buildEyeBasis(leftView, true);
     const CameraBasis rightBasis = buildEyeBasis(rightView, false);
+    g_eyeOffUnits.store(g_eyeOffThisFrame, std::memory_order_relaxed);
+    // The head, which is the average of the two eyes - the culling wants one
+    // frustum, not one per eye, and half an IPD either side of it is far
+    // smaller than the margin the planes get widened by anyway.
+    // WHAT THE TWO EYES ARE ACTUALLY DOING (2026-09-26, user: "my eyes were
+    // not aligning properly ... like my eyes were looking too far to the left
+    // and right - straight when entering VR").
+    //
+    // Straight on entry and wrong later means something drifts, and guessing
+    // which of half a dozen candidates it is has not worked. These are the only
+    // three numbers that can describe it: how far apart the eyes are, how much
+    // they are converging or diverging, and how much they are canted relative
+    // to each other. A correct pair is a steady separation, near zero degrees
+    // of convergence and exactly zero cant.
+    {
+        static unsigned long long s_saidAt = 0;
+        const unsigned long long nowEye = GetTickCount64();
+        if (nowEye - s_saidAt > 1000) {
+            s_saidAt = nowEye;
+            const float apart[3] = { rightBasis.camPos[0] - leftBasis.camPos[0],
+                rightBasis.camPos[1] - leftBasis.camPos[1], rightBasis.camPos[2] - leftBasis.camPos[2] };
+            const float sep = Length3(apart);
+            // Convergence: the angle between the two forward vectors. Parallel
+            // is zero; anything else and the eyes are pointing past or across
+            // each other, which is what reads as cockeyed.
+            float dotF = 0.0f, dotU = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                dotF += leftBasis.forward[k] * rightBasis.forward[k];
+                dotU += leftBasis.up[k] * rightBasis.up[k];
+            }
+            if (dotF > 1.0f)
+                dotF = 1.0f;
+            if (dotF < -1.0f)
+                dotF = -1.0f;
+            if (dotU > 1.0f)
+                dotU = 1.0f;
+            if (dotU < -1.0f)
+                dotU = -1.0f;
+            const float convergeDeg = std::acos(dotF) * 57.2957795f;
+            const float cantDeg = std::acos(dotU) * 57.2957795f;
+            Log_Printf("EyeCheck: %.2f units apart (%.1f mm), converging %.3f deg, canted %.3f deg, each %.1f "
+                       "units off the game camera",
+                sep, sep / 85.8f * 1000.0f, convergeDeg, cantDeg, g_eyeOffThisFrame);
+            // AND THE PROJECTION, WHICH IS WHAT IS LEFT (2026-09-26, user: "64
+            // is in fact my IPD").
+            //
+            // Which closes the positional question for good: the eyes are
+            // exactly where they should be, parallel, unrolled, and an IPD
+            // apart. Nothing about where we put them can be what is wrong.
+            //
+            // The only other thing that differs between the two eyes is the
+            // frustum. A headset lens is off centre, so OpenXR reports an
+            // ASYMMETRIC one - |angleLeft| and |angleRight| are not equal, and
+            // they are mirror images between the two eyes. Get that wrong, or
+            // hand the left eye the right eye's angles, and the image in each
+            // eye sits off to one side. Which is the complaint, in the words it
+            // was made in.
+            //
+            // A healthy pair reads as mirrored: the left eye's centre negative
+            // by as much as the right eye's is positive. Two centres with the
+            // same sign means they are swapped or duplicated.
+            const float leftCentreDeg = (leftView.angleLeft + leftView.angleRight) * 0.5f * 57.2957795f;
+            const float rightCentreDeg = (rightView.angleLeft + rightView.angleRight) * 0.5f * 57.2957795f;
+            Log_Printf("EyeCheck:   left eye %.1f to %.1f deg (centre %+.2f), right eye %.1f to %.1f deg "
+                       "(centre %+.2f), widen %.2f",
+                leftView.angleLeft * 57.2957795f, leftView.angleRight * 57.2957795f, leftCentreDeg,
+                rightView.angleLeft * 57.2957795f, rightView.angleRight * 57.2957795f, rightCentreDeg,
+                g_fovWidenMultiplier);
+        }
+    }
+
+    g_eyeOffX.store(g_eyeOffSum[0] * 0.5f, std::memory_order_relaxed);
+    g_eyeOffY.store(g_eyeOffSum[1] * 0.5f, std::memory_order_relaxed);
+    g_eyeOffZ.store(g_eyeOffSum[2] * 0.5f, std::memory_order_relaxed);
+#if RE5VR_DIAGNOSTICS
+    // How far the eye is from the camera the game is culling against, while the
+    // action camera has hold of it (2026-09-25, user: "I still have that weird
+    // culling/checkboarding when an action happens").
+    //
+    // The frustum is pushed out by this plus twenty-five units, so if this reads
+    // in the hundreds during an action then the margin is nowhere near enough
+    // and geometry behind the real eye is being thrown away - which is what a
+    // checkerboard of missing surfaces would be. It is measured here and used a
+    // frame later, which is its own small problem if the number moves fast.
+    if (g_eyeOffThisFrame > 5.0f) {
+        static unsigned long long s_toldOff = 0;
+        static float s_worstOff = 0.0f;
+        if (g_eyeOffThisFrame > s_worstOff)
+            s_worstOff = g_eyeOffThisFrame;
+        const unsigned long long nowOff = GetTickCount64();
+        if (nowOff - s_toldOff >= 1000) {
+            s_toldOff = nowOff;
+            Log_Printf("Culling: your eye is %.0f units from the camera being culled against (worst %.0f), so "
+                       "the frustum wants %.0f of margin",
+                g_eyeOffThisFrame, s_worstOff, g_eyeOffThisFrame + 25.0f);
+            s_worstOff = 0.0f;
+        }
+    }
+#endif
     {
         static ULONGLONG s_lastFrameMs = 0;
         if (g_lastPresentMs != s_lastFrameMs) {
             s_lastFrameMs = g_lastPresentMs;
-#if RE5VR_DIAGNOSTICS
+            // On in release while the head-turn jitter is open (2026-09-16).
+            // This is the measurement that says whether the picture turns by
+            // the same amount the head does. Anything other than 1.00 is an
+            // error that grows with how fast you turn, which is the symptom
+            // testers describe: still is perfect, stick turning is perfect,
+            // physically turning shakes.
             NoteViewVsGameCamera(leftBasis.forward, leftView.rotationDelta);
-#endif
         }
     }
 
@@ -914,6 +1774,27 @@ void EndStereoDraw(IDirect3DDevice9* pDevice)
 //
 // Scissored to the eye's half, because the shifted viewport can overhang it.
 // Both are menu options now (2026-09-13); these are the defaults.
+// THE THEATRE (2026-09-25, user: "implement a 2d theatre mode - this would be
+// applied during the main menu, and cutscenes so that you can see everything").
+//
+// Everything needed for this already existed, wearing a different name. Every
+// draw is already sorted into one of three answers by ClassifyHudDraw: throw it
+// away, put it on a flat panel hanging in front of you, or render it twice in
+// stereo. The HUD has been going on that panel since the beginning, at a chosen
+// distance and size, with the per-eye convergence worked out so the two copies
+// fuse. A cinema screen is that panel with the whole film on it.
+//
+// So the theatre is not a new renderer. It is a fourth answer to the same
+// question - "panel, please" - given for every draw instead of just the HUD,
+// while the game is running its own camera anyway. The world arrives with the
+// game's own flat framing, the HUD arrives with it, and nothing is dropped,
+// which is the whole point: you can see everything.
+//
+// Wanted because the HUD is not fixed yet (the user: "I'd love to do a 3d main
+// menu, but we haven't gone through and fixed the hud"). It earns its keep for
+// cutscenes regardless - they are composed for a rectangle, and a camera that
+// cuts and swings is far kinder watched on a screen than worn on your face.
+
 float g_hudDistanceMeters = 2.0f; // how far away the HUD appears
 float g_hudScale = 0.67f;         // HUD width as a fraction of one eye's half - the user's pick in the headset, 2026-09-13 (was 0.8)
 constexpr float kFallbackIpdMeters = 0.063f;
@@ -1051,13 +1932,293 @@ bool IsLaserGlowSprite(IDirect3DDevice9* dev, UINT prims)
     return laser;
 }
 
+// Is the film on? Two occasions, and both are times the game has the camera and
+// we do not want it.
+//
+//   * Nobody is the player. The main menu, and the loading that follows it.
+//   * A cutscene. Judged exactly the way the action camera judges it, because
+//     that test was already argued out once: a kick or a stomp takes the camera
+//     for well under a second, a cutscene takes it and keeps it. Held past a
+//     second and a half, it is the film. Anything shorter must NOT put a screen
+//     in front of you - flipping to a cinema for a melee animation would be far
+//     worse than the thing this fixes.
+//
+// Leaving waits four tenths of a second, so that the camera being handed back
+// and taken again across a cut does not flicker the screen in and out.
+bool TheatreNow()
+{
+    static unsigned long long s_askedMs = 0;
+    static unsigned long long s_quietSince = 0;
+    static unsigned long long s_leaveAt = 0;
+    static bool s_on = false;
+    const unsigned long long now = GetTickCount64();
+    // Asked once every other frame at most; this runs per draw call otherwise.
+    if (now - s_askedMs < 16 && s_askedMs)
+        return s_on;
+    s_askedMs = now;
+    // NOT ON A MONITOR (2026-09-25, user: "let's not break our flatscreen
+    // gamers").
+    //
+    // A real hole, and not a small one: the composite is called from Present
+    // every frame, not from the draw path, so none of the checks that keep the
+    // rest of this code away from a flat game were protecting it. On a monitor
+    // it would have blacked the frame out and pasted two small copies of it
+    // side by side - the whole game, unplayable, for somebody who never asked
+    // for any of this.
+    //
+    // g_enabled is the honest question. It is what turns the side-by-side on,
+    // set by the bridge when VR starts, and without it there are no eye halves
+    // to paste into. Suppressed counts as off for the same reason.
+    // Held on by hand until you are playing again (2026-09-25, user: "fuck the
+    // automatic catch. Just a bind that turns it on", and "it would be nice to
+    // have an automatic 'you're in game now' to turn it off").
+    //
+    // Turning it off is a far easier question than turning it on, which is why
+    // this asymmetry is the right shape. "Is this a cutscene" has no reliable
+    // answer - five tests tonight and the best of them made the action camera
+    // worse. "Are you playing" does: the game is showing you your health and
+    // ammo, and the camera is back on your body. Neither is true during anything
+    // you would have put the screen up for.
+    if (g_theatreForced && g_enabled && !g_suppressed) {
+        static unsigned long long s_backSince = 0;
+        const bool hudUp = g_hudGoneSince == 0;
+        const bool onYourBody = g_cameraAwaySince == 0;
+        if (hudUp && onYourBody) {
+            if (!s_backSince)
+                s_backSince = now;
+        } else {
+            s_backSince = 0;
+        }
+        // A second of both, so a single frame of HUD inside a scene does not
+        // drop the screen in the middle of it.
+        if (s_backSince && now - s_backSince > 1000) {
+            s_backSince = 0;
+            g_theatreForced = false;
+            g_haveScreenAnchor = false;
+            Log_Printf("Theatre: your HUD is back and the camera is on you, so the screen comes down");
+        } else {
+            if (!s_on) {
+                s_on = true;
+                Log_Printf("Theatre: on the screen because you asked for it");
+            }
+            s_leaveAt = 0;
+            return true;
+        }
+    }
+    if (!g_theatre || !g_enabled || g_suppressed) {
+        s_on = false;
+        s_quietSince = 0;
+        g_haveScreenAnchor = false;
+        return false;
+    }
+    if (!CameraRigHook_InScriptedCamera()) {
+        // Say how long the game had the camera, every time it gives it back, so
+        // the threshold above can be read off a list of real melees and real
+        // scenes rather than guessed at again.
+        if (s_quietSince) {
+            const float heldSec = (now - s_quietSince) / 1000.0f;
+            if (heldSec > 0.5f)
+                Log_Printf("Theatre: the game held the camera for %.1f s - %s", heldSec,
+                    heldSec > 4.0f ? "long enough to be a scene" : "too short, left alone");
+        }
+        s_quietSince = 0;
+    } else if (!s_quietSince) {
+        s_quietSince = now;
+    }
+    // FOUR SECONDS, AND I WAS WRONG ABOUT THIS ONE (2026-09-25).
+    //
+    // I told the user this test had never misfired. The log says it fired six
+    // times in two minutes, and four of those lasted between one and three
+    // seconds:
+    //
+    //   04:34:26.311 on - the game has taken the camera and kept it
+    //   04:34:27.469 back in the world          (1.2 s)
+    //   04:35:39.791 on
+    //   04:35:40.959 back in the world          (1.2 s)
+    //   04:36:09.434 on
+    //   04:36:10.240 back in the world          (0.8 s)
+    //
+    // A cutscene is not over in eight tenths of a second. Those are the melees
+    // and the window vaults, and the rig going quiet for a second and a half
+    // does not tell them apart from a scene after all.
+    //
+    // It matters far more than a screen appearing when it should not, because
+    // the arm solve stands down for a scripted camera too. Every one of those
+    // flickers took the player's arms away and gave them back, which is exactly
+    // what "my aim IK broke for a bit" looks like from inside a headset.
+    const unsigned long long quietFor = s_quietSince ? now - s_quietSince : 0;
+    const bool nobodyPlaying = CameraRigHook_GetPlayerController() == nullptr;
+    // The engine's own scenes, where the rig keeps being called and the camera
+    // simply leaves your body.
+    //
+    // The camera cannot say this on its own (2026-09-25, user: "there's a few
+    // moments when theater mode kicks in and shouldn't, like longer melee
+    // actions, or being revived"). Quite so: a long melee and a scene look
+    // identical to a distance test, and no threshold separates them, because a
+    // revive genuinely does keep the camera off you for several seconds. Any
+    // number high enough to exclude a revive would start half the scenes late.
+    //
+    // The HUD draws the line the camera cannot. The game takes it away for a
+    // scene and leaves it up for everything you do yourself - you still have
+    // health and ammo to read while you are being revived, and none to read
+    // during a conversation. So both have to agree: the view is off your body
+    // AND the game has stopped telling you anything about yourself.
+    // SIX AND FOUR (2026-09-25, user: "still kicks on at moments it shouldn't.
+    // Like jumping out a window and other basic interactions. We want it to
+    // fire on cutscenes only").
+    //
+    // Three seconds and one was not enough, and I have now guessed at these
+    // numbers twice. The honest position is that this test is a safety net and
+    // not the main way in - the scenes where the game TAKES the camera are
+    // caught exactly by `film` above, which has never misfired. This one exists
+    // for the scenes that keep the rig ticking, and being late to those is a
+    // far smaller cost than turning a window vault into a cinema.
+    //
+    // So the thresholds go where nothing you DO can reach: six seconds with the
+    // view off your body and four with nothing on screen about yourself. And
+    // every episode is now logged with its real durations when it ends, so the
+    // next pass at these numbers can be read off the log instead of guessed at
+    // a third time.
+    // Still the long stop, for the scenes that keep the rig ticking. Six
+    // seconds because this signal cannot tell a scene from a revive, and a
+    // revive is the longest thing you do that looks like one.
+    const bool cameraGone = g_cameraAwaySince && now - g_cameraAwaySince > 6000;
+    const bool hudGone = g_hudGoneSince && now - g_hudGoneSince > 1500;
+    const bool acted = cameraGone && hudGone;
+    // A CHEST AND A PAUSE MENU ARE NOT FILMS (2026-09-25, user: "I like the
+    // in-game cutscene theater mode, but it fires like when opening a chest, or
+    // pausing the game").
+    //
+    // Both of those look exactly like a cutscene to a camera test, and that is
+    // why three passes at the thresholds never fixed it. Pause the game and
+    // nothing updates, so the rig goes quiet, which is the entire definition of
+    // `film`. Open a chest and the camera settles onto it and stays.
+    //
+    // But they have something in common that a real scene never does: the game
+    // is showing you a menu. A pause screen is HUD, an inventory is HUD, a chest
+    // is HUD. A cutscene has none, which is the whole point of a cutscene.
+    //
+    // That test was already being applied to the camera-distance path and not to
+    // this one, for no better reason than the order they were written in. Both
+    // want it. And with the HUD deciding it, the camera timings can come back
+    // down, so a real scene reaches the screen quickly instead of playing its
+    // first four seconds in 3D.
+    // A chest reveal is one move with no HUD, so the HUD alone cannot refuse it.
+    // A cut can. Two of them, so that the single jump into a shot does not count
+    // on its own - or six seconds, because a scene long enough to be sat through
+    // is a scene whether or not anybody bothered to cut it.
+    // AND THE CUT CANNOT BE COMPULSORY (2026-09-25, user: "it no longer picks up
+    // pre-rendered scenes. And doesn't really work to pick up in game scenes").
+    //
+    // My fault, and an obvious one in hindsight. Requiring a cut AND everything
+    // else was an AND too far: a pre-rendered film does not move the 3D camera
+    // at all, so there is nothing to detect a cut in, and the camera never
+    // counts as having left your body either. Both of the things I made
+    // compulsory are things a film cannot supply.
+    //
+    // So the cut is a reason to go EARLY, not a requirement. What every scene
+    // does have is the game holding the camera with no HUD up, and the only
+    // thing that shares that shape is a chest reveal, which is over in a few
+    // seconds. Three seconds of it excludes the chest without excluding
+    // anything else; a scene that has visibly cut between shots does not have
+    // to wait that long.
+    // AND NOTHING ELSE PUTS IT UP (2026-09-25, user: "fuck the automatic
+    // catch").
+    //
+    // Fair. Five attempts: the rig going quiet, how long it stayed quiet, the
+    // camera leaving your body, the HUD going away, and the camera cutting
+    // between shots. Each one caught some scenes and some chests, vaults,
+    // revives or pause menus, and the last one made the action camera worse. The
+    // game does not distinguish a scene from an action in any way this code can
+    // see, and pretending otherwise has cost a whole night.
+    //
+    // What is left is the one test that has never once been wrong - nobody is
+    // the player, so this is the menu - and F10, pressed by somebody who can see
+    // what is on the screen.
+    //
+    // The measurements all stay, and the watcher with them. If a pattern ever
+    // does emerge in a log, it can be turned back on in one line.
+    (void)quietFor;
+    (void)hudGone;
+    (void)acted;
+    const bool want = nobodyPlaying;
+#if RE5VR_DIAGNOSTICS
+    // WHAT A PRE-RENDERED FILM LOOKS LIKE FROM IN HERE (2026-09-25, user: "the
+    // theater mode still isn't catching pre-rendered cutscenes").
+    //
+    // Five theories have been spent on this behaviour tonight and three were
+    // wrong, so this one gets measured instead. Whenever anything cutscene-like
+    // is happening, every input the decision is made from goes in the log, once
+    // a second. A film played through it will say in its own words which test it
+    // fails - and the suspicion is the HUD count, because the movie is very
+    // likely being drawn by a shader this code already calls HUD, which would
+    // make "the HUD has gone" false for the whole film and block every path.
+    if (quietFor > 1000 || g_cameraAwaySince) {
+        static unsigned long long s_toldWatch = 0;
+        if (now - s_toldWatch >= 1000) {
+            s_toldWatch = now;
+            Log_Printf("Theatre: watching - player %s, rig quiet %.1f s, %u HUD draw(s) last frame, HUD gone "
+                       "%.1f s, view off your body %.1f s, %d cut(s) -> %s",
+                nobodyPlaying ? "NONE" : "yes", quietFor / 1000.0f, g_hudDrawsLastFrame,
+                g_hudGoneSince ? (now - g_hudGoneSince) / 1000.0f : 0.0f,
+                g_cameraAwaySince ? (now - g_cameraAwaySince) / 1000.0f : 0.0f, g_cameraCuts,
+                want ? "SCREEN" : "left alone");
+        }
+    }
+#endif
+    if (want) {
+        s_leaveAt = 0;
+        if (!s_on) {
+            s_on = true;
+            Log_Printf("Theatre: on the screen now - %s",
+                "nobody is the player, so this is a menu or a film");
+        }
+    } else if (s_on) {
+        if (!s_leaveAt)
+            s_leaveAt = now;
+        if (now - s_leaveAt > 400) {
+            s_on = false;
+            s_leaveAt = 0;
+            // Taken again next time, so the screen is always in front of you
+            // when it appears and never behind you from a cutscene ago.
+            g_haveScreenAnchor = false;
+            Log_Printf("Theatre: back in the world");
+        }
+    }
+    return s_on;
+}
+
 HudDrawClass ClassifyHudDraw(IDirect3DDevice9* pDevice, UINT prims)
 {
     if (!g_enabled || g_suppressed)
         return kNotHud;
+    // In the theatre nothing is sorted at all: the game draws its ordinary flat
+    // frame across the whole back buffer and the picture is moved onto the
+    // screen afterwards, in one piece.
+    //
+    // Putting each draw on the panel individually was the first attempt and it
+    // does not survive contact with the menu: the title and the menu text came
+    // out perfectly, because those are real HUD draws that have been taking
+    // this path for months, while the animated logo behind them arrived eight
+    // times across the frame. Whatever those draws do with screen coordinates,
+    // they do not survive being handed a different viewport, and there is no
+    // reason to think they are the only ones.
+    //
+    // A finished frame has no such opinions. Copy it, clear the buffer, and put
+    // it back twice in the right places, and it does not matter how any single
+    // draw was authored.
     // Recognised by bytecode hash from launch (hud_shaders.cpp). The K capture
     // stays available in developer builds, for finding shaders not listed yet.
-    if (HudShaders_IsHudDraw(pDevice)) {
+    const bool isHud = HudShaders_IsHudDraw(pDevice);
+    // COUNTED FIRST, AND ALWAYS (2026-09-25). The theatre asks whether the HUD
+    // is on screen, so this has to be answered while the theatre is running as
+    // well - the same trap the camera clock fell into an hour ago, where the
+    // thing that lets you in stops being measured the moment you are in.
+    if (isHud)
+        ++g_hudDrawsThisFrame;
+    if (g_inTheatre)
+        return kNotHud;
+    if (isHud) {
         if (IsLaserGlowSprite(pDevice, prims)) {
             static bool logged = false;
             if (!logged) {
@@ -1279,36 +2440,401 @@ void StereoTest_Install(IDirect3DDevice9* pDevice)
 }
 
 namespace {
-unsigned long long g_lastBackBufferMs = 0;
+bool g_haveBackBufferSize = false;
 } // namespace
+
+// A SCREEN IS AN OBJECT (2026-09-25, user: "as you look around, the screen
+// warps. Consider the screen basically being an object that stays in one spot.
+// Almost like you are in a 3d space with a 2d screen in front of you").
+//
+// Exactly right, and the reason it warped is that the first version was not an
+// object at all. It pasted a rectangle of fixed pixel size and slid it sideways
+// by the tangent of how far you had turned. A rectangle that never changes
+// shape is only correct while you are looking straight at it; turn your head
+// and a real screen foreshortens and keystones, and sliding a fixed rectangle
+// instead reads as the picture stretching away from you.
+//
+// So it is four corners in space now, projected properly. The screen hangs at
+// the remembered direction with a width and height in metres, each corner is
+// expressed in the eye's own axes and divided through by its depth, and the
+// vertices carry one over that depth as their w - which is what makes the
+// texture perspective-correct across the quad rather than merely stretched to
+// fit it. Off-axis it foreshortens by itself, because that falls out of the
+// arithmetic instead of being imitated.
+void ComposeTheatreNow(IDirect3DDevice9* dev)
+{
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
+        return;
+    D3DSURFACE_DESC desc = {};
+    if (FAILED(bb->GetDesc(&desc)) || desc.Width < 16 || desc.Height < 16) {
+        bb->Release();
+        return;
+    }
+    if (!g_theatreTex || g_theatreCopyW != desc.Width || g_theatreCopyH != desc.Height
+        || g_theatreCopyFmt != desc.Format) {
+        ReleaseTheatreCopy();
+        if (FAILED(dev->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format,
+                D3DPOOL_DEFAULT, &g_theatreTex, nullptr))
+            || !g_theatreTex || FAILED(g_theatreTex->GetSurfaceLevel(0, &g_theatreSurf))) {
+            ReleaseTheatreCopy();
+            bb->Release();
+            return;
+        }
+        g_theatreCopyW = desc.Width;
+        g_theatreCopyH = desc.Height;
+        g_theatreCopyFmt = desc.Format;
+        Log_Printf("Theatre: a %ux%u screen to show the picture on", desc.Width, desc.Height);
+    }
+    if (FAILED(dev->StretchRect(bb, nullptr, g_theatreSurf, nullptr, D3DTEXF_NONE))) {
+        bb->Release();
+        return;
+    }
+
+    XRBridgeEyeView views[2];
+    const bool haveViews = GetEyeViewsForDraw(views[0], views[1]);
+    if (!haveViews) {
+        bb->Release();
+        return;
+    }
+    const float ipd = MeasuredIpd(haveViews, views);
+    const float* R = views[0].rotationDelta; // rows: right, up, forward
+
+    // Where it hangs. Levelled, and only the way you were facing, because a
+    // cinema screen is not tilted to match somebody who was looking at the
+    // floor. Taken afresh every frame if it is meant to follow you instead.
+    if (!g_haveScreenAnchor || g_theatreFollowsHead) {
+        const float fx = R[6], fz = R[8];
+        const float flen = std::sqrt(fx * fx + fz * fz);
+        const float rx = R[0], rz = R[2];
+        const float rlen = std::sqrt(rx * rx + rz * rz);
+        if (flen > 0.01f && rlen > 0.01f) {
+            g_screenFwd[0] = fx / flen;
+            g_screenFwd[1] = 0.0f;
+            g_screenFwd[2] = fz / flen;
+            g_screenRight[0] = rx / rlen;
+            g_screenRight[1] = 0.0f;
+            g_screenRight[2] = rz / rlen;
+            if (!g_haveScreenAnchor) {
+                g_haveScreenAnchor = true;
+                Log_Printf("Theatre: the screen hangs where you were facing; look around and it stays put");
+            }
+        }
+    }
+    if (!g_haveScreenAnchor) {
+        bb->Release();
+        return;
+    }
+
+    // How big, in metres. The slider says what share of your view it fills, so
+    // that becomes an angle, and the angle becomes a size at the set distance.
+    float spanX = 2.4f;
+    {
+        const float sx = std::tan(views[0].angleRight) - std::tan(views[0].angleLeft);
+        if (sx > 0.1f)
+            spanX = sx;
+    }
+    const float dist = g_theatreDistanceMeters;
+    const float halfWm = dist * spanX * g_theatreScale * 0.5f;
+    // The picture's own shape, kept: the back buffer is the whole frame.
+    const float halfHm = halfWm * (static_cast<float>(desc.Height) / static_cast<float>(desc.Width));
+
+    // Black first. Whatever is not the screen is the dark of the room.
+    dev->ColorFill(bb, nullptr, D3DCOLOR_ARGB(255, 0, 0, 0));
+
+    IDirect3DStateBlock9* saved = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved)))
+        saved = nullptr;
+    IDirect3DSurface9* oldRt = nullptr;
+    dev->GetRenderTarget(0, &oldRt);
+    dev->SetRenderTarget(0, bb);
+
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    dev->SetTexture(0, g_theatreTex);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE,
+        D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE
+            | D3DCOLORWRITEENABLE_ALPHA);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    const float fullW = static_cast<float>(desc.Width);
+    const float fullH = static_cast<float>(desc.Height);
+    const float halfW = fullW * 0.5f;
+
+    D3DVIEWPORT9 whole = {};
+    whole.Width = desc.Width;
+    whole.Height = desc.Height;
+    whole.MaxZ = 1.0f;
+    dev->SetViewport(&whole);
+
+    for (int eye = 0; eye < 2; ++eye) {
+        const XRBridgeEyeView& v = views[eye];
+        const float* E = v.rotationDelta; // this eye's own axes
+        const float tl = std::tan(v.angleLeft), tr = std::tan(v.angleRight);
+        const float tu = std::tan(v.angleUp), td = std::tan(v.angleDown);
+        if (tr - tl <= 1e-3f || tu - td <= 1e-3f)
+            continue;
+        const float halfX0 = eye ? halfW : 0.0f;
+
+        // Where this eye is: half an inter-pupillary distance along its own
+        // right. The screen does not move, so the two views of it differ by
+        // exactly this, which is what gives it a place in the room.
+        const float side = (eye == 0 ? -0.5f : 0.5f) * ipd;
+        const float eyeAt[3] = { E[0] * side, E[1] * side, E[2] * side };
+
+        TheatreVertex quad[4];
+        bool ok = true;
+        for (int c = 0; c < 4; ++c) {
+            const float sx = (c == 0 || c == 2) ? -1.0f : 1.0f;
+            const float sy = (c < 2) ? 1.0f : -1.0f;
+            float p[3];
+            for (int i = 0; i < 3; ++i)
+                p[i] = g_screenFwd[i] * dist + g_screenRight[i] * (halfWm * sx) - eyeAt[i];
+            p[1] += halfHm * sy;
+            const float vx = p[0] * E[0] + p[1] * E[1] + p[2] * E[2];
+            const float vy = p[0] * E[3] + p[1] * E[4] + p[2] * E[5];
+            const float vz = p[0] * E[6] + p[1] * E[7] + p[2] * E[8];
+            if (vz < 0.05f) { // a corner level with or behind the eye
+                ok = false;
+                break;
+            }
+            const float ndcX = (2.0f * (vx / vz) - (tr + tl)) / (tr - tl);
+            const float ndcY = (2.0f * (vy / vz) - (tu + td)) / (tu - td);
+            quad[c].x = halfX0 + (ndcX + 1.0f) * 0.5f * halfW;
+            quad[c].y = (1.0f - ndcY) * 0.5f * fullH;
+            quad[c].z = 0.5f;
+            quad[c].rhw = 1.0f / vz;
+            quad[c].u = (c == 0 || c == 2) ? 0.0f : 1.0f;
+            quad[c].v = (c < 2) ? 0.0f : 1.0f;
+        }
+        if (!ok)
+            continue;
+
+        // Its own half and nothing else, so a screen at the edge of your view
+        // cannot spill into the other eye.
+        RECT half = { static_cast<LONG>(halfX0), 0, static_cast<LONG>(halfX0 + halfW),
+            static_cast<LONG>(fullH) };
+        dev->SetScissorRect(&half);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(TheatreVertex));
+    }
+
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetTexture(0, nullptr);
+    if (oldRt) {
+        dev->SetRenderTarget(0, oldRt);
+        oldRt->Release();
+    }
+    if (saved) {
+        saved->Apply();
+        saved->Release();
+    }
+    bb->Release();
+}
+
+// How long the rendered camera has been away from where the skeleton says your
+// eye is. Run from Present, so it keeps answering while the theatre is on and
+// can say when the scene has finished and given you back your body.
+// The game takes the HUD away for a scene and leaves it up for everything you
+// do yourself. That is the line the camera cannot draw on its own.
+void UpdateHudGoneClock()
+{
+    const unsigned long long now = GetTickCount64();
+    // ONE DRAW IS NOT A HUD (2026-09-25, user: "the theater watcher still didn't
+    // grab pre-rendered cutscenes").
+    //
+    // The watcher earned its keep on the first run. A pre-rendered film reads:
+    //
+    //   rig quiet  4.8 s, 1 HUD draw(s) last frame, HUD gone 0.0 s, 0 cut(s) -> left alone
+    //   rig quiet 10.8 s, 1 HUD draw(s) last frame, HUD gone 0.0 s, 0 cut(s) -> left alone
+    //
+    // Exactly one HUD draw a frame, for eleven seconds. That one draw IS the
+    // film - a full-screen quad drawn by a shader this code already recognises
+    // as HUD. So "the HUD has gone" was false for the whole picture, and since
+    // every path was made to require it, every path was blocked. The reason
+    // nothing I changed helped is that I kept changing the tests in front of it.
+    //
+    // A HUD is health and ammo and a partner's name: the same log reads 22 draws
+    // six seconds later with a real one up. One or two draws is a picture, not an
+    // interface, so it takes three to count as the HUD being up.
+    constexpr unsigned kHudIsUp = 3;
+    g_hudDrawsLastFrame = g_hudDrawsThisFrame;
+    if (g_hudDrawsThisFrame >= kHudIsUp)
+        g_hudGoneSince = 0;
+    else if (!g_hudGoneSince)
+        g_hudGoneSince = now;
+    g_hudDrawsThisFrame = 0;
+}
+
+void UpdateCameraAwayClock()
+{
+    float m[16];
+    if (!ConstantProbe_GetCachedCameraMatrix(m))
+        return;
+    CameraBasis basis = {};
+    DecomposeCameraMatrix(m, basis);
+    float bodyEye[3];
+    if (!CameraRigHook_GetBodyEye(basis.forward, basis.camPos, bodyEye)) {
+        g_cameraAwaySince = 0;
+        return;
+    }
+    const float d[3] = { bodyEye[0] - basis.camPos[0], bodyEye[1] - basis.camPos[1],
+        bodyEye[2] - basis.camPos[2] };
+    const float away = Length3(d);
+    // A CUT IS THE THING ONLY A FILM DOES (2026-09-25, user: "a chest isn't a
+    // hud. It's a camera focused on the chest opening to reveal the items
+    // inside").
+    //
+    // Which is right, and it takes the HUD test with it for that case. So this
+    // asks the question the other way round: not where the camera is or how
+    // long it stays, both of which a chest reveal matches perfectly, but whether
+    // it has ever JUMPED.
+    //
+    // Cutscenes are cut together. They change shot, and a change of shot moves
+    // the camera metres in a single frame. A chest opening, a vault, a melee, a
+    // revive are each one continuous move from wherever you were standing - a
+    // camera that travels, never one that teleports. At a hundred frames a
+    // second nothing continuous covers a metre and a half between two of them.
+    {
+        static float s_lastCam[3] = {};
+        static bool s_haveLastCam = false;
+        if (s_haveLastCam) {
+            const float j[3] = { basis.camPos[0] - s_lastCam[0], basis.camPos[1] - s_lastCam[1],
+                basis.camPos[2] - s_lastCam[2] };
+            if (Length3(j) > 150.0f && g_cameraCuts < 1000)
+                ++g_cameraCuts;
+        }
+        std::memcpy(s_lastCam, basis.camPos, sizeof(s_lastCam));
+        s_haveLastCam = true;
+    }
+    // The same hysteresis the action camera uses: far enough to be a shot, and
+    // then held until it is clearly back.
+    static bool s_away = false;
+    s_away = s_away ? away > 25.0f : away > 60.0f;
+    const unsigned long long now = GetTickCount64();
+    if (!s_away) {
+        // Say what that was, now it is over. Every vault, every melee, every
+        // scene, with the two numbers the theatre judges them on - so the
+        // thresholds can be set from a log of real moments rather than from
+        // anybody's idea of how long a window jump takes.
+        if (g_cameraAwaySince) {
+            const float wasAwaySec = (now - g_cameraAwaySince) / 1000.0f;
+            if (wasAwaySec > 1.0f) {
+                const float hudSec = g_hudGoneSince ? (now - g_hudGoneSince) / 1000.0f : 0.0f;
+                Log_Printf("Theatre: the view was off your body for %.1f s, HUD gone %.1f s, %d cut(s) - %s",
+                    wasAwaySec, hudSec, g_cameraCuts, g_inTheatre ? "the screen was up" : "left alone");
+            }
+        }
+        g_cameraAwaySince = 0;
+        g_cameraCuts = 0; // back on your body: whatever that was, it is over
+    } else if (!g_cameraAwaySince) {
+        g_cameraAwaySince = now;
+        g_cameraCuts = 0;
+    }
+}
+
+void StereoTest_ComposeTheatre(IDirect3DDevice9* pDevice)
+{
+    if (!pDevice)
+        return;
+    // And belt and braces at the door, because this one is called from Present
+    // rather than from a draw, so nothing upstream has already decided that VR
+    // is running.
+    if (!g_enabled || g_suppressed) {
+        if (g_inTheatre) {
+            g_inTheatre = false;
+            g_haveScreenAnchor = false;
+            Log_Printf("Theatre: VR is off, so the screen is too");
+        }
+        return;
+    }
+    // Composited on the state the frame was DRAWN with, then the state is
+    // decided for the next one. Asking now and acting on the answer would put a
+    // screen around a frame that was rendered in stereo, once, on the way in
+    // and again on the way out.
+    UpdateCameraAwayClock();
+    UpdateHudGoneClock();
+    if (g_inTheatre)
+        ComposeTheatreNow(pDevice);
+    g_inTheatre = TheatreNow();
+}
+
+void StereoTest_ToggleTheatre()
+{
+    g_theatreForced = !g_theatreForced;
+    if (!g_theatreForced)
+        g_haveScreenAnchor = false; // hangs where you are facing next time
+    Log_Printf("Theatre: %s by hand", g_theatreForced ? "held ON" : "let go, back to deciding for itself");
+}
+
+bool StereoTest_TheatreHeld()
+{
+    return g_theatreForced;
+}
+
+void StereoTest_OnBeforeDeviceReset()
+{
+    // A default-pool render target has to be gone before Reset, or Reset fails
+    // and takes the device with it.
+    ReleaseTheatreCopy();
+}
 
 void StereoTest_OnDeviceReset()
 {
-    g_lastBackBufferMs = 0;
+    g_haveBackBufferSize = false;
 }
 
 void StereoTest_OnEndScene(IDirect3DDevice9* pDevice)
 {
     const unsigned long long nowMs = GetTickCount64();
 
-    // Backbuffer size, for RenderTargetIsScreenShaped. Refreshed once a
-    // second, and straight after a Reset - it only changes on a resolution
-    // switch.
-    if (nowMs - g_lastBackBufferMs >= 1000) {
-        g_lastBackBufferMs = nowMs;
+    // Backbuffer size, for RenderTargetIsScreenShaped. Taken once, and again
+    // after a Reset, which is the only thing that changes it.
+    //
+    // It used to be re-read every second, and that cost a frame every second
+    // (2026-09-18). GetBackBuffer takes a reference on a surface the driver is
+    // using, asks it a question and hands it back, which can make the pipeline
+    // wait. A tester measured a rock-steady 120 dropping to 100 on a perfect
+    // one-second beat, sitting on the MENU, where the mod is otherwise doing
+    // nothing - a value that only changes on a resolution switch has no business
+    // being polled.
+    if (!g_haveBackBufferSize) {
         IDirect3DSurface9* bb = nullptr;
         if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
             D3DSURFACE_DESC d = {};
             if (SUCCEEDED(bb->GetDesc(&d))) {
                 g_backBufferWidth = d.Width;
                 g_backBufferHeight = d.Height;
+                g_haveBackBufferSize = true;
             }
             bb->Release();
         }
     }
 
+    // Same reasoning as the patch reports: a five-second disk write on the
+    // render thread, for a line only a developer reads.
     static unsigned long long s_lastCensusMs = 0;
-    if (nowMs - s_lastCensusMs >= 5000) {
+    if (RE5VR_DIAGNOSTICS && nowMs - s_lastCensusMs >= 5000) {
         s_lastCensusMs = nowMs;
         XRBridgeEyeView l, r;
         if (g_enabled && VRBridge_GetEyeViews(l, r)) {
@@ -1460,6 +2986,99 @@ float StereoTest_GetBackbufferAspect()
     return static_cast<float>(g_backBufferWidth) / static_cast<float>(g_backBufferHeight);
 }
 
+// ---- Holding the camera to a human turning speed (2026-09-27) ------------
+//
+// "The whip when stomping most certainly happens while in flatscreen." That
+// one sentence rules out everything we spent the night on. Flatscreen never
+// touches the per-eye path and never uses the head-locked view the way VR
+// does, so if the stomp throws the view there as well, then GetViewMatrix was
+// never the route and the limiter in camera_rig_hook was refusing a turn that
+// was not the one reaching the screen. It explains the 102 degree ask being
+// held while the view whipped anyway.
+//
+// This is the matrix the game hands the shader. Both modes go through it,
+// nothing goes around it, and correcting it here corrects it once for both.
+//
+// Register 0 is written many times a frame, usually with the same matrix, so
+// the correction is computed when the matrix CHANGES and replayed for every
+// repeat. Otherwise the elapsed time between two writes of one frame is zero
+// and the allowance collapses to nothing.
+void StereoTest_LimitCameraTurn(float m[16])
+{
+    const float limitDeg = CameraRigHook_GetSettings().viewTurnLimitDeg;
+    if (!(limitDeg > 0.0f) || !CameraRigHook_IsEnabled())
+        return;
+    if (!IsPlausibleCameraMatrix(m))
+        return;
+
+    static float s_lastRaw[16] = {};
+    static float s_lastFixed[16] = {};
+    static bool s_have = false;
+    static float s_heldFwd[3] = { 0.0f, 0.0f, 1.0f };
+    static unsigned long long s_changedAt = 0;
+
+    if (s_have && std::memcmp(m, s_lastRaw, sizeof(s_lastRaw)) == 0) {
+        std::memcpy(m, s_lastFixed, sizeof(s_lastFixed));
+        return;
+    }
+    std::memcpy(s_lastRaw, m, sizeof(s_lastRaw));
+
+    CameraBasis basis;
+    DecomposeCameraMatrix(m, basis);
+
+    const unsigned long long now = GetTickCount64();
+    const float dt = s_changedAt ? static_cast<float>(now - s_changedAt) * 0.001f : 0.0f;
+    s_changedAt = now;
+
+    if (s_have && dt > 0.0f && dt < 0.25f) {
+        float dot = basis.forward[0] * s_heldFwd[0] + basis.forward[1] * s_heldFwd[1]
+            + basis.forward[2] * s_heldFwd[2];
+        dot = dot > 1.0f ? 1.0f : (dot < -1.0f ? -1.0f : dot);
+        const float turned = std::acos(dot) * 57.2957795f;
+        const float allowed = limitDeg * dt;
+        if (turned > allowed && turned > 0.01f) {
+            // Creep rather than clamp: clamping still delivers the whole turn
+            // over the following frames, which is a slower whip, not none.
+            constexpr float kCreepDegPerSec = 20.0f;
+            const float creep = kCreepDegPerSec * dt;
+            const float k = (creep < turned ? creep : turned) / turned;
+            float want[3];
+            for (int i = 0; i < 3; ++i)
+                want[i] = s_heldFwd[i] + (basis.forward[i] - s_heldFwd[i]) * k;
+            const float l = Length3(want);
+            if (l > 1e-4f) {
+                for (int i = 0; i < 3; ++i)
+                    basis.forward[i] = want[i] / l;
+                // Rebuilt about world vertical, so the horizon stays level
+                // whatever the game was doing. A rolled horizon is the one
+                // thing in a headset that is worse than a whip.
+                const float up[3] = { 0.0f, 1.0f, 0.0f };
+                float right[3] = { up[1] * basis.forward[2] - up[2] * basis.forward[1],
+                    up[2] * basis.forward[0] - up[0] * basis.forward[2],
+                    up[0] * basis.forward[1] - up[1] * basis.forward[0] };
+                const float rl = Length3(right);
+                if (rl > 1e-4f) {
+                    for (int i = 0; i < 3; ++i)
+                        basis.right[i] = right[i] / rl;
+                    basis.up[0] = basis.forward[1] * basis.right[2] - basis.forward[2] * basis.right[1];
+                    basis.up[1] = basis.forward[2] * basis.right[0] - basis.forward[0] * basis.right[2];
+                    basis.up[2] = basis.forward[0] * basis.right[1] - basis.forward[1] * basis.right[0];
+                    ComposeCameraMatrix(basis, m);
+                }
+            }
+            static unsigned long long s_toldAt = 0;
+            if (now - s_toldAt > 250) {
+                s_toldAt = now;
+                Log_Printf("StereoTest: the camera matrix turned %.0f deg in %.0f ms (%.0f deg/s) - held",
+                    turned, dt * 1000.0f, turned / dt);
+            }
+        }
+    }
+    std::memcpy(s_heldFwd, basis.forward, sizeof(s_heldFwd));
+    std::memcpy(s_lastFixed, m, sizeof(s_lastFixed));
+    s_have = true;
+}
+
 void StereoTest_OnPresent()
 {
     // The frame that was just presented is the one rendered with the pose
@@ -1469,8 +3088,13 @@ void StereoTest_OnPresent()
     VRBridge_NoteFramePresented(g_frameCameraPoseId != 0 ? g_frameCameraPoseId : g_frameViewsPoseId);
     g_frameCameraPoseId = 0;
 
-    g_haveFrameViews = VRBridge_GetEyeViews(g_frameViews[0], g_frameViews[1]);
-    g_frameViewsPoseId = g_haveFrameViews ? VRBridge_GetCurrentPoseId() : 0;
+    // Views and their pose id together, in one read (2026-09-16). Asking for
+    // the id separately let the submit thread publish a new pose in between,
+    // so the picture was drawn with one head rotation and handed to the
+    // runtime labelled as another. See VRBridge_GetEyeViews.
+    XRBridgePoseId viewsPoseId = 0;
+    g_haveFrameViews = VRBridge_GetEyeViews(g_frameViews[0], g_frameViews[1], &viewsPoseId);
+    g_frameViewsPoseId = g_haveFrameViews ? viewsPoseId : 0;
     g_lastPresentMs = GetTickCount64();
     ++g_presentCount;
 }
@@ -1484,9 +3108,16 @@ StereoSettings StereoTest_GetSettings()
     s.fovWiden = g_fovWidenMultiplier;
     s.monoSmallTargets = g_monoSmallTargets.load(std::memory_order_relaxed);
     s.compensateHeadFollow = g_compensateHeadFollow.load(std::memory_order_relaxed);
+    s.headPositionTracking = g_headPositionTracking;
+    s.leanScale = g_leanScale;
+    s.nearPlaneUnits = g_nearPlaneUnits;
     s.pictureTurnMode = g_pictureTurnMode.load(std::memory_order_relaxed);
     s.hudDistanceMeters = g_hudDistanceMeters;
     s.hudScale = g_hudScale;
+    s.theatre = g_theatre;
+    s.theatreFollowsHead = g_theatreFollowsHead;
+    s.theatreDistanceMeters = g_theatreDistanceMeters;
+    s.theatreScale = g_theatreScale;
     return s;
 }
 
@@ -1498,6 +3129,8 @@ void StereoTest_ApplySettings(const StereoSettings& in)
     s.fovWiden = clamp(s.fovWiden, 0.5f, 2.0f);
     s.hudDistanceMeters = clamp(s.hudDistanceMeters, 0.5f, 10.0f);
     s.hudScale = clamp(s.hudScale, 0.3f, 1.0f);
+    s.theatreDistanceMeters = clamp(s.theatreDistanceMeters, 0.8f, 12.0f);
+    s.theatreScale = clamp(s.theatreScale, 0.3f, 1.0f);
 
     const StereoSettings old = StereoTest_GetSettings();
     if (s.stereoEnabled != old.stereoEnabled)
@@ -1508,22 +3141,90 @@ void StereoTest_ApplySettings(const StereoSettings& in)
         Log_Printf("StereoTest: post-process buffers now drawn %s",
             s.monoSmallTargets ? "MONO (default, no light leaks)" : "per eye (expect light leaks)");
     g_compensateHeadFollow.store(s.compensateHeadFollow, std::memory_order_relaxed);
-    if (s.pictureTurnMode < 0 || s.pictureTurnMode > 3)
-        s.pictureTurnMode = kPictureTurnDoubleFixed;
-    if (s.pictureTurnMode != old.pictureTurnMode) {
-        static const char* const kNames[] = { "double (v0.4.1)", "game camera only", "catch-up", "double, culling fixed" };
-        Log_Printf("StereoTest: picture turning mode now %s", kNames[s.pictureTurnMode]);
+    s.leanScale = clamp(s.leanScale, 0.0f, 3.0f);
+    if (s.headPositionTracking != old.headPositionTracking) {
+        // Switching it on takes wherever you are sitting now as the centre,
+        // rather than snapping the view to a reference from ten minutes ago.
+        g_leanReferenceSet = false;
+        Log_Printf("StereoTest: leaning is now %s", s.headPositionTracking ? "ON" : "off");
     }
+    g_headPositionTracking = s.headPositionTracking;
+    g_leanScale = s.leanScale;
+    s.nearPlaneUnits = clamp(s.nearPlaneUnits, 0.0f, 40.0f);
+    g_nearPlaneUnits = s.nearPlaneUnits;
+    // Pinned (2026-09-18, user: "double, culling fixed should be the only
+    // camera option, we just need to steady those micro movements"). The
+    // other four were the 2026-09-15 experiments and this one won. Leaving
+    // them selectable cost more than it was worth: a stale PictureTurnMode in
+    // somebody's ini put them on a mode nobody was testing, and the modes do
+    // not agree about who turns the picture - so head steadying is exactly
+    // 1:1 on this one and deliberately not on Game camera only. One path, one
+    // thing to reason about.
+    s.pictureTurnMode = kPictureTurnDoubleFixed;
+    if (s.pictureTurnMode != old.pictureTurnMode)
+        Log_Printf("StereoTest: picture turning mode now %s", PictureTurnModeName(s.pictureTurnMode));
     g_pictureTurnMode.store(s.pictureTurnMode, std::memory_order_relaxed);
     g_halfSeparation = s.halfSeparation;
     g_fovWidenMultiplier = s.fovWiden;
     g_hudDistanceMeters = s.hudDistanceMeters;
     g_hudScale = s.hudScale;
+    g_theatre = s.theatre;
+    g_theatreFollowsHead = s.theatreFollowsHead;
+    g_theatreDistanceMeters = s.theatreDistanceMeters;
+    g_theatreScale = s.theatreScale;
     if (s.halfSeparation != old.halfSeparation || s.fovWiden != old.fovWiden ||
         s.hudDistanceMeters != old.hudDistanceMeters || s.hudScale != old.hudScale) {
         Log_Printf("StereoTest: eye half-separation %.2f, FOV widen %.2f, HUD %.2f m at scale %.2f",
             g_halfSeparation, g_fovWidenMultiplier, g_hudDistanceMeters, g_hudScale);
     }
+}
+
+float StereoTest_GetNearPlaneUnits()
+{
+    return g_nearPlaneUnits;
+}
+
+float StereoTest_EyeOffsetUnits()
+{
+    return g_eyeOffUnits.load(std::memory_order_relaxed);
+}
+
+void StereoTest_EyeOffset(float out[3])
+{
+    out[0] = g_eyeOffX.load(std::memory_order_relaxed);
+    out[1] = g_eyeOffY.load(std::memory_order_relaxed);
+    out[2] = g_eyeOffZ.load(std::memory_order_relaxed);
+}
+
+void StereoTest_SetRoomAsk(float right, float forward)
+{
+    g_roomAsk[0] = right;
+    g_roomAsk[1] = forward;
+}
+
+bool StereoTest_GetRoomStep(float* rightMetres, float* forwardMetres)
+{
+    if (!g_headPositionTracking || !g_haveRoomStep)
+        return false;
+    if (rightMetres)
+        *rightMetres = g_roomStep[0];
+    if (forwardMetres)
+        *forwardMetres = g_roomStep[1];
+    return true;
+}
+
+bool StereoTest_GetLeanWorld(float out[3])
+{
+    if (!g_headPositionTracking || !g_haveLeanWorld || !out)
+        return false;
+    std::memcpy(out, g_leanWorld, sizeof(g_leanWorld));
+    return true;
+}
+
+void StereoTest_RecentreLean()
+{
+    g_leanReferenceSet = false;
+    g_haveLeanWorld = false;
 }
 
 bool StereoTest_IsEnabled()

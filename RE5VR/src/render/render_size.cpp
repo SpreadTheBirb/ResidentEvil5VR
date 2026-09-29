@@ -376,19 +376,57 @@ bool RenderSize_EyeSizeFor(UINT recW, UINT recH, UINT* outW, UINT* outH)
     return k < 1.0;
 }
 
+// FIVE WAYS TO DO NOTHING, ALL OF THEM SILENT (2026-09-28, user: "when
+// disabling VR, and re-enabling, it is no longer full resolution").
+//
+// The log for that session has one "VR on - asked RE5 for 2688x1440", one
+// "VR off - back to the game\x27s own 1280x720", and then nothing at all for
+// the rest of the run even though this is called every frame. So it is
+// taking one of the early returns below, and not one of them says so.
+//
+// None of them is obviously the culprit from reading: the availability
+// check is latched true after the first success, the recommended size is
+// never cleared, and nothing logged sets g_failed. Rather than guess a
+// sixth time today, make each one name itself, once every five seconds.
+void SayWhyNot(const char* why)
+{
+    static unsigned long long s_at = 0;
+    static const char* s_last = nullptr;
+    const unsigned long long now = GetTickCount64();
+    if (why == s_last && now - s_at < 5000)
+        return;
+    s_last = why;
+    s_at = now;
+    Log_Printf("RenderSize: not switching to the VR size - %s", why);
+}
+
 bool RenderSize_EnterVR(IDirect3DDevice9* device, UINT recW, UINT recH)
 {
     if (g_state == State::Active)
         return true;
-    if (!g_settings.fullResPerEye)
+    if (!g_settings.fullResPerEye) {
+        SayWhyNot("full resolution per eye is switched off");
         return true;
-    if (g_failed || !recW || !recH || !CheckAvailable(device))
+    }
+    if (g_failed) {
+        SayWhyNot("it failed earlier this session and will not be tried again");
         return true;
+    }
+    if (!recW || !recH) {
+        SayWhyNot("the runtime has not said what it recommends per eye yet");
+        return true;
+    }
+    if (!CheckAvailable(device)) {
+        SayWhyNot("the resolution setter is not usable on this build");
+        return true;
+    }
 
     const unsigned long long now = GetTickCount64();
     const DWORD obj = RenderObject();
-    if (!obj)
+    if (!obj) {
+        SayWhyNot("the game has no render object right now");
         return true;
+    }
 
     if (g_state == State::Idle) {
         ReadFreeTextureMemory(device); // still at the game's own size here
@@ -398,9 +436,12 @@ bool RenderSize_EnterVR(IDirect3DDevice9* device, UINT recW, UINT recH)
         g_targetH = eyeH;
 
         Sizes cur = {};
-        if (!ReadSizes(obj, cur))
+        if (!ReadSizes(obj, cur)) {
+            SayWhyNot("the render object would not read");
             return true;
+        }
         if (cur.render[0] == static_cast<int>(g_targetW) && cur.render[1] == static_cast<int>(g_targetH)) {
+            Log_Printf("RenderSize: already at %ux%u - taking it as active", g_targetW, g_targetH);
             g_state = State::Active;
             ApplyCutsceneFix(true);
             return true;
@@ -492,12 +533,31 @@ void RenderSize_OnPresent(IDirect3DDevice9* device)
 
 void RenderSize_OnBeforeReset(D3DPRESENT_PARAMETERS* pp)
 {
+    if (!pp || g_state == State::Idle)
+        return;
+
+    // Don't let the desktop pace the headset (2026-09-16). A windowed frame
+    // is normally handed to the desktop compositor at the MONITOR's refresh,
+    // so a 75 Hz monitor delivers about 74 frames a second no matter what
+    // RE5's own framerate setting says, while the headset asks for 72, 90 or
+    // 120. Frames then arrive on a cadence that fits neither, which is felt
+    // as judder while turning and not at all while still. Presenting
+    // immediately hands frames over as they finish; the headset's own timing
+    // decides what is displayed, which is the only clock that matters here.
+    if (pp->BackBufferWidth == g_targetW && pp->BackBufferHeight == g_targetH
+        && pp->PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE) {
+        Log_Printf("RenderSize: presenting the VR frame immediately (was interval %u) so the desktop's refresh "
+                   "doesn't pace the headset",
+            pp->PresentationInterval);
+        pp->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    }
+
     // Exclusive fullscreen only takes frame sizes that are real display modes,
     // and a VR size never is: a tester in fullscreen got D3DERR_INVALIDCALL on
     // the switch and RE5 died (2026-09-14). A windowed frame can be any size,
     // and it is only the headset that sees it. The game's own fullscreen comes
     // back with its own size when VR turns off.
-    if (!pp || pp->Windowed || g_state == State::Idle)
+    if (pp->Windowed)
         return;
     if (pp->BackBufferWidth != g_targetW || pp->BackBufferHeight != g_targetH)
         return;

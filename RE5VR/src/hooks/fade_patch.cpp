@@ -1,5 +1,6 @@
 #include "fade_patch.h"
 #include "../util/log.h"
+#include "../render/stereo_test.h"
 
 #include <MinHook.h>
 #include <windows.h>
@@ -149,11 +150,73 @@ void RecordCaller(uintptr_t ret, float value, bool overridden)
     }
 }
 
+#if RE5VR_DIAGNOSTICS
+// Who dims anything while the view is being held in the body (2026-09-23,
+// user: "this is only when you do one of the action camera options. and is
+// what you see as the camera is regaining control", with screenshots of a
+// Majini and a patch of ground drawn in a checkerboard).
+//
+// A checkerboard is stipple alpha, which is how this game fades something out
+// without blending it, so something is asking for less than full visibility.
+// Every camera-proximity call in the log is already caught and put back to
+// 1.0, including one asking for 0.000, so whatever is doing this is arriving
+// by another route - and the aggregate report cannot show it, because it only
+// names callers it already knows about and averages over three seconds.
+//
+// This names them as they happen, and only in the window where it happens:
+// while the eye is being held away from the game's own camera.
+void WatchDimming(uintptr_t ret, float value, bool overridden, const char* which)
+{
+    if (value >= 0.999f || overridden)
+        return;
+    if (StereoTest_EyeOffsetUnits() < 1.0f)
+        return;
+    static uintptr_t s_seen[12] = {};
+    static float s_low[12] = {};
+    static unsigned s_hits[12] = {};
+    static unsigned long long s_toldMs = 0;
+    int slot = -1;
+    for (int i = 0; i < 12; ++i) {
+        if (s_seen[i] == ret) {
+            slot = i;
+            break;
+        }
+        if (!s_seen[i]) {
+            s_seen[i] = ret;
+            s_low[i] = 1.0f;
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0)
+        return;
+    ++s_hits[slot];
+    if (value < s_low[slot])
+        s_low[slot] = value;
+    const unsigned long long now = GetTickCount64();
+    if (now - s_toldMs < 1000)
+        return;
+    s_toldMs = now;
+    for (int i = 0; i < 12 && s_seen[i]; ++i) {
+        if (!s_hits[i])
+            continue;
+        Log_Printf("FadeWatch: while the view was held in the body, %s from re5dx9.exe+%lX dimmed something to "
+                   "%.3f, %u time(s) - NOT overridden",
+            which, static_cast<unsigned long>(s_seen[i]), s_low[i], s_hits[i]);
+        s_hits[i] = 0;
+        s_low[i] = 1.0f;
+    }
+}
+#endif
+
 void __fastcall hkSetVisibility(void* model, void* edxUnused, int view, float value)
 {
     const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_moduleBase;
     const bool overridden = g_enabled && IsCameraCaller(ret) && value != 1.0f;
     RecordCaller(ret, value, overridden);
+#if RE5VR_DIAGNOSTICS
+    WatchDimming(ret, value, overridden, "SetVisibility");
+#endif
     if (overridden)
         value = 1.0f;
     g_origSetVisibility(model, edxUnused, view, value);
@@ -168,6 +231,9 @@ void __fastcall hkApplyVisibility(void* model, void* edxUnused, int view, float 
     const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_moduleBase;
     const bool overridden = g_enabled && IsFadeStateCaller(ret) && value != 1.0f;
     RecordCaller(ret, value, overridden);
+#if RE5VR_DIAGNOSTICS
+    WatchDimming(ret, value, overridden, "ApplyVisibility");
+#endif
     if (overridden)
         value = 1.0f;
     g_origApplyVisibility(model, edxUnused, view, value);

@@ -28,6 +28,30 @@
 
 // Installs the SetTransform/SetVertexShaderConstantF hooks backing the
 // capture. Idempotent.
+// ---- Hiding parts of the body, without touching the skeleton ----------
+//
+// (2026-09-26, user: "let's try to get a hide in place and implement it
+// without scaling skeletons down. I want a full body option, arms, and then
+// just hands".)
+//
+// Shrinking bones cannot do it: a joint's scale moves its children, and the
+// children are the camera's head and the arms the solve drives. Per-model
+// visibility cannot do it either, because the character is one mesh and the
+// switch is all or nothing.
+//
+// What can is the bone palette. A skinned mesh is drawn from a table of bone
+// matrices handed to the vertex shader as constants, and a matrix zeroed
+// THERE collapses that part of the mesh and nothing else - the real skeleton
+// keeps its scale, the head stays where the camera expects it, and the arm
+// solve works in a frame nobody has touched.
+//
+// Where that table lives and which entry is which bone are questions for
+// experiment, not for reasoning, so these are a tool rather than a feature:
+// the log reports every large constant upload it sees, and the poke zeroes a
+// register range so you can watch what disappears.
+void ConstantProbe_SetVertexPoke(bool on, int fromRegister, int toRegister);
+void ConstantProbe_GetVertexPoke(bool& on, int& fromRegister, int& toRegister);
+
 void ConstantProbe_Install(IDirect3DDevice9* pDevice);
 
 // Call once per frame from the existing EndScene hook. Polls the F9 hotkey

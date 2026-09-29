@@ -14,6 +14,7 @@
 #include <dxgi.h>
 #include <dxgi1_4.h> // IDXGIFactory4::EnumAdapterByLuid
 #include <timeapi.h>
+#include <tlhelp32.h> // is SteamVR actually running when it refuses us?
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include "xr_input.h" // after openxr.h: its OpenXR half is only declared there
@@ -117,7 +118,12 @@ bool g_haveEyeViews = false;
 struct RenderedPose {
     XrPosef pose[2];
     XrFovf fov[2];
-    double publishedMs; // when this pose was located - see the age measurement
+    double publishedMs;          // when this pose was located
+    // When the game finished the frame drawn with this pose. Splits the age
+    // at submit into the two halves that can be fixed separately: how long
+    // the GAME took from pose to finished picture, and how long OUR pipeline
+    // then took to get it into the headset (2026-09-16).
+    std::atomic<double> presentedMs{ 0.0 };
     std::atomic<XRBridgePoseId> id{ 0 }; // written last: id != 0 means the entry is complete
 };
 constexpr size_t kPoseRingSize = 16;
@@ -183,7 +189,15 @@ XRBridgePoseId g_imagePoseId[2][kMaxSwapchainImages] = {};
 // Pose the frame the game just finished was rendered with, set at Present.
 std::atomic<XRBridgePoseId> g_poseOfPresentedFrame{ 0 };
 // Diagnostics for the submit thread's pose lookup.
+// The two halves of the age at submit, so the wait can be attacked where it
+// actually is: the game drawing, or our own path into the headset.
+double g_ageGameSumMs = 0.0, g_ageGameWorstMs = 0.0;
+double g_agePipeSumMs = 0.0, g_agePipeWorstMs = 0.0;
+unsigned long long g_ageSplitCount = 0;
+
 std::atomic<unsigned long long> g_poseHits{ 0 };
+// Frames the game actually handed us, counted for the pacing line below.
+std::atomic<unsigned long long> g_framesPresented{ 0 };
 std::atomic<unsigned long long> g_poseMisses{ 0 };
 // How stale the image is by the time it reaches the compositor, measured from
 // when its pose was located. The user can see this directly: mouse look is 1:1
@@ -199,6 +213,15 @@ double g_frameAgeWorstMs = 0.0;
 char g_statusRuntimeName[128] = "";
 char g_statusSystemName[128] = "";
 std::atomic<float> g_statusPredictedPeriodMs{ 0.0f };
+// The refresh rate the headset agreed to, and whether the runtime is actually
+// pacing us at a good fraction of it (2026-09-17). Virtual Desktop's
+// Synchronous Spacewarp locks a session to half rate and invents the frames in
+// between, and with no depth layer from us those invented frames can only guess
+// at parallax - which is the head-turn judder the whole hunt was about. We
+// submit at the headset's own rate whatever the game manages, so the runtime's
+// help costs real frames and gives back guesses. Worth saying out loud.
+std::atomic<float> g_requestedRefreshHz{ 0.0f };
+std::atomic<bool> g_runtimeHalvingUs{ false };
 std::atomic<float> g_statusImageAgeMs{ 0.0f };
 std::atomic<float> g_statusSubmitHz{ 0.0f };
 // Menu requests for VR on/off, consumed on the render thread in OnEndScene.
@@ -245,6 +268,28 @@ double NowMillis()
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return static_cast<double>(now.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+}
+
+// Splits the age of a submitted image in two: how long the GAME took to turn
+// that pose into a finished picture, and how long OUR path then took to get
+// it to the runtime. One of those two owns the 50 to 90 ms that testers feel
+// as judder while turning, and they are fixed in completely different places.
+void NoteAgeSplit(const RenderedPose& entry, double submittedMs)
+{
+    const double presented = entry.presentedMs.load(std::memory_order_acquire);
+    if (presented <= 0.0)
+        return;
+    const double gameMs = presented - entry.publishedMs;
+    const double pipeMs = submittedMs - presented;
+    if (gameMs < 0.0 || pipeMs < 0.0 || gameMs > 1000.0 || pipeMs > 1000.0)
+        return;
+    g_ageGameSumMs += gameMs;
+    g_agePipeSumMs += pipeMs;
+    if (gameMs > g_ageGameWorstMs)
+        g_ageGameWorstMs = gameMs;
+    if (pipeMs > g_agePipeWorstMs)
+        g_agePipeWorstMs = pipeMs;
+    ++g_ageSplitCount;
 }
 
 void Mat3ToAxisAngle(const Mat3& m, float axis[3], float* angle)
@@ -328,6 +373,12 @@ XRBridgeEyeView g_eyeViews[2] = {};
 // Written by the XR submit thread, read by the render thread: a pose must
 // be copied in or out whole, never half of one frame and half of the next.
 SRWLOCK g_eyeViewsLock = SRWLOCK_INIT;
+// The pose these views came from, written under the lock above with them.
+XRBridgePoseId g_eyeViewsPoseId = 0;
+// The yaw-only recentre reference, rows = right/up/forward in the runtime's
+// own tracking space. Same lock, same reason. See VRBridge_GetTrackingFrame.
+float g_trackingFrame[9] = {};
+bool g_haveTrackingFrame = false;
 
 // Per-eye orientation reference, captured once per eye the first time a
 // valid view is located after XR mode is (re-)enabled - same recenter-on-
@@ -458,13 +509,69 @@ constexpr int kPlaceholderModeFrames = 300;
 int g_realContentFrameCount = 0;
 bool g_placeholderModeEverActive = false;
 
+// EVERY FAILURE BEFORE THE INSTANCE EXISTS PRINTED A BARE NUMBER
+// (2026-09-28, from a SteamVR log reading "XrResult(-13)").
+//
+// xrResultToString needs an instance, and the most important failure we
+// have - xrCreateInstance itself - is precisely the one where there is not
+// one. So every remote report of a runtime refusing us arrived as a number
+// nobody could act on. These are the codes that can reach us that early.
+const char* XrResultNameEarly(XrResult r)
+{
+    switch (r) {
+    case XR_ERROR_VALIDATION_FAILURE: return "XR_ERROR_VALIDATION_FAILURE";
+    case XR_ERROR_RUNTIME_FAILURE: return "XR_ERROR_RUNTIME_FAILURE";
+    case XR_ERROR_OUT_OF_MEMORY: return "XR_ERROR_OUT_OF_MEMORY";
+    case XR_ERROR_API_VERSION_UNSUPPORTED: return "XR_ERROR_API_VERSION_UNSUPPORTED";
+    case XR_ERROR_INITIALIZATION_FAILED: return "XR_ERROR_INITIALIZATION_FAILED";
+    case XR_ERROR_FUNCTION_UNSUPPORTED: return "XR_ERROR_FUNCTION_UNSUPPORTED";
+    case XR_ERROR_FEATURE_UNSUPPORTED: return "XR_ERROR_FEATURE_UNSUPPORTED";
+    case XR_ERROR_EXTENSION_NOT_PRESENT: return "XR_ERROR_EXTENSION_NOT_PRESENT";
+    case XR_ERROR_LIMIT_REACHED: return "XR_ERROR_LIMIT_REACHED";
+    case XR_ERROR_SIZE_INSUFFICIENT: return "XR_ERROR_SIZE_INSUFFICIENT";
+    case XR_ERROR_HANDLE_INVALID: return "XR_ERROR_HANDLE_INVALID";
+    case XR_ERROR_INSTANCE_LOST: return "XR_ERROR_INSTANCE_LOST";
+    case XR_ERROR_SYSTEM_INVALID: return "XR_ERROR_SYSTEM_INVALID";
+    case XR_ERROR_FORM_FACTOR_UNSUPPORTED: return "XR_ERROR_FORM_FACTOR_UNSUPPORTED";
+    case XR_ERROR_FORM_FACTOR_UNAVAILABLE: return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_ERROR_API_LAYER_NOT_PRESENT: return "XR_ERROR_API_LAYER_NOT_PRESENT";
+    case XR_ERROR_GRAPHICS_DEVICE_INVALID: return "XR_ERROR_GRAPHICS_DEVICE_INVALID";
+    case XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING: return "XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING";
+    case XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED: return "XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED";
+    default: return nullptr;
+    }
+}
+
 const char* XrResultName(XrResult r)
 {
     static char buf[XR_MAX_RESULT_STRING_SIZE];
     if (g_xrInstance != XR_NULL_HANDLE && XR_SUCCEEDED(xrResultToString(g_xrInstance, r, buf)))
         return buf;
+    if (const char* known = XrResultNameEarly(r))
+        return known;
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "XrResult(%d)", static_cast<int>(r));
     return buf;
+}
+
+// Whether a named executable is running right now. Used only to say, in the
+// log, whether SteamVR was actually up at the moment its runtime refused us
+// - which is the difference between "the user started it too late" and "it
+// was running and said no anyway", two entirely different bugs that have
+// looked identical in every report so far.
+bool ProcessIsRunning(const char* exeName)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+    PROCESSENTRY32 pe{};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    for (BOOL ok = Process32First(snap, &pe); ok && !found; ok = Process32Next(snap, &pe)) {
+        if (_stricmp(pe.szExeFile, exeName) == 0)
+            found = true;
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 // ---- D3D9<->D3D11 pixel pipeline (UNCHANGED from the OpenVR bridge) -----
@@ -616,6 +723,40 @@ struct ScopedTimer {
         Log_Printf("XRBridge: TIMING %s: %.2f ms", name, ms);
         if (budget && *budget > 0)
             --(*budget);
+    }
+};
+
+// Always-on stall watch (2026-09-16). The pacing line showed our own path
+// spiking to 200 ms and beyond in every five second window while its average
+// stayed near one frame - which is judder while turning and nothing while
+// still. ScopedTimer only reports when a budget or a periodic gate lets it,
+// so a stall between those moments left no trace at all. This one is silent
+// until a stage actually takes too long, which is exactly the frame worth
+// knowing about.
+constexpr double kStallMs = 40.0;
+
+struct StallWatch {
+    const char* name;
+    double startMs;
+
+    explicit StallWatch(const char* n) : name(n), startMs(NowMillis()) {}
+
+    ~StallWatch()
+    {
+        const double ms = NowMillis() - startMs;
+        if (ms < kStallMs)
+            return;
+        static ULONGLONG s_lastMs = 0;
+        static int s_inWindow = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now - s_lastMs > 1000) {
+            s_lastMs = now;
+            s_inWindow = 0;
+        }
+        // At most a handful a second: a stall storm must not become a log
+        // storm, which would itself cost frames.
+        if (++s_inWindow <= 4)
+            Log_Printf("XRBridge stall: %s took %.0f ms", name, ms);
     }
 };
 
@@ -1059,7 +1200,24 @@ bool InitOpenXRInstanceAndSystem()
 
     XrResult r = xrCreateInstance(&instanceInfo, &g_xrInstance);
     if (XR_FAILED(r)) {
-        Log_Printf("XRBridge: xrCreateInstance failed -> %d", static_cast<int>(r));
+        // By name, and with what it usually means (2026-09-21). This printed a
+        // bare -13, and the line after it guessed "no headset or no OpenXR
+        // runtime?" - which was wrong for the tester it happened to: they had
+        // both. The runtime DLL had loaded, since the extension list above came
+        // back fine; it was the runtime failing to reach its own server.
+        Log_Printf("XRBridge: xrCreateInstance failed -> %s (%d)", XrResultName(r), static_cast<int>(r));
+        if (r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_RUNTIME_FAILURE) {
+            Log_Printf("XRBridge: SteamVR processes at this moment - vrserver %s, vrmonitor %s, vrcompositor %s",
+                ProcessIsRunning("vrserver.exe") ? "RUNNING" : "not running",
+                ProcessIsRunning("vrmonitor.exe") ? "RUNNING" : "not running",
+                ProcessIsRunning("vrcompositor.exe") ? "RUNNING" : "not running");
+            Log_Printf("XRBridge: the runtime loaded but could not reach its own server. With SteamVR this "
+                       "is what you get while it is still starting up - and it can take twenty seconds. "
+                       "We keep asking, so leave it alone and it will come on by itself.");
+        } else if (r == XR_ERROR_EXTENSION_NOT_PRESENT) {
+            Log_Printf("XRBridge: the runtime does not offer Direct3D 11 to 32-bit programs, which RE5 is "
+                       "and needs. Try a different OpenXR runtime.");
+        }
         g_xrInstance = XR_NULL_HANDLE;
         return false;
     }
@@ -1531,6 +1689,11 @@ double g_targetFrameIntervalMs = 1000.0 / 400.0;
 bool g_xrThreadStarted = false;
 HANDLE g_xrThread = nullptr; // 2026-07-29: dedicated submit thread, see EnsureXrThreadStarted
 
+// Non-zero while F7 is on but the runtime has not answered yet. See the note
+// at the failure path: SteamVR answers the first xrCreateInstance with
+// INSTANCE_LOST and then goes off to start vrserver.
+unsigned long long g_xrWaitingUntilMs = 0;
+
 void PumpXrEvents()
 {
     XrEventDataBuffer event{ XR_TYPE_EVENT_DATA_BUFFER };
@@ -1564,6 +1727,8 @@ void PumpXrEvents()
                         XrResult rr = g_xrRequestDisplayRefreshRateFB(g_xrSession, maxRate);
                         Log_Printf("XRBridge: xrRequestDisplayRefreshRateFB(%.1f) -> %s",
                             maxRate, XR_SUCCEEDED(rr) ? "OK" : XrResultName(rr));
+                        if (XR_SUCCEEDED(rr))
+                            g_requestedRefreshHz.store(maxRate, std::memory_order_relaxed);
                     }
                 }
 
@@ -1627,6 +1792,7 @@ void XrSubmitOneFrame()
 
     {
         ScopedTimer t("PumpXrEvents", logThisIteration);
+        StallWatch sw("pumping runtime events");
         PumpXrEvents();
     }
     if (!g_xrSessionRunning)
@@ -1637,6 +1803,7 @@ void XrSubmitOneFrame()
     XrResult r;
     {
         ScopedTimer t("xrWaitFrame", logThisIteration);
+        StallWatch sw("waiting for the runtime frame");
         r = xrWaitFrame(g_xrSession, &waitInfo, &frameState);
         if (XR_SUCCEEDED(r)) {
             g_statusPredictedPeriodMs.store(static_cast<float>(frameState.predictedDisplayPeriod) / 1000000.0f,
@@ -1690,6 +1857,7 @@ void XrSubmitOneFrame()
         XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
         {
             ScopedTimer t("xrBeginFrame", logThisIteration);
+            StallWatch sw("beginning the runtime frame");
             r = xrBeginFrame(g_xrSession, &beginInfo);
         }
         if (XR_FAILED(r)) {
@@ -1709,6 +1877,7 @@ void XrSubmitOneFrame()
             XrViewState viewState{ XR_TYPE_VIEW_STATE };
             {
                 ScopedTimer t("xrLocateViews", logThisIteration);
+                StallWatch sw("locating the head");
                 r = xrLocateViews(g_xrSession, &locateInfo, &viewState, 2, &viewCount, views);
             }
             haveViews = XR_SUCCEEDED(r) && viewCount >= 1;
@@ -1910,9 +2079,29 @@ void XrSubmitOneFrame()
                 entry.publishedMs = NowMillis();
                 entry.id.store(poseId, std::memory_order_release);
 
+                // The id goes in under the SAME lock as the views it belongs
+                // to (2026-09-16). It used to be published after the lock was
+                // released, so a reader could take views from pose N and then
+                // read the id as N+1 - drawing the picture with one head
+                // rotation and telling the runtime it was another. The
+                // compositor then corrected by a whole pose step too much,
+                // once per game frame, by an amount that grows with head
+                // speed: jitter when you turn your head, nothing when you sit
+                // still, and nothing when the stick does the turning.
                 AcquireSRWLockExclusive(&g_eyeViewsLock);
                 std::memcpy(g_eyeViews, next, sizeof(g_eyeViews));
+                g_eyeViewsPoseId = poseId;
                 g_haveEyeViews = true;
+                // The frame the deltas are measured against, published with
+                // them (2026-09-17). Arm IK needs it: a controller's position
+                // arrives in the runtime's raw tracking space, where forward is
+                // wherever the play space was set up, while everything the mod
+                // does downstream is in the recentred frame. Expressing an
+                // offset in these three rows is what puts the two in step.
+                if (g_haveEyeReference[kEyeLeft]) {
+                    std::memcpy(g_trackingFrame, g_eyeReference[kEyeLeft].m, sizeof(g_trackingFrame));
+                    g_haveTrackingFrame = true;
+                }
                 ReleaseSRWLockExclusive(&g_eyeViewsLock);
                 g_currentPoseId.store(poseId, std::memory_order_release);
             }
@@ -1958,7 +2147,9 @@ void XrSubmitOneFrame()
                     // sees as the headset trailing the desktop mirror, and it
                     // is the number to beat if we start removing pipeline
                     // hops (addon slot -> eye texture -> swapchain).
-                    const double ageMs = NowMillis() - entry.publishedMs;
+                    const double nowMsSubmit = NowMillis();
+                    const double ageMs = nowMsSubmit - entry.publishedMs;
+                    NoteAgeSplit(entry, nowMsSubmit);
                     if (ageMs >= 0.0 && ageMs < 1000.0) {
                         g_frameAgeSumMs += ageMs;
                         ++g_frameAgeCount;
@@ -2003,6 +2194,7 @@ void XrSubmitOneFrame()
                     int addonSlot = -1;
                     bool copied = false;
                     ScopedTimer t("DirectSubmitCopy", logThisIteration);
+                    StallWatch sw("copying the game frame into the headset images");
                     // A bounded wait, not a skip: on this thread a skip costs
                     // a whole displayed frame (that is what made the first
                     // direct-submit attempt slower than the staged path), so
@@ -2023,7 +2215,9 @@ void XrSubmitOneFrame()
                                     submitPose[eye] = entry.pose[eye];
                                     submitFov[eye] = entry.fov[eye];
                                 }
-                                const double ageMs = NowMillis() - entry.publishedMs;
+                                const double nowMsSubmit = NowMillis();
+                                const double ageMs = nowMsSubmit - entry.publishedMs;
+                                NoteAgeSplit(entry, nowMsSubmit);
                                 if (ageMs >= 0.0 && ageMs < 1000.0) {
                                     g_frameAgeSumMs += ageMs;
                                     ++g_frameAgeCount;
@@ -2174,14 +2368,31 @@ void XrSubmitOneFrame()
         endInfo.layers = layers;
         {
             ScopedTimer t("xrEndFrame", logThisIteration);
+            StallWatch sw("handing the frame to the runtime");
             r = xrEndFrame(g_xrSession, &endInfo);
         }
         static UINT64 g_frameCount = 0;
         ++g_frameCount;
-        if (g_frameCount % 600 == 0) {
-            // Should be almost all hits. A high miss count means the tag
-            // isn't reaching the submit thread and we are back to submitting
-            // a pose the image was never rendered with.
+        // Every five seconds rather than every 600 frames (2026-09-16): a
+        // short session never reached 600 and left no trace at all, which is
+        // exactly when someone reports judder and asks what the numbers were.
+        //
+        // Judder while turning, none while sitting still, says the picture is
+        // not being reprojected onto your head properly. These four readings
+        // tell apart the three causes people keep proposing:
+        //  * "fell back" climbing means the pose tag isn't reaching the
+        //    submit thread, so a pose the image was never drawn with is going
+        //    to the compositor, and every head turn under-corrects;
+        //  * image age, especially the worst, says how stale the pixels are;
+        //  * the game's own rate against the headset's says whether it is
+        //    simply running slower than the display, which judders the WORLD
+        //    while sitting still rather than the view while turning;
+        //  * reused frames say how often the same image was shown twice.
+        static ULONGLONG s_statsMs = 0;
+        const ULONGLONG statsNow = GetTickCount64();
+        if (!s_statsMs)
+            s_statsMs = statsNow;
+        if (statsNow - s_statsMs >= 5000) {
             const unsigned long long ageCount = g_frameAgeCount;
             const double ageSum = g_frameAgeSumMs;
             if (ageCount)
@@ -2190,10 +2401,73 @@ void XrSubmitOneFrame()
             g_frameAgeCount = 0;
             g_frameAgeSumMs = 0.0;
             g_frameAgeWorstMs = 0.0;
-            Log_Printf("XRBridge: submitted pose came from the rendered frame %llu time(s), fell back %llu time(s) "
-                       "| image age at submit: avg %.1f ms, worst %.1f ms",
-                g_poseHits.load(std::memory_order_relaxed), g_poseMisses.load(std::memory_order_relaxed),
-                ageCount ? ageSum / static_cast<double>(ageCount) : 0.0, ageWorst);
+
+            const unsigned long long presented = g_framesPresented.exchange(0, std::memory_order_relaxed);
+            const float gameHz = static_cast<float>(presented) * 1000.0f / static_cast<float>(statsNow - s_statsMs);
+            const float periodMs = g_statusPredictedPeriodMs.load(std::memory_order_relaxed);
+            s_statsMs = statsNow;
+
+            const unsigned long long splitCount = g_ageSplitCount;
+            const double gameAvg = splitCount ? g_ageGameSumMs / static_cast<double>(splitCount) : 0.0;
+            const double pipeAvg = splitCount ? g_agePipeSumMs / static_cast<double>(splitCount) : 0.0;
+            const double gameWorst = g_ageGameWorstMs, pipeWorst = g_agePipeWorstMs;
+            g_ageGameSumMs = g_agePipeSumMs = g_ageGameWorstMs = g_agePipeWorstMs = 0.0;
+            g_ageSplitCount = 0;
+
+            // Developer only (2026-09-18). This is a synchronous disk write, with
+            // a mutex and an fflush, on the thread that paces xrWaitFrame and
+            // xrEndFrame - once a second, every second, in a shipped build. Stall
+            // that thread and a submit is missed, which is a dropped frame on a
+            // perfect beat. A tester measured a rock-solid 120 going to 100 and
+            // back, and it happened sitting on the menu.
+#if RE5VR_DIAGNOSTICS
+            Log_Printf("XRBridge pacing: game %.0f fps, we submit %.0f/s, headset %.0f Hz | image age avg %.1f ms, "
+                       "worst %.1f ms | of that: the game took %.1f ms (worst %.1f), our path took %.1f ms (worst "
+                       "%.1f) | pose from the rendered frame %llu, fell back %llu",
+                gameHz, g_statusSubmitHz.load(std::memory_order_relaxed), periodMs > 0.0f ? 1000.0f / periodMs : 0.0f,
+                ageCount ? ageSum / static_cast<double>(ageCount) : 0.0, ageWorst, gameAvg, gameWorst, pipeAvg,
+                pipeWorst, g_poseHits.exchange(0, std::memory_order_relaxed),
+                g_poseMisses.exchange(0, std::memory_order_relaxed));
+#else
+            (void)gameHz;
+            (void)periodMs;
+            (void)ageWorst;
+            (void)gameAvg;
+            (void)pipeAvg;
+            (void)gameWorst;
+            (void)pipeWorst;
+            (void)ageSum;
+            (void)ageCount;
+            g_poseHits.exchange(0, std::memory_order_relaxed);
+            g_poseMisses.exchange(0, std::memory_order_relaxed);
+#endif
+
+            // Is the runtime pacing us at the rate the headset agreed to? A
+            // cadence well under it means the runtime has taken the session to
+            // half rate and is filling in the gaps itself. Measured, not
+            // guessed, because no extension reports it: the user's 90 Hz Quest
+            // handed us 45 with spacewarp on and 90 with it off, same hardware,
+            // same build (2026-09-17). Only flipped after a full window, so a
+            // loading screen can't trip it.
+            const float wantHz = g_requestedRefreshHz.load(std::memory_order_relaxed);
+            const float gotHz = periodMs > 0.0f ? 1000.0f / periodMs : 0.0f;
+            if (wantHz > 0.0f && gotHz > 0.0f) {
+                const bool halving = gotHz < wantHz * 0.75f;
+                if (halving != g_runtimeHalvingUs.exchange(halving, std::memory_order_relaxed)) {
+                    if (halving) {
+                        Log_Printf("XRBridge: the headset agreed to %.0f Hz but the runtime is pacing us at %.0f Hz. "
+                                   "It has taken the session to a lower rate and is inventing the frames in between. "
+                                   "We already submit at the headset's own rate, so those invented frames replace real "
+                                   "ones and can only guess at head movement - this is what makes turning your head "
+                                   "judder. Turn Synchronous Spacewarp (Virtual Desktop) or ASW/motion smoothing off.",
+                            wantHz, gotHz);
+                    } else {
+                        Log_Printf("XRBridge: the runtime is pacing us at %.0f Hz again, matching the %.0f Hz the "
+                                   "headset agreed to - every frame you see is one we drew.",
+                            gotHz, wantHz);
+                    }
+                }
+            }
         }
         if (XR_FAILED(r)) {
             Log_Printf("XRBridge: xrEndFrame failed (count=%llu) -> %s", g_frameCount, XrResultName(r));
@@ -2498,16 +2772,55 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
             g_deltaLogCount[1] = 0;
             g_realContentFrameCount = 0;
             g_placeholderModeEverActive = false;
-            if (!g_xrInitAttempted) {
+            // Retried, not tried once (2026-09-21).
+            //
+            // This was a one-shot latch: the first attempt failed and every F7
+            // afterwards went straight to "failed" without asking the runtime
+            // again, for the rest of the session. A SteamVR tester hit exactly
+            // that. SteamVR's OpenXR runtime answers xrCreateInstance with
+            // XR_ERROR_INSTANCE_LOST while it cannot reach vrserver - which is
+            // what happens while SteamVR is still starting, or when it was
+            // started after the game - so pressing F7 a moment too early locked
+            // them out until they restarted RE5. Nothing about that failure is
+            // permanent, so nothing about our response to it should be.
+            //
+            // Two seconds between attempts, so holding the key or mashing it
+            // does not hammer a runtime that is busy coming up.
+            static unsigned long long s_lastInitAttemptMs = 0;
+            const unsigned long long nowInit = GetTickCount64();
+            if (!g_xrInitialized && (!g_xrInitAttempted || nowInit - s_lastInitAttemptMs >= 2000)) {
+                if (g_xrInitAttempted)
+                    Log_Printf("XRBridge: trying the OpenXR runtime again");
                 g_xrInitAttempted = true;
+                s_lastInitAttemptMs = nowInit;
                 g_xrInitialized = InitOpenXRInstanceAndSystem();
             } else if (g_xrInitialized) {
                 RefreshRecommendedEyeSize();
             }
             if (!g_xrInitialized) {
-                Log_Printf("XRBridge: OpenXR instance/system init failed (no headset or no OpenXR "
-                           "runtime?), turning XR mode back off");
-                g_xrModeEnabled = false;
+                // TEN MILLISECONDS IS NOT A FAIR CHANCE (2026-09-28, from the
+                // first SteamVR log we have ever had).
+                //
+                //   21:38:15.463  active runtime manifest is steamxr_win32.json
+                //   21:38:15.473  xrCreateInstance failed -> -13
+                //
+                // Ten milliseconds between finding SteamVR and giving up on
+                // it. XR_ERROR_INSTANCE_LOST there does not mean "no headset",
+                // it means the runtime could not reach vrserver - and
+                // SteamVR STARTS vrserver in response to exactly this call.
+                // It simply takes several seconds to do it, sometimes twenty.
+                //
+                // Virtual Desktop and Meta both keep their service running
+                // already, so they answer instantly and we never noticed. On
+                // SteamVR we asked, were told "not yet", switched VR off and
+                // reported no headset - which is precisely what "SteamVR
+                // alone does not work" looks like from the outside.
+                //
+                // So stay armed and keep asking. F7 again cancels.
+                g_xrWaitingUntilMs = GetTickCount64() + 45000;
+                Log_Printf("XRBridge: the runtime is not ready yet - staying on and asking again every 2 s "
+                           "for 45 s. If it is still starting, VR will come on by itself. Press F7 again to "
+                           "stop waiting.");
             } else {
                 // Only split the screen once we know there is somewhere to
                 // send the two halves. Turning it on before this point left
@@ -2522,6 +2835,30 @@ void VRBridge_OnEndScene(IDirect3DDevice9* pGameDevice)
             RenderSize_ExitVR(); // the player's own resolution comes back
             if (g_xrSessionReady.load(std::memory_order_acquire))
                 g_sessionTeardownRequest.store(true, std::memory_order_release);
+        }
+    }
+
+    // Still waiting for a runtime that was busy coming up.
+    if (g_xrModeEnabled && !g_xrInitialized && g_xrWaitingUntilMs) {
+        const unsigned long long nowWait = GetTickCount64();
+        if (nowWait >= g_xrWaitingUntilMs) {
+            g_xrWaitingUntilMs = 0;
+            g_xrModeEnabled = false;
+            Log_Printf("XRBridge: gave up waiting for the OpenXR runtime after 45 s - VR is off. Start the "
+                       "runtime, wait for the headset to show as ready, then press F7 again.");
+        } else {
+            static unsigned long long s_nextTryMs = 0;
+            if (nowWait >= s_nextTryMs) {
+                s_nextTryMs = nowWait + 2000;
+                Log_Printf("XRBridge: asking the OpenXR runtime again");
+                g_xrInitialized = InitOpenXRInstanceAndSystem();
+                if (g_xrInitialized) {
+                    g_xrWaitingUntilMs = 0;
+                    Log_Printf("XRBridge: the runtime came up - starting VR");
+                    StereoTest_SetEnabled(true);
+                    g_xrOutputOn.store(true, std::memory_order_release);
+                }
+            }
         }
     }
 
@@ -2657,7 +2994,13 @@ XRBridgePoseId VRBridge_GetCurrentPoseId()
 
 void VRBridge_NoteFramePresented(XRBridgePoseId poseId)
 {
+    g_framesPresented.fetch_add(1, std::memory_order_relaxed);
     g_poseOfPresentedFrame.store(poseId, std::memory_order_release);
+    if (poseId != 0) {
+        RenderedPose& entry = g_poseRing[poseId % kPoseRingSize];
+        if (entry.id.load(std::memory_order_acquire) == poseId)
+            entry.presentedMs.store(NowMillis(), std::memory_order_release);
+    }
 
     // Direct-submit path: nothing of ours stages this frame, so tag the
     // addon's own slot here instead - dgVoodoo has just published into it
@@ -2669,7 +3012,19 @@ void VRBridge_NoteFramePresented(XRBridgePoseId poseId)
     }
 }
 
-bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
+bool VRBridge_GetTrackingFrame(float outRows[9])
+{
+    if (!outRows || !g_xrOutputOn.load(std::memory_order_acquire))
+        return false;
+    AcquireSRWLockShared(&g_eyeViewsLock);
+    const bool have = g_haveTrackingFrame;
+    if (have)
+        std::memcpy(outRows, g_trackingFrame, sizeof(g_trackingFrame));
+    ReleaseSRWLockShared(&g_eyeViewsLock);
+    return have;
+}
+
+bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight, XRBridgePoseId* outPoseId)
 {
     // VR off: no head pose, so the camera, culling and stereo all go back to
     // flat-screen behaviour even though the session keeps running.
@@ -2680,6 +3035,8 @@ bool VRBridge_GetEyeViews(XRBridgeEyeView& outLeft, XRBridgeEyeView& outRight)
     if (have) {
         outLeft = g_eyeViews[kEyeLeft];
         outRight = g_eyeViews[kEyeRight];
+        if (outPoseId)
+            *outPoseId = g_eyeViewsPoseId;
     }
     ReleaseSRWLockShared(&g_eyeViewsLock);
     return have;
@@ -2789,5 +3146,7 @@ void VRBridge_GetStatus(VRBridgeStatus& out)
     out.eyeHeight = g_eyeHeight;
     out.predictedDisplayPeriodMs = g_statusPredictedPeriodMs.load(std::memory_order_relaxed);
     out.submitHz = g_xrSessionRunning ? g_statusSubmitHz.load(std::memory_order_relaxed) : 0.0f;
+    out.requestedRefreshHz = g_requestedRefreshHz.load(std::memory_order_relaxed);
+    out.runtimeHalvingUs = g_xrSessionRunning && g_runtimeHalvingUs.load(std::memory_order_relaxed);
     out.imageAgeMs = g_statusImageAgeMs.load(std::memory_order_relaxed);
 }

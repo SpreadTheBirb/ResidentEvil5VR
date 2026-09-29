@@ -67,20 +67,28 @@ PFN_Direct3DCreate9Ex g_origSystemCreate9Ex = nullptr;
 // other d3d9 wrappers are the usual suspects when a launch crashes inside
 // dgVoodoo2 on one PC and nowhere else, and their names are the only way to
 // tell from a log. Names only, no paths, and only once.
-void LogLoadedModulesOnce()
-{
-    static bool logged = false;
-    if (logged)
-        return;
-    logged = true;
+} // namespace
 
+// The module reporting is out of the anonymous namespace because net/ik_sync
+// calls it: it is declared in the header, so it has to have external linkage.
+
+// Takes a fresh snapshot every time, and says why it was taken. Startup is
+// not the only interesting moment: a module the game loads when it goes
+// online is invisible in a list captured at the main menu, which is exactly
+// what left the co-op networking unexplained (2026-09-19).
+void LogLoadedModules(const char* why)
+{
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) {
         Log_Printf("LoadedModules: snapshot failed (err=%lu)", GetLastError());
         return;
     }
+    Log_Printf("LoadedModules (%s):", why ? why : "startup");
 
-    char line[1024] = {};
+    // 320, not 1024. A log line holds 400 characters including its timestamp,
+    // so every one of these chunks was being cut off - which is how a module
+    // list printed for months while quietly losing most of its names.
+    char line[320] = {};
     size_t used = 0;
     MODULEENTRY32 me = {};
     me.dwSize = sizeof(me);
@@ -102,6 +110,69 @@ void LogLoadedModulesOnce()
     if (used)
         Log_Printf("LoadedModules: %s", line);
 }
+
+void LogLoadedModulesOnce()
+{
+    static bool logged = false;
+    if (logged)
+        return;
+    logged = true;
+    LogLoadedModules("startup");
+}
+
+// Modules that have turned up since the last look (2026-09-19).
+//
+// A list taken at one moment cannot answer "what does the game load when it
+// goes online", and neither can a list taken when a setting is switched on,
+// because a saved setting switches itself on at launch. The question is about
+// a CHANGE, so what gets reported is the change: call this on a timer and
+// whatever appears, appears with a timestamp against it.
+void LogNewModules()
+{
+    static char seen[256][64];
+    static int seenCount = 0;
+    static bool baseline = false;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+
+    char line[320] = {};
+    size_t used = 0;
+    MODULEENTRY32 me = {};
+    me.dwSize = sizeof(me);
+    for (BOOL ok = Module32First(snap, &me); ok; ok = Module32Next(snap, &me)) {
+        bool known = false;
+        for (int i = 0; i < seenCount && !known; ++i)
+            known = _stricmp(seen[i], me.szModule) == 0;
+        if (known)
+            continue;
+        if (seenCount < 256) {
+            strncpy_s(seen[seenCount], me.szModule, _TRUNCATE);
+            ++seenCount;
+        }
+        if (!baseline)
+            continue; // the first pass is only there to learn what normal is
+        const size_t len = strlen(me.szModule);
+        if (used + len + 2 >= sizeof(line)) {
+            Log_Printf("LoadedModules: newly loaded - %s", line);
+            used = 0;
+            line[0] = '\0';
+        }
+        if (used) {
+            line[used++] = ' ';
+            line[used] = '\0';
+        }
+        memcpy(line + used, me.szModule, len + 1);
+        used += len;
+    }
+    CloseHandle(snap);
+    if (used)
+        Log_Printf("LoadedModules: newly loaded - %s", line);
+    baseline = true;
+}
+
+namespace {
 
 IDirect3D9* WINAPI hkSystemDirect3DCreate9(UINT SDKVersion)
 {

@@ -58,16 +58,75 @@ int CameraRigHook_GetLiveBases(void** outBases, bool* outAim, int maxCount);
 // for watchpoints - never dereference it outside the camera hook.
 void* CameraRigHook_GetPlayerController();
 
+// Where the player's character is standing, in the game's world units. Taken
+// from where he STANDS rather than from any bone, so the animation's bob and
+// lean are not in it. False when there is no player yet.
+bool CameraRigHook_GetPlayerWorldPos(float out[3]);
+
+// Where the camera actually rendered from last frame, decoded from the shader
+// constants rather than read out of any game structure. Used to hunt for the
+// field the camera object keeps its own position in: whatever tracks this is
+// that field.
+bool CameraRigHook_LastCameraPosition(float out[3]);
+
+// The running lead currently being applied to the eye, in world units. It is
+// part of where the eye is DRAWN and no part of where the body is, so anything
+// asking "has the camera left the body" has to take it back off first.
+void CameraRigHook_GetRunLead(float out[3]);
+
+// Once per PRESENTED frame, not once per EndScene. See PinCameraToBody: this
+// game calls EndScene about thirty-four times for every frame it shows, and
+// the camera must be placed once, not thirty-four times at arbitrary points
+// inside the game's own update.
+void CameraRigHook_OnPresent();
+
 // True while the OpenXR session is delivering frames (polled from the
 // render thread every 100 ms). Safe to call from any thread.
 bool CameraRigHook_IsVrActive();
+
+// True while the game has taken the camera away from us: a cutscene, a vault,
+// a stomp, a scripted action. The same signal the head watchdog runs on - the
+// camera hook has gone quiet, which only happens when the game's own camera
+// code is driving. Two things need it: the culling fix does not reach the
+// game's own cameras, and a cutscene has to be skippable by a controller that
+// has no Start button of its own.
+bool CameraRigHook_InScriptedCamera();
+
+// Throw away which joints the arms are and find them again. For when the
+// numbers coming off them stop making sense, which means they are not the
+// arms any more: a new character, a new mode, a reloaded level.
+void CameraRigHook_ForgetArms();
+
+// Where the eye belongs inside the character's body right now, in world
+// space: the neck (or head) plus the usual up and ahead offsets, worked out
+// from the skeleton rather than from the camera rig - which stops running the
+// moment the game takes the camera for a kick or a vault. False when there is
+// no head to use, when the setting is off, or when the game's camera is far
+// enough away to be a deliberate shot rather than an action.
+bool CameraRigHook_GetBodyEye(const float forward[3], const float camPos[3], float outEye[3]);
+
+// What the aim servo is doing right now, for the tuning readout the menu draws
+// over the game (developer). Aiming in VR means the menu is closed, so the
+// numbers have to reach the headset some other way. False when the servo has
+// not run in the last quarter second.
+struct AimServoStatus {
+    float controllerPitchDeg, rigPitchDeg, errorDeg;
+    float wristPitchRate, wristYawRate; // deg/sec, as the servo sees them
+    float stickX, stickY;               // what it is asking the pad for, -1..1
+    float maxRateDeg;                   // what full stick buys at the current multiplier
+    float fastestSeenDeg;               // fastest the gun has actually been turned
+    float yawDebtDeg;                   // degrees the wrist has turned that the gun has not
+    float gunYawRate;                   // what the gun's bearing is actually managing, deg/sec
+    float pitchScale, yawScale;         // what the game's own speeds are being multiplied by
+};
+bool CameraRigHook_GetAimServoStatus(AimServoStatus& out);
 
 // 3DOF aiming: the right-stick push the aim servo wants this frame, -1..1, so
 // the gun's pitch catches up with where the controller points. False when it
 // has nothing to ask for. Applied to the virtual pad the game reads, because
 // the game re-derives its own aim pitch from stick input every frame and
 // ignores anything written straight into it.
-bool CameraRigHook_GetAimStickY(float* value);
+bool CameraRigHook_GetAimStick(float* x, float* y);
 
 // 3DOF aiming through the game's own mouse: the movement the aim servo wants,
 // in mouse counts, taken once and cleared. A mouse has no turn-rate ceiling,
@@ -121,11 +180,101 @@ struct CameraRigSettings {
     bool firstPerson = false;
     bool headFollow = true;            // VR: head turns the game camera while the gun is down
     bool vrStabilise = true;           // VR: smooth the idle-animation shake out of the eye
+    // 0 off. Holds the GAME CAMERA against the fraction of a degree a head
+    // moves while its owner is talking or breathing. What you see through the
+    // lenses is untouched - see HeadSteadier in camera_rig_hook.cpp.
+    float vrHeadSteady = 0.35f;        // VR: hold the camera against head micro movement
+    // VR: how many game ticks of the character's own movement the eye is led
+    // by when the frame is drawn, so it stays in his head at a run instead of
+    // landing where his head was a tick ago. Position only, level, no lean.
+    // Four, and the slider goes to eight (2026-09-25, user: "I've been setting
+    // running lead to 4.0 - that's about the only solve for your body clipping
+    // into the camera when sprinting").
+    //
+    // Four was the top of the slider, and two was the top of it before that,
+    // and both times the answer was the top. A default nobody keeps is not a
+    // default, so it becomes the tested value, with real headroom above it.
+    //
+    // Worth saying plainly though: if eight also turns out to be the answer,
+    // the number is not the problem. A flat multiple of one tick of movement
+    // cannot be right at every speed, and the honest fix would be to lead by
+    // how fast you are actually going rather than by a constant somebody has
+    // to find on a slider.
+    float vrRunLead = 4.0f;
+    float vrViewSteady = 0.7f;
+    // The eye rides the NECK bone rather than the head (2026-09-23, user:
+    // "it needs locked to his neck bone instead of the eyes, and just raised a
+    // bit to match eye level"). The head bone nods, rocks when he fires and
+    // leads when he runs; the neck is where a head is carried from.
+    bool vrEyeOnNeck = true;
+    float vrEyeAboveNeck = 20.0f; // units above the neck bone, about 23 cm
     bool vrMatchCullFov = true;        // VR: cull with the headset's own FOV
     float vrCullMarginPct = 15.0f;     // VR: extra culling angle on top of the headset's FOV
     float vrCullTurnLookaheadMs = 0.0f; // VR: widen culling by how far the head turns in this long (developer)
+    // Off for now (2026-09-18): it causes more trouble than it solves while the
+    // arm work is in flight, and wants debugging on its own rather than as a
+    // variable in someone else's test.
+    bool headLock = false;             // keep the view on the head even when the game takes the camera
+    float headLockReach = 2500.0f;     // how far the camera may stray and still be brought back, game units
+    float viewTurnLimitDeg = 450.0f;   // fastest the game may swing your view, 0 for no limit
+    bool headLockDirection = true;     // while the game drives, face where the character faces, not where its camera does
     bool showHeadDuringActions = true; // head pops back in when the game's camera leaves you
-    bool aimWalkCommit = false;        // developer: co-op aim-walk sync test
+    // HOLD YOUR VIEW WHILE THE GAME PLAYS AN ACTION (2026-09-28).
+    //
+    // Stomps, uppercuts, door kicks and vaults all end at the same function:
+    // the game tells the camera where to be and where to look, and whatever
+    // we had is gone. This keeps the position - the camera still rides your
+    // body through the animation, so the move still reads - and refuses the
+    // rotation, which is the part that hurts.
+    //
+    // "If I jump a gap, the movement from camera should be minimal, if any.
+    // Enough to sell the effect of jumping, but anything intense causes
+    // discomfort."
+    // On, and under a NEW ini key (2026-09-28). The old HoldViewInMelee has
+    // been both true and false in people\x27s settings files during a day of
+    // this being wrong, and a saved value from a build that behaved
+    // differently is worth nothing. RefuseMeleeCamera starts fresh.
+    bool holdViewInMelee = true;
+    // Holding partner locate currently swings the view onto Sheva, which in
+    // a headset is somebody grabbing your head and turning it. exe+7743C8 is
+    // the line that does it; zeroing what it writes keeps the locate icons
+    // and leaves the camera where you left it.
+    bool partnerNoCamera = true;
+    // A scope in a headset points into one eye and fills the screen, which
+    // is unusable. RE5 already knows how to keep a scoped weapon in third
+    // person - it does it between shots with the S75 - and exe+75AF53 is the
+    // check that decides. Forcing it keeps every scope out where you can
+    // actually aim it. Off by default because it changes how those weapons
+    // handle on a flat screen too.
+    bool scopeThirdPerson = false;
+    // Developer: how an aim-walk step is committed so a co-op partner sees it.
+    // An AimWalkCommit, kept as an int. See the enum in camera_rig_hook.cpp -
+    // this was a bool, and being a bool is why the co-op fault has gone
+    // unexplained since 2026-09-11: it welded two separate actions together.
+    // Defaults to 4, kCommitTidy, from 2026-09-19. It was 0 because the only
+    // setting that synced the move also dumped the magazine, so shipping it on
+    // was out of the question. Splitting the switch found the one that does
+    // the first without the second, a co-op session confirmed it, and with
+    // that there is no reason for a partner to watch you stand frozen every
+    // time you aim.
+    int aimWalkCommit = 4;
+    // How many times a second the step may be committed. The position itself
+    // is still written every frame - that is what makes walking smooth - but
+    // the COMMIT is the game's own once-per-step ritual and running it at
+    // frame rate is running it about five times too often.
+    // ZERO, MEANING EVERY FRAME (2026-09-29, user: "0ms on the timing").
+    //
+    // 25 a second was a guess made while the teleporting was being chased and
+    // the mode below was still wrong. With commit mode 4 - both, then put the
+    // flag back - the throttle is what stops a co-op partner seeing the walk
+    // at all, so it comes off. Neither of these is saved to the ini, so this
+    // default is what every build runs.
+    float aimWalkCommitHz = 0.0f;
+    // Let walking-while-aiming work in third person too. It is first-person
+    // only by default because that is the mode it exists for, but you cannot
+    // judge your own legs from inside your own head: to see whether the walk
+    // animation plays or the character slides, you have to watch from outside.
+    bool aimWalkThirdPerson = false;
     float flatFovDeg = 90.0f;
     float flatEyeUp = 0.9f, flatEyeAhead = -0.4f;
     float vrEyeUp = 1.0f, vrEyeAhead = 0.2f;

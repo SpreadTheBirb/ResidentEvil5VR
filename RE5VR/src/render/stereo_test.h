@@ -36,6 +36,12 @@ void StereoTest_OnEndScene(IDirect3DDevice9* pDevice);
 // that every draw of the next frame will use.
 void StereoTest_OnPresent();
 
+// Hold the camera matrix to a human turning speed, in place, before anything
+// downstream sees it. Called from the shader constant hook for register 0,
+// which is the one point BOTH flatscreen and VR pass through - proven by the
+// stomp whipping the view in flatscreen too, where none of the VR path runs.
+void StereoTest_LimitCameraTurn(float m[16]);
+
 // Call around any draw call that must never be duplicated/clipped (e.g.
 // the Phase 0 debug quad) - while suppressed, stereo_test's Draw* hooks
 // pass straight through to a single normal draw.
@@ -62,7 +68,16 @@ bool StereoTest_GetLatchedHeadForward(float out[3]);
 // The pose id of that latch (0 if none).
 unsigned long long StereoTest_GetLatchedPoseId();
 
-// Test build: 0 double (v0.4.1), 1 game camera only, 2 catch-up. See g_pictureTurnMode.
+// How the picture turns with the head. See g_pictureTurnMode for what each one
+// does and why it exists; camera_rig_hook reads these to decide whether to
+// steer the game camera at all.
+enum {
+    kPictureTurnModeDouble = 0,
+    kPictureTurnModeCameraOnly = 1,
+    kPictureTurnModeCatchUp = 2,
+    kPictureTurnModeDoubleFixed = 3,
+    kPictureTurnModeCompositorOnly = 4,
+};
 int StereoTest_GetPictureTurnMode();
 
 // ---- In-game menu (ui/menu.cpp) -----------------------------------------
@@ -74,10 +89,56 @@ struct StereoSettings {
     float fovWiden = 1.0f;
     bool monoSmallTargets = true;      // the light-leak fix
     bool compensateHeadFollow = false; // developer (superseded by pictureTurnMode)
-    int pictureTurnMode = 3;           // test: 0 double (v0.4.1), 1 game camera only, 2 catch-up, 3 double with culling fixed
+    int pictureTurnMode = 3;           // test: see the kPictureTurnMode values above
     float hudDistanceMeters = 2.0f;
     float hudScale = 0.67f;
+    bool theatre = true;             // menus and cutscenes play on a flat screen
+    bool theatreFollowsHead = false; // off: it hangs in the room and you can look away
+    float theatreDistanceMeters = 2.2f;
+    float theatreScale = 0.95f;
+    bool headPositionTracking = false; // lean and peek: your head's real movement moves the view
+    float leanScale = 1.0f;            // how far the game moves for how far you do
+    float nearPlaneUnits = 0.0f;       // 0 = the game's own; larger clips your own body away
 };
+
+// How close something can get to the eye before it is clipped away, in game
+// units, or 0 for the game's own. Read by the flat-screen path in
+// constant_probe.cpp as well as by the stereo matrices here.
+float StereoTest_GetNearPlaneUnits();
+
+// Takes where your head is now as the new centre for leaning. Call when the
+// player asks to recentre, or when leaning is switched on.
+void StereoTest_RecentreLean();
+
+// How far your head has moved from where it was taken, in the game's own
+// units and axes (2026-09-23). The view already moves by this; the spine can
+// move by it too, which is the difference between leaning the camera and
+// leaning the man. False when leaning is off or no reference has been taken.
+bool StereoTest_GetLeanWorld(float out[3]);
+
+// How far your character still has to walk to stand where you are standing,
+// in metres, along the view's own right and forward. This is what is left of
+// your room movement after the spine has leaned as far as it will: step
+// further than a lean can cover and he has to take a step.
+bool StereoTest_GetRoomStep(float* rightMetres, float* forwardMetres);
+
+// What the pad decided to ask his legs for this frame, so the loop above can
+// tell his own steps apart from the ones your thumb asked for.
+void StereoTest_SetRoomAsk(float right, float forward);
+
+// How far the eye we are drawing from has been moved away from the camera the
+// GAME thinks it is drawing from, in world units. Everything that displaces
+// the eye is in it: leaning, roomscale, and the hold that keeps you in your
+// body during an action. The culling needs it, because the game builds its
+// frustum around its own camera and anything we see past the edge of that
+// frustum has already been thrown away.
+float StereoTest_EyeOffsetUnits();
+
+// Which way the eye sits from the camera the game thinks it is drawing from,
+// in game units. The culling needs the direction, not just the distance: it
+// moves the frustum to where you actually are rather than making the camera's
+// own frustum bigger and hoping.
+void StereoTest_EyeOffset(float out[3]);
 StereoSettings StereoTest_GetSettings();
 void StereoTest_ApplySettings(const StereoSettings& s);
 bool StereoTest_IsEnabled();
@@ -98,3 +159,16 @@ bool StereoTest_GetPanelPlacement(float distanceMeters, UINT frameWidth, UINT fr
 // resolution per eye switches it), so re-read it before the next draw instead
 // of up to a second later.
 void StereoTest_OnDeviceReset();
+
+// Default-pool surfaces must go before Reset, not after it.
+void StereoTest_OnBeforeDeviceReset();
+
+// Moves the finished flat frame onto a screen in front of you, in each eye,
+// while a menu or a cutscene is playing. Call once a frame, just before the
+// real Present, on a back buffer the game has finished with.
+void StereoTest_ComposeTheatre(IDirect3DDevice9* pDevice);
+
+// Hold the screen up regardless of what the cutscene tests think, and ask
+// whether it is being held. F10, or the button in the menu.
+void StereoTest_ToggleTheatre();
+bool StereoTest_TheatreHeld();

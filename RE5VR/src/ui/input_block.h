@@ -1,5 +1,23 @@
 #pragma once
 
+// DID YOU ASK FOR IT (2026-09-27, user: "even at 2000 it cannot keep up with a
+// full speed mouse move").
+//
+// Which retires the rate test completely. A mouse flick and a stomp are both
+// faster than a person could ask for, because a flick IS a person asking. Rate
+// was only ever a proxy for the real question, and the real question can be
+// answered outright: the player either moved their mouse or they did not.
+//
+// Milliseconds since the last real mouse movement, and how far it moved in the
+// last window. Raw input is where the game reads the mouse, so it is where the
+// truth is - and this file already intercepts it.
+unsigned long long InputBlock_LastLookMs();
+long InputBlock_LookMagnitude();
+
+// Whether a movement key is down. This game steers the camera with your
+// running direction, so holding a direction key is asking for a turn.
+bool InputBlock_MovementHeld();
+
 #include <windows.h>
 #include <Xinput.h>
 

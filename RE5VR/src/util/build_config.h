@@ -16,4 +16,9 @@
 // Player-facing options have no hotkeys any more (2026-09-13): they live in
 // the in-game menu (ui/menu.cpp, Insert or a click of both sticks). At 1 the
 // menu also gets a Developer tab for the experiment switches above.
+// Overridable from the build command line (/DRE5VR_DIAGNOSTICS=1), so a
+// developer build needs no edit here and the repository default stays 0 for
+// anything that ships (2026-09-16).
+#ifndef RE5VR_DIAGNOSTICS
 #define RE5VR_DIAGNOSTICS 0
+#endif

@@ -32,3 +32,8 @@ RE5VR/thirdparty/openvr/
 # ---- Packaging / scratch ------------------------------------------------
 *.zip
 *.7z
+
+# ---- Release packaging --------------------------------------------------
+# Zips and notes built for a release; the zips are attached to the GitHub
+# release rather than kept in history.
+dist/

@@ -4,6 +4,9 @@
 #include "head_hide_probe.h"
 #include "camera_rig_hook.h"
 #include "aim_finder.h"
+#include "ammo.h"
+#include "pose_guard.h"
+#include "frame_times.h"
 #include "boom_finder.h"
 #include "fade_probe.h"
 #include "fade_patch.h"
@@ -12,9 +15,11 @@
 #include "skeleton_probe.h"
 #include "state_probe.h"
 #include "laser_patch.h"
+#include "tremor_patch.h"
 #include "filter_patch.h"
 #include "hud_probe.h"
 #include "../render/stereo_test.h"
+#include "../render/bone_palette.h"
 #include "../render/hud_shaders.h"
 #include "../render/render_size.h"
 #include "../vr/openxr_bridge.h"
@@ -207,6 +212,7 @@ HRESULT WINAPI hkReset(IDirect3DDevice9* This, D3DPRESENT_PARAMETERS* pPresentat
         pPresentationParameters ? pPresentationParameters->Windowed : -1);
     RenderSize_OnBeforeReset(pPresentationParameters);
     Menu_OnBeforeReset(); // the menu's D3DPOOL_DEFAULT textures and buffers must go first
+    StereoTest_OnBeforeDeviceReset(); // and so must the theatre's copy of the frame
     D3D12AddonBridge_NotifyReset(true);
     const HRESULT hr = oReset(This, pPresentationParameters);
     D3D12AddonBridge_NotifyReset(false);
@@ -233,12 +239,56 @@ Present_t oPresent = nullptr;
 HRESULT WINAPI hkPresent(IDirect3DDevice9* This, const RECT* pSourceRect, const RECT* pDestRect,
     HWND hDestWindowOverride, const RGNDATA* pDirtyRegion)
 {
+    // How many frames a second this machine is actually drawing (2026-09-24,
+    // user: "I bet my game is getting 62fps vs his 120"). Worth settling with a
+    // number rather than an inference: two machines sharing arms run the same
+    // solve at whatever rate each of them draws, and every per-frame constant
+    // in it means something different at 40 than at 120. Present is one real
+    // frame, which EndScene is not - the game calls that dozens of times a
+    // frame - so this is the only honest count, and it costs one integer.
+    {
+        static unsigned s_frames = 0;
+        static unsigned long long s_sinceMs = 0;
+        const unsigned long long nowFps = GetTickCount64();
+        ++s_frames;
+        if (!s_sinceMs)
+            s_sinceMs = nowFps;
+        else if (nowFps - s_sinceMs >= 5000) {
+            Log_Printf("Frames: %.1f a second over the last %.1f s", s_frames * 1000.0 / (nowFps - s_sinceMs),
+                (nowFps - s_sinceMs) / 1000.0);
+            s_frames = 0;
+            s_sinceMs = nowFps;
+        }
+    }
+
+    // The theatre first, then the menu on top of it. A menu or a cutscene has
+    // been drawn flat across the whole back buffer; this copies it onto a
+    // screen in each eye. The mod's own menu is drawn afterwards so that it
+    // stays where it always is rather than being pasted onto the film.
+    StereoTest_ComposeTheatre(This);
+
     // Before the real Present, so the menu is in the frame that reaches the
     // monitor and the headset.
+    LARGE_INTEGER pStart;
+    QueryPerformanceCounter(&pStart);
     Menu_OnPresent(This);
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        FrameTimes_Note(kPhaseMenu, now.QuadPart - pStart.QuadPart);
+    }
     const HRESULT hr = oPresent(This, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    LARGE_INTEGER afterPresent;
+    QueryPerformanceCounter(&afterPresent);
+    CameraRigHook_OnPresent();
     StereoTest_OnPresent();
     RenderSize_OnPresent(This);
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        FrameTimes_Note(kPhasePresent, now.QuadPart - afterPresent.QuadPart);
+    }
+    FrameTimes_NotePresent();
 #if RE5VR_DIAGNOSTICS
     HudProbe_OnPresent(); // K: record the HUD's draw calls
 #endif
@@ -252,18 +302,50 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
         return oEndScene(This);
     ++g_frameCounter;
 
+    // Where the time goes (2026-09-18). Three likely causes were picked off
+    // the source and removed, and none of them was the tester's rhythmic drop
+    // from 120 to 96. Running dgVoodoo without this DLL is rock solid, so the
+    // cost is here somewhere; this measures each phase instead of guessing at
+    // it again. Two QPC reads per phase, no allocation, no I/O, and the numbers
+    // are read out in the menu's Status tab.
+    LARGE_INTEGER phaseStart;
+    QueryPerformanceCounter(&phaseStart);
+    const LARGE_INTEGER frameStart = phaseStart;
+    const auto phase = [&phaseStart](int which) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        FrameTimes_Note(which, now.QuadPart - phaseStart.QuadPart);
+        phaseStart = now;
+    };
+
     // Poll the F8 stereo-test toggle first.
     StereoTest_OnEndScene(This);
+    phase(kPhaseStereo);
     CameraRigHook_OnEndScene();
+    phase(kPhaseCamera);
     AimFinder_OnEndScene(); // reports if a watch window has finished
+    Ammo_OnEndScene();      // reads back what the magazine hook has found
+    BonePalette_OnEndScene(); // ties the shader's bone table to the skeleton
+    PoseGuard_Tick();       // re-arms the arm-pose watch on any new threads
+    phase(kPhaseGuard);
 #if RE5VR_DIAGNOSTICS
     BoomFinder_OnEndScene();   // F5: hardware-watchpoint finder
     StateProbe_OnEndScene();   // "=": game-state capture
     SkeletonProbe_OnEndScene();
 #endif
+#if RE5VR_DIAGNOSTICS
+    // All three only REPORT - they do no work the game depends on - and each
+    // ends in a rate-limited Log_Printf, which is a mutex and an fflush on the
+    // render thread. At three, five and ten seconds their cadences overlap into
+    // something close to once a second, and the frame timer caught them: every
+    // other phase stayed under 0.3 ms while this one reached 2 ms, which is
+    // precisely the 120 to 96 a tester measured (2026-09-18). Found by measuring
+    // after three wrong guesses at it.
     FadePatch_OnEndScene();
     CullingPatch_OnEndScene();
     QueryProbe_OnEndScene();
+#endif
+    phase(kPhasePatches);
 
     // At this point the game's own rendering for this frame is completely
     // finished (backbuffer holds the final, fully composited/tonemapped
@@ -271,6 +353,7 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     // grab it and submit to the headset, before anything else (like the
     // debug quad below) draws on top of it.
     VRBridge_OnEndScene(This);
+    phase(kPhaseSubmit);
 
 #if RE5VR_DIAGNOSTICS
     DrawDebugQuad(This);
@@ -279,9 +362,15 @@ HRESULT WINAPI hkEndScene(IDirect3DDevice9* This)
     HeadHideProbe_OnEndScene();      // F1-F3, F11, F12 (F12 is Steam's screenshot key)
 #endif
 
+#if RE5VR_DIAGNOSTICS
+    // Also a disk write on a render thread, for the same reason as the pacing
+    // line above: a heartbeat is worth having while debugging and worth nothing
+    // to a player.
     if (g_frameCounter % 300 == 0)
         Log_Printf("hkEndScene: frame %llu", g_frameCounter);
+#endif
 
+    FrameTimes_EndFrame(frameStart.QuadPart);
     return oEndScene(This);
 }
 
@@ -351,6 +440,8 @@ void Hooks_OnDeviceCreated(IDirect3DDevice9* pDevice)
     FadePatch_Install();
     CullingPatch_Install();
     LaserPatch_Install();
+    TremorPatch_Install();
+    Ammo_Install();
     FilterPatch_Install();
 #if RE5VR_DIAGNOSTICS
     HudProbe_Install();

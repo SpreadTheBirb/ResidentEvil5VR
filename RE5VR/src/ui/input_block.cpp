@@ -125,6 +125,11 @@ void ApplyMask(BYTE* state, BYTE* mask, int n, std::atomic<bool>& capture)
     }
 }
 
+// The controllers acting as keyboard and mouse: defined further down, used
+// by the device filters above.
+bool MouseAimMode();
+bool MotionKeyDown(int vk);
+
 // Counted while blocking, reported at close: which devices the game read.
 std::atomic<unsigned long> g_diKeyboardReads{ 0 }, g_diMouseReads{ 0 }, g_diOtherReads{ 0 };
 
@@ -188,11 +193,78 @@ void IdleJoystickState(IDirectInputDevice8A* dev, LPVOID data, DWORD cb)
     std::memset(static_cast<BYTE*>(data) + 48, 0, cb - 48);
 }
 
+// Which input path a cutscene actually reads (2026-09-17). The pause button
+// works in play and does nothing during a cutscene, so the mapping is right and
+// something else is the difference. Rather than guess, count what the game asks
+// for while it has the camera: if XInput polling stops, the cutscene reads
+// somewhere else entirely, and this says where.
+std::atomic<long> g_probeXInput{ 0 }, g_probeDiKeyboard{ 0 }, g_probeDiPadRead{ 0 }, g_probeDiOther{ 0 };
+std::atomic<long> g_probeStartSent{ 0 };
+// When each kind of input was last actually used - see MotionPadIsTheActiveDevice.
+std::atomic<unsigned long long> g_lastMotionInputMs{ 0 };
+std::atomic<unsigned long long> g_lastKbmInputMs{ 0 };
+
+void CutsceneInputProbe()
+{
+    static ULONGLONG s_ms = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!CameraRigHook_InScriptedCamera()) {
+        s_ms = 0;
+        g_probeXInput.store(0, std::memory_order_relaxed);
+        g_probeDiKeyboard.store(0, std::memory_order_relaxed);
+        g_probeDiPadRead.store(0, std::memory_order_relaxed);
+        g_probeDiOther.store(0, std::memory_order_relaxed);
+        g_probeStartSent.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (!s_ms) {
+        s_ms = now;
+        return;
+    }
+    if (now - s_ms < 1000)
+        return;
+    s_ms = now;
+    Log_Printf("CutsceneInput: while the game has the camera, last second - XInput polled %ld time(s), DI keyboard "
+               "%ld, DI pad %ld, DI other %ld; we offered Start on %ld of them",
+        g_probeXInput.exchange(0, std::memory_order_relaxed), g_probeDiKeyboard.exchange(0, std::memory_order_relaxed),
+        g_probeDiPadRead.exchange(0, std::memory_order_relaxed), g_probeDiOther.exchange(0, std::memory_order_relaxed),
+        g_probeStartSent.exchange(0, std::memory_order_relaxed));
+}
+
 HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRESULT hr)
 {
     if (FAILED(hr) || !data || dev == g_diPad)
         return hr;
     const BYTE kind = KindOf(dev);
+    (kind == DI8DEVTYPE_KEYBOARD  ? g_probeDiKeyboard
+            : kind == DI8DEVTYPE_MOUSE ? g_probeDiOther
+                                       : g_probeDiPadRead)
+        .fetch_add(1, std::memory_order_relaxed);
+
+    // Is a person actually using the keyboard or mouse? This is the game's own
+    // read of them, so it costs nothing to look. Anything held or moved marks
+    // the moment, and the virtual pad steps aside until a controller is touched
+    // again - see MotionPadIsTheActiveDevice.
+    if (!g_blocking.load(std::memory_order_relaxed)) {
+        if (kind == DI8DEVTYPE_KEYBOARD && cb >= 256) {
+            const auto* keys = static_cast<const BYTE*>(data);
+            for (DWORD i = 0; i < 256; ++i) {
+                if (keys[i] & 0x80) {
+                    g_lastKbmInputMs.store(GetTickCount64(), std::memory_order_relaxed);
+                    break;
+                }
+            }
+        } else if (kind == DI8DEVTYPE_MOUSE
+            && (cb == sizeof(DIMOUSESTATE) || cb == sizeof(DIMOUSESTATE2))) {
+            const auto* m = static_cast<const DIMOUSESTATE2*>(data);
+            const int buttons = cb == sizeof(DIMOUSESTATE2) ? 8 : 4;
+            bool used = m->lX != 0 || m->lY != 0 || m->lZ != 0;
+            for (int i = 0; i < buttons && !used; ++i)
+                used = (m->rgbButtons[i] & 0x80) != 0;
+            if (used)
+                g_lastKbmInputMs.store(GetTickCount64(), std::memory_order_relaxed);
+        }
+    }
     if (g_blocking.load(std::memory_order_relaxed))
         (kind == DI8DEVTYPE_MOUSE ? g_diMouseReads : kind == DI8DEVTYPE_KEYBOARD ? g_diKeyboardReads : g_diOtherReads)
             .fetch_add(1, std::memory_order_relaxed);
@@ -220,6 +292,14 @@ HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRES
                 m->lX += aimDx;
                 m->lY += aimDy;
             }
+            // The clicks that go with it: aim is the right button in this
+            // mode, fire the left.
+            if (MouseAimMode()) {
+                if (MotionKeyDown(VK_LBUTTON))
+                    m->rgbButtons[0] = 0x80;
+                if (MotionKeyDown(VK_RBUTTON))
+                    m->rgbButtons[1] = 0x80;
+            }
         }
     } else if (kind == DI8DEVTYPE_MOUSE) {
         // A mouse read in a format we don't parse: still hide it from the game.
@@ -228,10 +308,35 @@ HRESULT FilterDeviceState(IDirectInputDevice8A* dev, DWORD cb, LPVOID data, HRES
         if (g_blocking.load(std::memory_order_relaxed))
             std::memset(data, 0, cb);
     } else if (kind == DI8DEVTYPE_KEYBOARD && cb == 256) {
-        if (g_blocking.load(std::memory_order_relaxed))
+        if (g_blocking.load(std::memory_order_relaxed)) {
             std::memset(data, 0, cb);
-        else
+        } else {
             ApplyMask(static_cast<BYTE*>(data), g_keyMask, 256, g_captureKeyMask);
+            // The controllers as keys, for mouse mode (2026-09-16). RE5 reads
+            // movement through DirectInput, not the Win32 key calls, so
+            // answering only those left WASD dead while aiming and turning
+            // worked: "you can't move".
+            if (MouseAimMode()) {
+                struct KeyMap {
+                    int vk;
+                    BYTE dik;
+                };
+                static const KeyMap kKeys[] = {
+                    { 'W', 0x11 },
+                    { 'A', 0x1E },
+                    { 'S', 0x1F },
+                    { 'D', 0x20 },
+                    { 'R', 0x13 },
+                    { VK_SPACE, 0x39 },
+                    { VK_ESCAPE, 0x01 },
+                };
+                auto* keys = static_cast<BYTE*>(data);
+                for (const KeyMap& k : kKeys) {
+                    if (MotionKeyDown(k.vk))
+                        keys[k.dik] = 0x80;
+                }
+            }
+        }
     } else if (cb == sizeof(DIJOYSTATE) || cb == sizeof(DIJOYSTATE2)) {
         // A pad the game reads through DirectInput (2026-09-15): a PlayStation
         // pad without Steam Input, or a generic USB one. Until now it walked
@@ -410,14 +515,22 @@ XInputSetState_t oXInputSetState = nullptr;
 // game that finds a pad then asks what it is. Only XInputGetState was hooked,
 // so XInputGetCapabilities still said nothing is there, and the game believed
 // the second answer. Now both agree: a plain wired pad on slot 0.
+bool MotionPadIsTheActiveDevice();
+
 DWORD WINAPI hkXInputGetCapabilities(DWORD index, DWORD flags, XINPUT_CAPABILITIES* caps)
 {
     const DWORD r = oXInputGetCapabilities(index, flags, caps);
-    if (r == ERROR_SUCCESS || !caps || index != 0)
+    // Same as above: in mouse mode there is no pad as far as the game is
+    // concerned, or it will not stay in keyboard and mouse mode.
+    if (r == ERROR_SUCCESS || !caps || index != 0 || MouseAimMode())
         return r;
 
     XINPUT_GAMEPAD probe = {};
     if (!XrInput_GetPad(&probe))
+        return r;
+    // And no pad at all while the keyboard and mouse are the ones being used:
+    // claiming one here is what pins the game in controller mode.
+    if (!MotionPadIsTheActiveDevice())
         return r;
 
     // What a wired Xbox 360 pad reports: every standard control present, both
@@ -459,15 +572,115 @@ DWORD WINAPI hkXInputSetState(DWORD index, XINPUT_VIBRATION* vibration)
     return XrInput_GetPad(&probe) ? ERROR_SUCCESS : r;
 }
 
+// 3DOF aiming driven through the game's mouse. In that mode RE5 is in
+// keyboard and mouse mode, where aiming is the right mouse button, so the
+// grip has to arrive as a right click rather than as a pad trigger. Sending
+// both is what made the game flip its prompts between mouse and pad every
+// time the gun came up.
+bool MouseAimMode()
+{
+    const XrInputSettings s = XrInput_GetSettings();
+    return s.enabled && s.pointToAim && s.aimWriteField == 5;
+}
+
+// Is the gun hand's grip held? It arrives as the pad's left trigger, which is
+// what RE5 aims on.
+bool MotionAimHeld()
+{
+    XINPUT_GAMEPAD vr = {};
+    return XrInput_GetPad(&vr) && vr.bLeftTrigger > 128;
+}
+
+// The controllers as a keyboard and mouse, for the mouse-driven 3DOF mode.
+// Once the game is in keyboard and mouse mode, everything it reads comes from
+// there: a pad button arriving at the same time as mouse movement is what
+// made its prompts flip back and forth. So while that mode is on, the same
+// controller inputs are answered as keys and clicks instead.
+//
+//   right grip     right mouse   aim          left stick    W A S D
+//   right trigger  left mouse    fire         A / cross     space, action
+//   B / circle     R, reload                  menu          escape
+//
+// Returns true when the mod is holding this key down, which is OR'd into
+// whatever the real keyboard says.
+bool MotionKeyDown(int vk)
+{
+    XINPUT_GAMEPAD vr = {};
+    if (!XrInput_GetPad(&vr))
+        return false;
+    constexpr SHORT kStick = 12000; // past the deadzone, roughly a third over
+    switch (vk) {
+    case VK_RBUTTON:
+        return vr.bLeftTrigger > 128;
+    case VK_LBUTTON:
+        return vr.bRightTrigger > 128;
+    case 'W':
+        return vr.sThumbLY > kStick;
+    case 'S':
+        return vr.sThumbLY < -kStick;
+    case 'A':
+        return vr.sThumbLX < -kStick;
+    case 'D':
+        return vr.sThumbLX > kStick;
+    case VK_SPACE:
+        return (vr.wButtons & XINPUT_GAMEPAD_A) != 0;
+    case 'R':
+        return (vr.wButtons & XINPUT_GAMEPAD_B) != 0;
+    case VK_ESCAPE:
+        return (vr.wButtons & XINPUT_GAMEPAD_START) != 0;
+    default:
+        return false;
+    }
+}
+
 // Motion controllers, merged into whatever the real pad said (v0.4.3). Same
 // idea as UEVR: OR the buttons in and add the sticks, so a real pad and the
 // controllers work side by side. Slot 0 only, and only when a real pad hasn't
 // already claimed that slot.
+// Last device wins (2026-09-17). Turning VR on presented a virtual pad for as
+// long as a controller was tracked, whether or not anybody was touching it - so
+// the game switched to controller prompts and stopped listening to the keyboard
+// and mouse, and there was no way back short of unticking Motion controllers.
+// The user: "when you enable VR, it forces you to controller mode and using a
+// mouse and keyboard is broken". That is also the likeliest reason a cutscene
+// could not be skipped: the skip may want a key, and the game was in pad mode.
+//
+// So the pad is offered only while the controllers are the thing being used.
+// Touch a key or move the mouse and it goes away; touch a controller and it
+// comes back. The controllers are still READ the whole time - that is how the
+// coming-back is noticed - they are simply not shown to the game.
+bool MotionPadIsTheActiveDevice()
+{
+    const unsigned long long motion = g_lastMotionInputMs.load(std::memory_order_relaxed);
+    const unsigned long long kbm = g_lastKbmInputMs.load(std::memory_order_relaxed);
+    if (!kbm)
+        return true; // nothing else has ever been used
+    return motion >= kbm;
+}
+
+void NoteMotionInput(const XINPUT_GAMEPAD& vr)
+{
+    constexpr SHORT kStickMoved = 8000;
+    const bool active = vr.wButtons != 0 || vr.bLeftTrigger > 30 || vr.bRightTrigger > 30
+        || vr.sThumbLX > kStickMoved || vr.sThumbLX < -kStickMoved || vr.sThumbLY > kStickMoved
+        || vr.sThumbLY < -kStickMoved || vr.sThumbRX > kStickMoved || vr.sThumbRX < -kStickMoved
+        || vr.sThumbRY > kStickMoved || vr.sThumbRY < -kStickMoved;
+    if (active)
+        g_lastMotionInputMs.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
 bool MergeMotionPad(XINPUT_GAMEPAD& g)
 {
     XINPUT_GAMEPAD vr = {};
     if (!XrInput_GetPad(&vr))
         return false;
+    NoteMotionInput(vr);
+    if (!MotionPadIsTheActiveDevice())
+        return false;
+
+    // Aim goes out as a right click instead, so let it go here.
+    if (MouseAimMode())
+        vr.bLeftTrigger = 0;
 
     g.wButtons |= vr.wButtons;
     if (vr.bLeftTrigger > g.bLeftTrigger)
@@ -487,18 +700,36 @@ bool MergeMotionPad(XINPUT_GAMEPAD& g)
     // the controller points. It replaces the stick rather than adding to it,
     // and only while it has something to ask for, so your own stick still
     // wins the moment the gun is where you want it.
-    float aimY = 0.0f;
-    if (CameraRigHook_GetAimStickY(&aimY)) {
-        const SHORT servo = static_cast<SHORT>(aimY * 32767.0f);
-        if (std::abs(static_cast<int>(servo)) > std::abs(static_cast<int>(g.sThumbRY)))
-            g.sThumbRY = servo;
+    // Added to your own stick, never in place of it (2026-09-16). Replacing
+    // it meant the servo owned the right stick outright while it had anything
+    // to say, so looking around with the stick did nothing: "it completely
+    // locks it out". Adding leaves you in charge - push the stick and it goes
+    // where you push it, on top of whatever the gun is doing.
+    float aimX = 0.0f, aimY = 0.0f;
+    if (CameraRigHook_GetAimStick(&aimX, &aimY)) {
+        g.sThumbRX = add(g.sThumbRX, static_cast<SHORT>(aimX * 32767.0f));
+        g.sThumbRY = add(g.sThumbRY, static_cast<SHORT>(aimY * 32767.0f));
     }
+
+    // A briefly also meant Start while the game held the camera, to make
+    // cutscenes skippable. Removed the same day (2026-09-17) for two reasons,
+    // either of which is enough. The probe proved it pointless: the game polls
+    // XInput 54 to 104 times a second right through a cutscene and was offered
+    // Start on up to 49 of those polls, and ignored every one, so RE5 simply
+    // does not skip on Start there. And it was unsafe, because "the game has
+    // the camera" does not mean "cutscene" - it is equally a vault, a stomp or
+    // a melee prompt, and those are exactly the moments someone hammers A. One
+    // press at the wrong time would have paused the game mid-action.
+    if (g.wButtons & XINPUT_GAMEPAD_START)
+        g_probeStartSent.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 DWORD WINAPI hkXInputGetState(DWORD index, XINPUT_STATE* state)
 {
     const DWORD r = oXInputGetState(index, state);
+    g_probeXInput.fetch_add(1, std::memory_order_relaxed);
+    CutsceneInputProbe();
 
     // Does RE5 even ask for a pad, and does it get ours? Once every 5 s while
     // motion controllers are in hand, and silent otherwise (2026-09-16).
@@ -523,6 +754,14 @@ DWORD WINAPI hkXInputGetState(DWORD index, XINPUT_STATE* state)
                 ++s_synth;
         }
     }
+
+    // In mouse mode the game must not see a pad at all (2026-09-16). While it
+    // thinks one is connected it stays in pad mode, ignores WASD, and takes
+    // the stick as well as our mouse movement, so the two fight over the aim.
+    // The mod menu still reads the controllers through InputBlock_ReadPad,
+    // which never goes through here.
+    if (MouseAimMode())
+        return r;
 
     // No pad plugged in, but motion controllers in hand: the game is told
     // slot 0 has a pad, which is how RE5 comes to believe in them at all.
@@ -664,6 +903,7 @@ void InstallXInput()
 // return address lies inside re5dx9.exe). Our menu, dgVoodoo and the runtime
 // keep seeing the real thing - the menu needs the real cursor to draw its own.
 uintptr_t g_gameBegin = 0, g_gameEnd = 0;
+uintptr_t g_usBegin = 0, g_usEnd = 0;
 
 bool CalledFromGame(void* returnAddress)
 {
@@ -671,10 +911,31 @@ bool CalledFromGame(void* returnAddress)
     return a >= g_gameBegin && a < g_gameEnd;
 }
 
+// ANYBODY BUT US (2026-09-25, user: "I installed the QOL Fixes .dll from a mod
+// ... since doing that, our mod menu doesn't trap the mouse from moving the
+// camera").
+//
+// Every block above asks whether the call came from re5dx9.exe, and answers
+// honestly to anyone else, which was right when the only other callers were
+// dgVoodoo and the VR runtime. A plugin is a third kind of caller and it is
+// not covered by either half of that: it is not the game, so it is waved
+// straight through, and it drives the game's camera, so waving it through is
+// exactly the same as not blocking at all.
+//
+// The question was never "is this the game". It is "is this us". While the
+// menu is open the mod is the only thing in the process entitled to read the
+// mouse, because the mod is what the mouse is currently doing.
+bool CalledFromSomebodyElse(void* returnAddress)
+{
+    const uintptr_t a = reinterpret_cast<uintptr_t>(returnAddress);
+    return !(a >= g_usBegin && a < g_usEnd);
+}
+
 // What the game has asked for while the menu was open, logged when it closes,
 // so the next report says exactly which route the input took.
 struct BlockCounts {
     std::atomic<unsigned long> cursor{ 0 }, keyState{ 0 }, keyboardState{ 0 }, asyncKey{ 0 }, messages{ 0 }, sent{ 0 };
+    std::atomic<unsigned long> raw{ 0 };
 };
 BlockCounts g_counts;
 
@@ -691,6 +952,7 @@ bool IsInputMessage(UINT m)
         (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST) || m == WM_INPUT;
 }
 
+typedef BOOL(WINAPI* SetCursorPos_t)(int, int);
 typedef BOOL(WINAPI* GetCursorPos_t)(LPPOINT);
 typedef SHORT(WINAPI* GetKeyState_t)(int);
 typedef BOOL(WINAPI* GetKeyboardState_t)(PBYTE);
@@ -715,7 +977,134 @@ HCURSOR WINAPI hkSetCursor(HCURSOR cursor)
     }
     return oSetCursor(cursor);
 }
+// RAW INPUT (2026-09-25). Not hooked before, because the game does not use
+// it: RE5 takes its mouse from Windows the ordinary way. A plugin that adds
+// better mouse aiming almost certainly does use it, and reading it does not
+// go through the message pump, so none of the filtering above can see it.
+typedef UINT(WINAPI* GetRawInputData_t)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
+typedef UINT(WINAPI* GetRawInputBuffer_t)(PRAWINPUT, PUINT, UINT);
+GetRawInputData_t oGetRawInputData = nullptr;
+GetRawInputBuffer_t oGetRawInputBuffer = nullptr;
+
+// See input_block.h: the only honest answer to "did the player turn the view
+// or did the game" is whether the player moved the mouse. Recorded here,
+// before any blocking, because what the game is allowed to see does not change
+// what the player actually did.
+std::atomic<unsigned long long> g_lastLookMs{ 0 };
+std::atomic<long> g_lookMagnitude{ 0 };
+
+// MOVING IS ASKING TOO (2026-09-27, user: "only sprinting and steering with
+// the WASD (which spins your camera) doesn't hold").
+//
+// Quite right. This game turns the camera to follow where you are running, so
+// steering with the keys is you asking for a turn just as much as a mouse
+// move is - we were simply not looking at the keys. A stomp involves no
+// movement input at all, so this cannot excuse one.
+bool MovementKeyDown()
+{
+    static const int kKeys[] = { 'W', 'A', 'S', 'D', VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT };
+    for (int vk : kKeys) {
+        if (GetAsyncKeyState(vk) & 0x8000)
+            return true;
+    }
+    return false;
+}
+
+void NoteRealMouseMove(long dx, long dy)
+{
+    const long moved = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+    // A RESTING HAND IS NOT A REQUEST (2026-09-27, the log: "let a 85 deg turn
+    // through - you asked 1 (mouse 31 ms ago)" in the middle of a stomp).
+    //
+    // A hand resting on a mouse twitches a pixel or two constantly, and any
+    // nonzero movement was being treated as you asking to turn - so the
+    // anchor kept re-anchoring to wherever the stomp had swung you and
+    // nothing was ever held. A deliberate turn is tens of pixels.
+    //
+    // Four is above the noise of a still hand and far below anything
+    // intentional, so a turn you meant still passes instantly.
+    constexpr long kNotJustATwitch = 4;
+    if (moved < kNotJustATwitch)
+        return;
+    g_lastLookMs.store(GetTickCount64(), std::memory_order_relaxed);
+    g_lookMagnitude.store(moved, std::memory_order_relaxed);
+}
+
+UINT WINAPI hkGetRawInputData(HRAWINPUT h, UINT command, LPVOID data, PUINT size, UINT headerSize)
+{
+    const UINT r = oGetRawInputData(h, command, data, size, headerSize);
+    if (r != static_cast<UINT>(-1) && data && command == RID_INPUT
+        && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress())) {
+        g_counts.raw.fetch_add(1, std::memory_order_relaxed);
+        // The event is real and has to keep its shape, or a caller that trusts
+        // the return value reads a half-filled buffer. It simply says nothing
+        // happened: no movement, no wheel, no buttons.
+        RAWINPUT* ri = static_cast<RAWINPUT*>(data);
+        if (ri->header.dwType == RIM_TYPEMOUSE) {
+            NoteRealMouseMove(ri->data.mouse.lLastX, ri->data.mouse.lLastY);
+            ri->data.mouse.lLastX = 0;
+            ri->data.mouse.lLastY = 0;
+            ri->data.mouse.usButtonFlags = 0;
+            ri->data.mouse.usButtonData = 0;
+        } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+            ri->data.keyboard.VKey = 0;
+            ri->data.keyboard.Message = WM_NULL;
+        }
+    }
+    return r;
+}
+
+UINT WINAPI hkGetRawInputBuffer(PRAWINPUT data, PUINT size, UINT headerSize)
+{
+    const UINT r = oGetRawInputBuffer(data, size, headerSize);
+    if (r != static_cast<UINT>(-1) && r != 0 && data && g_blocking.load(std::memory_order_relaxed)
+        && CalledFromSomebodyElse(_ReturnAddress())) {
+        g_counts.raw.fetch_add(r, std::memory_order_relaxed);
+        RAWINPUT* ri = data;
+        for (UINT i = 0; i < r && ri; ++i) {
+            if (ri->header.dwType == RIM_TYPEMOUSE) {
+                NoteRealMouseMove(ri->data.mouse.lLastX, ri->data.mouse.lLastY);
+                ri->data.mouse.lLastX = 0;
+                ri->data.mouse.lLastY = 0;
+                ri->data.mouse.usButtonFlags = 0;
+                ri->data.mouse.usButtonData = 0;
+            } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+                ri->data.keyboard.VKey = 0;
+                ri->data.keyboard.Message = WM_NULL;
+            }
+            ri = NEXTRAWINPUTBLOCK(ri);
+        }
+    }
+    return r;
+}
+
 GetCursorPos_t oGetCursorPos = nullptr;
+SetCursorPos_t oSetCursorPos = nullptr;
+
+// MEASURED FROM WHERE THE GAME PARKED IT (2026-09-27, the trace: yaw jumps of
+// 144 degrees still getting through while the limiter barely engaged).
+//
+// Mouselook in this game works by reading the cursor and then recentring it,
+// so the difference between two consecutive reads is dominated by the
+// recentre, not by you. Taking that as "the player is turning" left the
+// limiter switched off almost permanently, which is exactly what the trace
+// shows.
+//
+// The real movement is the distance from where the game last PUT the cursor
+// to where it next finds it. That is the standard way mouselook is done and
+// the only delta that means anything here.
+POINT g_parkedAt = {};
+bool g_haveParked = false;
+bool g_parkedSinceRead = false;
+
+BOOL WINAPI hkSetCursorPos(int x, int y)
+{
+    g_parkedAt.x = x;
+    g_parkedAt.y = y;
+    g_haveParked = true;
+    g_parkedSinceRead = true;
+    return oSetCursorPos(x, y);
+}
 GetKeyState_t oGetKeyState = nullptr, oGetAsyncKeyState = nullptr;
 GetKeyboardState_t oGetKeyboardState = nullptr;
 PeekMessage_t oPeekMessageA = nullptr, oPeekMessageW = nullptr;
@@ -746,12 +1135,53 @@ void CaptureWinKeyMaskIfPending()
 
 BOOL WINAPI hkGetCursorPos(LPPOINT p)
 {
-    if (p && g_blocking.load(std::memory_order_relaxed) && CalledFromGame(_ReturnAddress())) {
+    if (p && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress())) {
         g_counts.cursor.fetch_add(1, std::memory_order_relaxed);
         *p = g_frozenCursor;
         return TRUE;
     }
-    return oGetCursorPos(p);
+    const BOOL ok = oGetCursorPos(p);
+    // WHERE THIS GAME ACTUALLY READS THE MOUSE (2026-09-27, user: "not
+    // capturing my mouse so those are still getting snagged").
+    //
+    // The raw input hook could never have worked: the block's own counters say
+    // "cursor 909, input messages 1430, DirectInput mouse 0, raw input 0", so
+    // this game polls the cursor and never touches raw input. The signal has
+    // to be taken from the path the game really uses, which is this one.
+    //
+    // Deltas rather than positions, because the game recentres the cursor to
+    // keep it captured, so the absolute value tells you nothing.
+    // THE BASELINE IS THE LAST READ, EXCEPT AFTER A RECENTRE (2026-09-27, the
+    // log: "you asked 1 (mouse 0 ms ago)" during a stomp with hands off the
+    // mouse).
+    //
+    // Measuring from the park point was wrong in the opposite direction to
+    // measuring from the last read. The game does not recentre on every poll,
+    // so between recentres the cursor sits at a fixed offset from the park
+    // point and every single read reports that same offset as fresh movement.
+    // The signal was therefore always on, and the limiter always off - which
+    // is precisely what the log shows.
+    //
+    // What actually moved the mouse is the change since the LAST READ. The
+    // one exception is the first read after the game recentred, where the
+    // jump to the park point is the game's doing and not yours; there the
+    // park point is the baseline instead.
+    if (ok && p) {
+        static POINT s_lastRead = {};
+        static bool s_haveRead = false;
+        POINT from = s_lastRead;
+        bool haveFrom = s_haveRead;
+        if (g_parkedSinceRead && g_haveParked) {
+            from = g_parkedAt;
+            haveFrom = true;
+            g_parkedSinceRead = false;
+        }
+        if (haveFrom)
+            NoteRealMouseMove(p->x - from.x, p->y - from.y);
+        s_lastRead = *p;
+        s_haveRead = true;
+    }
+    return ok;
 }
 
 SHORT WINAPI hkGetKeyState(int vk)
@@ -764,6 +1194,8 @@ SHORT WINAPI hkGetKeyState(int vk)
         CaptureWinKeyMaskIfPending();
         if (MaskedAfterClose(vk))
             return 0;
+        if (MouseAimMode() && MotionKeyDown(vk))
+            return static_cast<SHORT>(0x8000);
     }
     return oGetKeyState(vk);
 }
@@ -778,6 +1210,8 @@ SHORT WINAPI hkGetAsyncKeyState(int vk)
         CaptureWinKeyMaskIfPending();
         if (MaskedAfterClose(vk))
             return 0;
+        if (MouseAimMode() && MotionKeyDown(vk))
+            return static_cast<SHORT>(0x8000);
     }
     return oGetAsyncKeyState(vk);
 }
@@ -796,6 +1230,13 @@ BOOL WINAPI hkGetKeyboardState(PBYTE keys)
     for (int vk = 1; vk < 256; ++vk)
         if (g_winKeyMask[vk] && MaskedAfterClose(vk))
             keys[vk] = 0;
+    if (MouseAimMode()) {
+        static const int kMotionKeys[] = { VK_RBUTTON, VK_LBUTTON, 'W', 'A', 'S', 'D', VK_SPACE, 'R', VK_ESCAPE };
+        for (const int vk : kMotionKeys) {
+            if (MotionKeyDown(vk))
+                keys[vk] = 0x80;
+        }
+    }
     return r;
 }
 
@@ -822,28 +1263,28 @@ void DivertMessage(LPMSG msg, bool removed)
 BOOL WINAPI hkPeekMessageA(LPMSG msg, HWND hwnd, UINT lo, UINT hi, UINT flags)
 {
     const BOOL r = oPeekMessageA(msg, hwnd, lo, hi, flags);
-    if (r && g_blocking.load(std::memory_order_relaxed) && CalledFromGame(_ReturnAddress()))
+    if (r && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress()))
         DivertMessage(msg, (flags & PM_REMOVE) != 0);
     return r;
 }
 BOOL WINAPI hkPeekMessageW(LPMSG msg, HWND hwnd, UINT lo, UINT hi, UINT flags)
 {
     const BOOL r = oPeekMessageW(msg, hwnd, lo, hi, flags);
-    if (r && g_blocking.load(std::memory_order_relaxed) && CalledFromGame(_ReturnAddress()))
+    if (r && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress()))
         DivertMessage(msg, (flags & PM_REMOVE) != 0);
     return r;
 }
 BOOL WINAPI hkGetMessageA(LPMSG msg, HWND hwnd, UINT lo, UINT hi)
 {
     const BOOL r = oGetMessageA(msg, hwnd, lo, hi);
-    if (r > 0 && g_blocking.load(std::memory_order_relaxed) && CalledFromGame(_ReturnAddress()))
+    if (r > 0 && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress()))
         DivertMessage(msg, true);
     return r;
 }
 BOOL WINAPI hkGetMessageW(LPMSG msg, HWND hwnd, UINT lo, UINT hi)
 {
     const BOOL r = oGetMessageW(msg, hwnd, lo, hi);
-    if (r > 0 && g_blocking.load(std::memory_order_relaxed) && CalledFromGame(_ReturnAddress()))
+    if (r > 0 && g_blocking.load(std::memory_order_relaxed) && CalledFromSomebodyElse(_ReturnAddress()))
         DivertMessage(msg, true);
     return r;
 }
@@ -867,9 +1308,27 @@ void InstallWin32()
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const BYTE*>(exe) + dos->e_lfanew);
     g_gameBegin = reinterpret_cast<uintptr_t>(exe);
     g_gameEnd = g_gameBegin + nt->OptionalHeader.SizeOfImage;
+    // And where WE are, which is the only caller a block has to let through.
+    {
+        HMODULE us = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&HookExport), &us)
+            && us) {
+            const auto* dosUs = reinterpret_cast<const IMAGE_DOS_HEADER*>(us);
+            const auto* ntUs = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const BYTE*>(us) + dosUs->e_lfanew);
+            g_usBegin = reinterpret_cast<uintptr_t>(us);
+            g_usEnd = g_usBegin + ntUs->OptionalHeader.SizeOfImage;
+        }
+        Log_Printf("InputBlock: the game is %08X..%08X, this mod is %08X..%08X - while the menu is open the mod is "
+                   "the only caller that sees the real mouse",
+            static_cast<unsigned>(g_gameBegin), static_cast<unsigned>(g_gameEnd), static_cast<unsigned>(g_usBegin),
+            static_cast<unsigned>(g_usEnd));
+    }
 
     HMODULE user32 = GetModuleHandleA("user32.dll");
     HookExport(user32, "GetCursorPos", reinterpret_cast<void*>(&hkGetCursorPos), reinterpret_cast<void**>(&oGetCursorPos));
+    HookExport(user32, "SetCursorPos", reinterpret_cast<void*>(&hkSetCursorPos), reinterpret_cast<void**>(&oSetCursorPos));
     HookExport(user32, "GetKeyState", reinterpret_cast<void*>(&hkGetKeyState), reinterpret_cast<void**>(&oGetKeyState));
     HookExport(user32, "GetAsyncKeyState", reinterpret_cast<void*>(&hkGetAsyncKeyState),
         reinterpret_cast<void**>(&oGetAsyncKeyState));
@@ -880,6 +1339,10 @@ void InstallWin32()
     HookExport(user32, "GetMessageA", reinterpret_cast<void*>(&hkGetMessageA), reinterpret_cast<void**>(&oGetMessageA));
     HookExport(user32, "GetMessageW", reinterpret_cast<void*>(&hkGetMessageW), reinterpret_cast<void**>(&oGetMessageW));
     HookExport(user32, "SetCursor", reinterpret_cast<void*>(&hkSetCursor), reinterpret_cast<void**>(&oSetCursor));
+    HookExport(user32, "GetRawInputData", reinterpret_cast<void*>(&hkGetRawInputData),
+        reinterpret_cast<void**>(&oGetRawInputData));
+    HookExport(user32, "GetRawInputBuffer", reinterpret_cast<void*>(&hkGetRawInputBuffer),
+        reinterpret_cast<void**>(&oGetRawInputBuffer));
 }
 
 // ---- The mod's own DirectInput pad (2026-09-15) ------------------------
@@ -927,6 +1390,10 @@ BOOL CALLBACK EnumPadCallback(LPCDIDEVICEINSTANCEA inst, LPVOID context)
     return sony ? DIENUM_STOP : DIENUM_CONTINUE;
 }
 
+// The one thread allowed to make the slow calls. Anything else asking for a
+// pad gets whatever has already been found.
+DWORD g_padScanThreadId = 0;
+
 bool OpenDiPad()
 {
     if (g_diPad)
@@ -934,12 +1401,16 @@ bool OpenDiPad()
     if (!g_padWindow)
         return false;
 
-    // Enumeration is not free, so try at most every 2 s.
-    static ULONGLONG s_lastTryMs = 0;
-    const ULONGLONG nowMs = GetTickCount64();
-    if (s_lastTryMs && nowMs - s_lastTryMs < 2000)
+    // Only where a slow call is allowed to be slow (2026-09-18). Enumerating
+    // DirectInput devices costs on the order of two hundred milliseconds when
+    // there is nothing to find, and a two-second timer does not make that safe
+    // on a thread that owes a frame every eight. This is the same fault the
+    // XInput scan had, in the fallback that runs when XInput finds nothing -
+    // which is why fixing one of them moved the stall rather than removing it,
+    // and why plugging a pad in cured it outright: XInput then answers first
+    // and this never runs at all.
+    if (GetCurrentThreadId() != g_padScanThreadId)
         return false;
-    s_lastTryMs = nowMs;
 
     if (!g_di) {
         HMODULE self = nullptr;
@@ -1110,11 +1581,11 @@ void InputBlock_SetBlocking(bool blocking)
     if (!blocking) {
         g_captureWinKeyMask.store(true, std::memory_order_release);
         Log_Printf("InputBlock: while blocked the game asked for - cursor %lu, GetKeyState %lu, GetAsyncKeyState %lu, "
-                   "GetKeyboardState %lu, input messages %lu, DirectInput keyboard %lu / mouse %lu / other %lu "
-                   "(all hidden from it)",
+                   "GetKeyboardState %lu, input messages %lu, DirectInput keyboard %lu / mouse %lu / other %lu, "
+                   "raw input %lu (all hidden from it)",
             g_counts.cursor.exchange(0), g_counts.keyState.exchange(0), g_counts.asyncKey.exchange(0),
             g_counts.keyboardState.exchange(0), g_counts.messages.exchange(0), g_diKeyboardReads.exchange(0),
-            g_diMouseReads.exchange(0), g_diOtherReads.exchange(0));
+            g_diMouseReads.exchange(0), g_diOtherReads.exchange(0), g_counts.raw.exchange(0));
         g_captureKeyMask.store(true, std::memory_order_release);
         g_captureMouseMask.store(true, std::memory_order_release);
         for (auto& c : g_capturePadMask)
@@ -1137,32 +1608,70 @@ bool InputBlock_IsBlocking()
 
 namespace {
 
+// Which XInput slot has a pad, or -1. Written by the scanner thread below,
+// read by whoever is asking; a stale value costs one failed poll, which is
+// cheap on a slot that HAS a pad.
+volatile LONG g_xinputSlot = -1;
+volatile LONG g_xinputScanning = 0;
+
+// Looking for a pad, on its own thread (2026-09-18).
+//
+// XInputGetState on a slot with nothing in it takes tens of milliseconds -
+// it is a documented trap, and with four empty slots a scan costs around two
+// hundred. This ran on the Present thread every two seconds, which is one
+// frame in every two hundred and forty taking 200 ms: a tester measured a
+// rock-solid 120 fps dropping to 96 on a beat, and the frame timer caught it
+// red-handed at 207.95 ms inside the menu's Present work.
+//
+// Anyone playing with a pad never saw it: the scan only runs while no pad has
+// been found, and this mod's own users are on VR controllers, which arrive
+// through OpenXR instead. So it stalled precisely the people it was for.
+//
+// The timer was the wrong fix for a slow call. The right one is to not make
+// it on a thread that owes someone a frame every eight milliseconds.
+bool OpenDiPad();
+
+DWORD WINAPI XInputScanThread(LPVOID)
+{
+    g_padScanThreadId = GetCurrentThreadId();
+    for (;;) {
+        if (g_xinputSlot < 0 && g_padReader) {
+            for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+                XINPUT_STATE st = {};
+                if (g_padReader(i, &st) == ERROR_SUCCESS) {
+                    InterlockedExchange(&g_xinputSlot, static_cast<LONG>(i));
+                    Log_Printf("InputBlock: pad found on XInput slot %lu", i);
+                    break;
+                }
+            }
+        }
+        // And the DirectInput side, which has the same problem and is the
+        // one that runs when XInput comes up empty. Opening it is all that is
+        // slow; once it is open, reading it is not, so the readers can do that
+        // themselves on whatever thread they like.
+        if (g_xinputSlot < 0)
+            OpenDiPad();
+        Sleep(3000);
+    }
+}
+
 bool ReadXInputPad(XINPUT_STATE* out)
 {
     if (!g_padReader)
         return false;
-    static int s_pad = -1;
-    static ULONGLONG s_lastScanMs = 0;
-    static ULONGLONG s_firstScanMs = 0;
-    static bool s_loggedNone = false;
+    if (!InterlockedExchange(&g_xinputScanning, 1)) {
+        HANDLE t = CreateThread(nullptr, 0, &XInputScanThread, nullptr, 0, nullptr);
+        if (t)
+            CloseHandle(t);
+    }
+    const LONG slot = g_xinputSlot;
+    if (slot < 0)
+        return false;
+    // A slot that has a pad answers immediately, so this is safe here.
     XINPUT_STATE st = {};
-    if (s_pad >= 0 && g_padReader(static_cast<DWORD>(s_pad), &st) != ERROR_SUCCESS)
-        s_pad = -1;
-    if (s_pad < 0) {
-        // Empty slots are slow to poll, so only rescan every 2 s.
-        const ULONGLONG nowMs = GetTickCount64();
-        if (!s_firstScanMs)
-            s_firstScanMs = nowMs;
-        if (nowMs - s_lastScanMs < 2000)
-            return false;
-        s_lastScanMs = nowMs;
-        for (DWORD i = 0; i < XUSER_MAX_COUNT && s_pad < 0; ++i) {
-            if (g_padReader(i, &st) == ERROR_SUCCESS)
-                s_pad = static_cast<int>(i);
-        }
-        if (s_pad < 0)
-            return false;
-        Log_Printf("InputBlock: pad found on XInput slot %d", s_pad);
+    if (g_padReader(static_cast<DWORD>(slot), &st) != ERROR_SUCCESS) {
+        InterlockedExchange(&g_xinputSlot, -1); // unplugged; the scanner looks again
+        return false;
     }
     *out = st;
     return true;
@@ -1231,4 +1740,19 @@ void InputBlock_DescribeMouse(char* out, size_t size)
 HCURSOR InputBlock_GameCursor()
 {
     return g_gameCursor.load(std::memory_order_relaxed);
+}
+
+unsigned long long InputBlock_LastLookMs()
+{
+    return g_lastLookMs.load(std::memory_order_relaxed);
+}
+
+long InputBlock_LookMagnitude()
+{
+    return g_lookMagnitude.load(std::memory_order_relaxed);
+}
+
+bool InputBlock_MovementHeld()
+{
+    return MovementKeyDown();
 }

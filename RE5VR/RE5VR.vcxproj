@@ -27,7 +27,16 @@
     <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <CharacterSet>MultiByte</CharacterSet>
-    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+    <!-- OFF (2026-09-29). This project is full of naked asm stubs and globals
+         that only inline assembly ever reads - trampolines, g_killDelta,
+         g_theCameraRaw, the camera and melee flags. Whole program
+         optimisation cannot see those reads, so it is free to fold a global
+         to a constant or drop a store nothing appears to use, and it changes
+         calling conventions on functions whose only caller is an asm block.
+         A developer build survives it because the logging reads the same
+         globals; a release build does not. A few percent is not worth a
+         class of bug that only exists in the build people run. -->
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">false</WholeProgramOptimization>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -90,6 +99,7 @@
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\util\log.cpp" />
+    <ClCompile Include="src\util\sound.cpp" />
     <ClCompile Include="src\util\crash_log.cpp" />
     <ClCompile Include="src\proxy\real_d3d9.cpp" />
     <ClCompile Include="src\proxy\blind_forwards.cpp" />
@@ -100,16 +110,23 @@
     <ClCompile Include="src\hooks\head_hide_probe.cpp" />
     <ClCompile Include="src\hooks\camera_rig_hook.cpp" />
     <ClCompile Include="src\hooks\aim_finder.cpp" />
+    <ClCompile Include="src\hooks\ammo.cpp" />
+    <ClCompile Include="src\hooks\arm_ik.cpp" />
+    <ClCompile Include="src\net\ik_sync.cpp" />
+    <ClCompile Include="src\hooks\pose_guard.cpp" />
+    <ClCompile Include="src\hooks\frame_times.cpp" />
     <ClCompile Include="src\hooks\boom_finder.cpp" />
     <ClCompile Include="src\hooks\fade_probe.cpp" />
     <ClCompile Include="src\hooks\fade_patch.cpp" />
     <ClCompile Include="src\hooks\skeleton_probe.cpp" />
     <ClCompile Include="src\hooks\state_probe.cpp" />
     <ClCompile Include="src\hooks\laser_patch.cpp" />
+    <ClCompile Include="src\hooks\tremor_patch.cpp" />
     <ClCompile Include="src\hooks\filter_patch.cpp" />
     <ClCompile Include="src\hooks\hud_probe.cpp" />
     <ClCompile Include="src\hooks\culling_patch.cpp" />
     <ClCompile Include="src\hooks\query_probe.cpp" />
+    <ClCompile Include="src\render\bone_palette.cpp" />
     <ClCompile Include="src\render\stereo_test.cpp" />
     <ClCompile Include="src\render\hud_shaders.cpp" />
     <ClCompile Include="src\render\render_size.cpp" />
@@ -134,6 +151,7 @@
 
   <ItemGroup>
     <ClInclude Include="src\util\log.h" />
+    <ClInclude Include="src\util\sound.h" />
     <ClInclude Include="src\util\crash_log.h" />
     <ClInclude Include="src\proxy\real_d3d9.h" />
     <ClInclude Include="src\proxy\blind_forwards.h" />
@@ -144,16 +162,23 @@
     <ClInclude Include="src\hooks\head_hide_probe.h" />
     <ClInclude Include="src\hooks\camera_rig_hook.h" />
     <ClInclude Include="src\hooks\aim_finder.h" />
+    <ClInclude Include="src\hooks\ammo.h" />
+    <ClInclude Include="src\hooks\arm_ik.h" />
+    <ClInclude Include="src\hooks\pose_guard.h" />
+    <ClInclude Include="src\hooks\frame_times.h" />
     <ClInclude Include="src\hooks\boom_finder.h" />
     <ClInclude Include="src\hooks\fade_probe.h" />
     <ClInclude Include="src\hooks\fade_patch.h" />
     <ClInclude Include="src\hooks\skeleton_probe.h" />
     <ClInclude Include="src\hooks\state_probe.h" />
     <ClInclude Include="src\hooks\laser_patch.h" />
+    <ClInclude Include="src\hooks\tremor_patch.h" />
     <ClInclude Include="src\hooks\filter_patch.h" />
+    <ClInclude Include="srchooks	remor_patch.h" />
     <ClInclude Include="src\hooks\hud_probe.h" />
     <ClInclude Include="src\hooks\culling_patch.h" />
     <ClInclude Include="src\hooks\query_probe.h" />
+    <ClInclude Include="src\render\bone_palette.h" />
     <ClInclude Include="src\render\stereo_test.h" />
     <ClInclude Include="src\render\hud_shaders.h" />
     <ClInclude Include="src\render\render_size.h" />

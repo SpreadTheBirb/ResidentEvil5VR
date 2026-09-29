@@ -3,6 +3,7 @@
 #include "proxy/real_d3d9.h"
 #include "hooks/getprocaddress_hook.h"
 #include "util/crash_log.h"
+#include "net/ik_sync.h"
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
@@ -29,6 +30,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         Hooks_InstallGetProcAddressHook();
         break;
     case DLL_PROCESS_DETACH:
+        // The arm-sharing socket has a thread of its own, and a thread still
+        // running inside a module being unmapped is the kind of crash that
+        // gets blamed on the last thing the player did.
+        IkSync_Shutdown();
         Log_Printf("RE5VR proxy DLL detaching");
         break;
     }

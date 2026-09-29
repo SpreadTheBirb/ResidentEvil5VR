@@ -134,7 +134,10 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
         }
     }
 
-    // Log_Printf fflushes every line, so the report is already on disk.
+    // Logging is queued to a writer thread now, and that thread will not get
+    // another turn once this process goes - so the report is put on disk here,
+    // by this thread, before handing the crash on.
+    Log_Flush();
     return EXCEPTION_CONTINUE_SEARCH; // let the game/OS handle it as usual
 }
 
