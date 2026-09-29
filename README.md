@@ -386,24 +386,12 @@ PlayStation or similar), which is recommended, or mouse and keyboard.
 - Arms only body mode leaves some skeleton visible. Not the permanent
   implementation.
 - **Lean and peek is WIP. Do not use.** Off by default.
-
 - **Turning VR on in exclusive fullscreen** can still crash inside dgVoodoo2 on
   some PCs. Play windowed if it happens to you. (Changing resolution while
   fullscreen is fixed in v0.4.2.)
-- **Pressing aim repeatedly can pull your view back toward level** after you've
-  aimed up or down with the mouse or stick. The game rescales pitch every time
-  you enter aim.
-- **Motion controllers act as a gamepad, not as hands.** The gun points where
-  the game points it, not where you point the controller. Aiming by pointing
-  is being worked on for a later version.
-- **VR motion controllers are not supported yet.** Use a gamepad (Xbox,
-  PlayStation or similar) or mouse and keyboard.
-- RE5's own mouse cursor can point at the wrong menu item while VR is on (the
-  game still maps it to the window size). A gamepad is unaffected.
 - Some menus (the title screen, parts of the Organize screen) still don't
   draw correctly in VR.
-- Look straight down and you're inside your own torso.
-- Split-screen co-op: Chris's head stays hidden. **Online co-op is untested.**
+- Split-screen co-op: Chris's head stays hidden.
 
 ### Reporting a problem
 
